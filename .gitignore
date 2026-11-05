@@ -20,6 +20,3 @@ AGENTS.md
 .windsurf/
 .vscode/
 .idea/
-
-# dedicated local Python development environment
-.venv/
