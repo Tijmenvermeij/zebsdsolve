@@ -6,6 +6,20 @@ EBSD pattern-centre fitting and indexing on the GPU, in the browser or from Pyth
 
 One engine does the work for both front ends: the math is WGSL, the schedule is Zig, and it runs natively (Vulkan, Metal or Direct3D 12 through wgpu-native) and as WebAssembly on WebGPU.
 
+## Phase metadata and orientation export
+
+The ebsdsim NPZ importer reads the standardized top-level `meta_json.cell`, with lengths in Å and angles in degrees. A nested `cif_input.cell` describes the original input and never replaces that cell. The original JSON is retained internally, including setting, origin and transformation flags. The EMsoft importer reads `CrystalData/LatticeParameters`, converting nm to Å once, and retains the space group, crystal system and space-group setting. Phase names and formulas are used only when explicitly present; the filename supplies a missing name. No chemical formula is inferred.
+
+ANG and CTF exports require a finite, nondegenerate phase cell. Missing or invalid metadata leaves pattern indexing available but returns `MissingPhaseLattice` or `InvalidPhaseLattice` when exporting. Both files contain the actual cell with eight decimal places, and indexed phase IDs begin at 1; ANG unindexed cells have phase 0 and CI −1. ANG additionally records an EDAX `PointGroupID` for known point groups with an unambiguous axis setting. Groups 14, 18, 19, 20 and 26 retain the source point-group number and space group in `Info`, without claiming an unverified EDAX setting. CTF records the Laue class and space-group number.
+
+The supported master crystal frame is X∥a, Z∥c*. This follows ebsdsim's [`_lattice_arrays` / `direct_structure_matrix`](https://github.com/ZacharyVarley/ebsdsim/blob/main/ebsdsim/crystal/build.py) and EMsoft's [`CalcMatrices`](https://github.com/EMsoft-org/EMsoft/blob/develop/Source/EMsoftLib/crystal.f90). ANG uses the native MTEX EDAX crystal alignment (a/c* for triclinic, trigonal and hexagonal crystals; a*/c otherwise). CTF uses a*/c. The exporter converts crystal coordinates by left-composing the basis rotation with the stored sample-to-crystal quaternion. For a conventional hexagonal cell, ANG keeps the stored crystal frame and CTF applies Rz(−30°). The cell and its axis setting are never fitted to the orientations.
+
+The exporter keeps the engine's sample frame and scan coordinates: x points down the tilted surface toward the detector, z is the surface normal. It does not apply specimen tilt or map/sample-frame conversions. An importer may impose vendor sample-frame defaults; use the same explicit sample-frame choices when comparing exports physically.
+
+MTEX is an external validation reference only: the application, Python package, browser and default tests have no MTEX dependency. Because the runtime does not use MTEX, `src/phase_export.zig` contains the necessary small crystal-basis adapter using existing vector, matrix and quaternion operations. Its matrices are checked against native pyMTEX 1.0.0 (upstream commit `3323a312`) `orientation.transformReferenceFrame` results for cubic, hexagonal, monoclinic, triclinic and trigonal cells. EMsoft `CrystalSystem=5` uses separate rhombohedral sampling axes and returns `UnsupportedCrystalBasis` at export until that mapping is resolved. Incompatible conventional metrics and unsupported monoclinic axis settings also return that error.
+
+Run the CPU export checks locally with `zig build test-export` after fetching the normal build dependencies (`-Dwgpu=<installed-wgpu-directory>` can override their location). Setting `ZEBSDSOLVE_EXPORT_FIXTURE_DIR` to an existing directory saves the actual ANG and CTF fixture files for native-import validation; `ZEBSDSOLVE_EXPORT_MASTER` optionally tests an original master through the same importer-to-export path. These checks do not create a GPU or run hosted CI.
+
 ## Run the app
 
 ```bash

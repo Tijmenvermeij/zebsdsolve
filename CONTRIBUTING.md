@@ -75,7 +75,25 @@ python scripts/fetch_deps.py                        # Zig 0.16.0 + wgpu-native f
 .deps/zig-0.16.0/zig build test                     # host-side unit tests (math, file readers; no GPU)
 ```
 
-`pip install .` builds and installs the wheel for this machine (`pyproject.toml` hands the build to `scripts/build_backend.py`, which runs `build_wheels.py` for the host platform). There is no editable install: reinstall after changing Zig or WGSL, or run from the checkout with `PYTHONPATH=python`.
+`pip install .` builds and installs the wheel for this machine (`pyproject.toml` hands the build to `scripts/build_backend.py`, which runs `build_wheels.py` for the host platform). For source development, use the dedicated environment below; an installed wheel must be reinstalled after engine changes.
+
+### Local Python development
+
+```bash
+python scripts/dev.py setup                 # .venv + declared Python dependencies + native build
+python scripts/dev.py watch                 # rebuild after Zig, C/header or WGSL edits
+```
+
+Use `.venv/bin/python` on macOS/Linux or `.venv\Scripts\python.exe` on Windows in your terminal, IDE or notebook kernel. Python edits take effect on the next import in a new session; engine edits are debounced and built while the watcher runs. New Python sessions select the latest successful native build, even outside the checkout. To check the source package:
+
+```bash
+python scripts/dev.py run -- -c "import zebsdsolve; print(zebsdsolve.__file__)"
+python scripts/dev.py run -- your_script.py
+```
+
+`run --` forwards arguments to a fresh environment Python; plain `run` opens an interactive session. `build` performs one build. `setup`, `build` and `watch` accept `--optimize` (default `ReleaseFast`). Python jobs are never restarted automatically: restart your session after a successful engine build. A failed build keeps the last successful library and the watcher retries after another edit.
+
+Each native build has its own `.deps/dev-builds/` directory so a loaded Windows DLL is never overwritten. `.deps/dev-build-<platform>.json` is published atomically after success; each host platform has its own selection. Explicit `ZEBSDSOLVE_LIB` and `ZEBSDSOLVE_WGPU` overrides take precedence. Old build directories are retained; remove them only after closing Python sessions that may use them. The development environment adds the checkout through a startup `.pth` file; it does not install a release wheel.
 
 From a checkout, `node scripts/serve.mjs` serves `web/app` with the freshly built `zebsdsolve.wasm` on <http://127.0.0.1:4190/web/app/>. `python -m zebsdsolve`, run from `python/`, does the same.
 

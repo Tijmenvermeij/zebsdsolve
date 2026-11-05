@@ -4,6 +4,7 @@ const std = @import("std");
 const engine = @import("engine.zig");
 const rot = @import("rot.zig");
 const sym = @import("sym.zig");
+const phase_export = @import("phase_export.zig");
 
 const Engine = engine.Engine;
 
@@ -134,11 +135,31 @@ fn tslSymmetry(laue: sym.Laue) u32 {
     };
 }
 
+/// EDAX distinguishes settings that the master's numeric PG alone cannot disambiguate.
+/// Keep those groups in Info/Symmetry rather than assert an unverified PointGroupID setting.
+fn edaxPointGroupId(pg: u32) ?u32 {
+    if (pg == 0 or pg > 32) return null;
+    return switch (pg) {
+        14, 18, 19, 20, 26 => null,
+        else => 99 + pg,
+    };
+}
+
 /// The results as text (caller frees): kind 0 EDAX/TSL .ang, 1 HKL .ctf. Orientations are
 /// Bunge angles in the engine's sample frame (x down the tilted surface toward the detector,
 /// z the surface normal), those of the stored quaternions (each in its phase's fundamental
-/// zone); cells not indexed carry the formats' own markers.
+/// zone), with the crystal basis converted to each format's native convention. The sample
+/// frame and specimen tilt are unchanged; cells not indexed carry the formats' own markers.
 pub fn exportText(e: *Engine, kind: u32) ![]u8 {
+    const format: phase_export.Format = switch (kind) {
+        0 => .ang,
+        1 => .ctf,
+        else => return error.UnknownKind,
+    };
+    // Validate every phase before writing any result; missing cells never become unit cubes.
+    const crystal_rotations = try e.gpa.alloc(rot.Quat, e.phases.items.len);
+    defer e.gpa.free(crystal_rotations);
+    for (e.phases.items, crystal_rotations) |*p, *q| q.* = try phase_export.rotation(&p.master, format);
     const i = try e.info();
     const gpa = e.gpa;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -152,7 +173,9 @@ pub fn exportText(e: *Engine, kind: u32) ![]u8 {
             // EDAX measures the pattern centre's y from the bottom and y, z in fractions of the width
             try w.print("# TEM_PIX_PER_UM          1.000000\n# x-star                 {d:.6}\n# y-star                 {d:.6}\n# z-star                 {d:.6}\n# WorkingDistance        0.000000\n#\n", .{ g.pc[0], (1 - g.pc[1]) / ratio, g.pc[2] / ratio });
             for (e.phases.items, 0..) |*p, pi| {
-                try w.print("# Phase {d}\n# MaterialName  \t{s}\n# Formula     \t\n# Info \t\t\n# Symmetry              {d}\n# LatticeConstants      1.000 1.000 1.000  90.000  90.000  90.000\n# NumberFamilies        0\n#\n", .{ pi + 1, p.master.name, tslSymmetry(p.master.laue) });
+                try w.print("# Phase {d}\n# MaterialName  \t{s}\n# Formula     \t{s}\n# Info \t\tSpaceGroup={d}; SourcePointGroup={d}\n# Symmetry              {d}\n# LatticeConstants      {d:.8} {d:.8} {d:.8}  {d:.8}  {d:.8}  {d:.8}\n# NumberFamilies        0\n", .{ pi + 1, p.master.name, p.master.formula, p.master.space_group, p.master.point_group, tslSymmetry(p.master.laue), p.master.lattice.?[0], p.master.lattice.?[1], p.master.lattice.?[2], p.master.lattice.?[3], p.master.lattice.?[4], p.master.lattice.?[5] });
+                if (edaxPointGroupId(p.master.point_group)) |pgid| try w.print("# PointGroupID           {d}\n", .{pgid});
+                try w.writeAll("#\n");
             }
             try w.print("# GRID: SqrGrid\n# XSTEP: {d:.6}\n# YSTEP: {d:.6}\n# NCOLS_ODD: {d}\n# NCOLS_EVEN: {d}\n# NROWS: {d}\n#\n# SOFTWARE: zebsdsolve {s}\n# COLUMNS: phi1 PHI phi2 x y IQ(NMI) CI(NCC) Phase SEM Fit\n", .{ g.step_x_um, g.step_y_um, i.cols, i.cols, i.rows, engine.version });
             for (0..i.rows) |r| for (0..i.cols) |c| {
@@ -165,9 +188,8 @@ pub fn exportText(e: *Engine, kind: u32) ![]u8 {
                     continue;
                 }
                 const q = e.res.quat[4 * at ..][0..4];
-                const b = rot.toBunge(.{ q[0], q[1], q[2], q[3] });
-                // single-phase files number the phase 0
-                const pid: i32 = if (n_ph == 1) 0 else ph + 1;
+                const b = rot.toBunge(phase_export.orientation(.{ q[0], q[1], q[2], q[3] }, crystal_rotations[@intCast(ph)]));
+                const pid: u32 = @intCast(ph + 1);
                 try w.print("{d:10.5} {d:10.5} {d:10.5} {d:12.5} {d:12.5} {d:8.4} {d:7.4} {d:2} {d:6} {d:6.3}\n", .{ b[0], b[1], b[2], x, y, e.res.nmi[at], e.res.ncc[at], pid, 0, 0.0 });
             };
         },
@@ -176,7 +198,7 @@ pub fn exportText(e: *Engine, kind: u32) ![]u8 {
             try w.print("Euler angles refer to Sample Coordinate system (CS0)!\tMag\t0\tCoverage\t100\tDevice\t0\tKV\t{d:.1}\tTiltAngle\t{d:.2}\tTiltAxis\t0\n", .{ if (std.math.isNan(i.voltage_kv)) 0 else i.voltage_kv, g.sample_tilt_deg });
             try w.print("Phases\t{d}\n", .{n_ph});
             for (e.phases.items) |*p| {
-                try w.print("1.000;1.000;1.000\t90.000;90.000;90.000\t{s}\t{d}\t{d}\t\t\t\n", .{ p.master.name, @intFromEnum(p.master.laue), p.master.space_group });
+                try w.print("{d:.8};{d:.8};{d:.8}\t{d:.8};{d:.8};{d:.8}\t{s}\t{d}\t{d}\t\t\t\n", .{ p.master.lattice.?[0], p.master.lattice.?[1], p.master.lattice.?[2], p.master.lattice.?[3], p.master.lattice.?[4], p.master.lattice.?[5], p.master.name, @intFromEnum(p.master.laue), p.master.space_group });
             }
             try w.writeAll("Phase\tX\tY\tBands\tError\tEuler1\tEuler2\tEuler3\tMAD\tBC\tBS\n");
             const deg = 180.0 / std.math.pi;
@@ -190,13 +212,131 @@ pub fn exportText(e: *Engine, kind: u32) ![]u8 {
                     continue;
                 }
                 const q = e.res.quat[4 * at ..][0..4];
-                const b = rot.toBunge(.{ q[0], q[1], q[2], q[3] });
+                const b = rot.toBunge(phase_export.orientation(.{ q[0], q[1], q[2], q[3] }, crystal_rotations[@intCast(ph)]));
                 const bc: u32 = @intFromFloat(@round(255 * std.math.clamp(e.res.ncc[at], 0, 1)));
                 const bs: u32 = @intFromFloat(@round(255 * std.math.clamp(e.res.nmi[at], 0, 1)));
-                try w.print("{d}\t{d:.4}\t{d:.4}\t0\t0\t{d:.4}\t{d:.4}\t{d:.4}\t0.0000\t{d}\t{d}\n", .{ ph + 1, x, y, b[0] * deg, b[1] * deg, b[2] * deg, bc, bs });
+                try w.print("{d}\t{d:.4}\t{d:.4}\t0\t0\t{d:.4}\t{d:.4}\t{d:.4}\t0.0000\t{d}\t{d}\n", .{ @as(u32, @intCast(ph + 1)), x, y, b[0] * deg, b[1] * deg, b[2] * deg, bc, bs });
             };
         },
         else => return error.UnknownKind,
     }
     return out.toOwnedSlice();
+}
+
+// An optional fixture destination lets the native MTEX oracle read actual exportText output,
+// without a GPU, production result injection, or changes to the public ABI.
+fn fixtureEnvironment(key: []const u8) !?[]u8 {
+    return std.testing.environ.getAlloc(std.testing.allocator, key) catch |err| switch (err) {
+        error.EnvironmentVariableMissing => null,
+        else => return err,
+    };
+}
+
+fn saveExportFixture(name: []const u8, format: []const u8, text: []const u8) !void {
+    const destination = (try fixtureEnvironment("ZEBSDSOLVE_EXPORT_FIXTURE_DIR")) orelse return;
+    defer std.testing.allocator.free(destination);
+    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/{s}.{s}", .{ destination, name, format });
+    defer std.testing.allocator.free(path);
+    try std.Io.Dir.cwd().writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = path, .data = text });
+}
+
+test "text export real cells indexed IDs and crystal frames" {
+    const gpa = std.testing.allocator;
+    const cells = [_][6]f64{
+        .{ 3.47514587, 3.47514587, 3.47514587, 90, 90, 90 },
+        .{ 2.95111, 2.95111, 4.68433, 90, 90, 120 },
+        .{ 4, 5, 6, 90, 104, 90 },
+        .{ 4, 5, 6, 73, 88, 102 },
+        .{ 3, 3, 5, 90, 90, 120 },
+    };
+    const laues = [_]sym.Laue{ .o, .d6, .c2, .c1, .d3 };
+    const sgs = [_]u32{ 225, 194, 10, 2, 164 };
+    const pgs = [_]u32{ 32, 27, 5, 2, 20 };
+    const names = [_][]const u8{ "cubic", "hexagonal", "monoclinic", "triclinic", "trigonal" };
+    var phases: [5]engine.Phase = undefined;
+    for (&phases, 0..) |*p, j| p.* = .{ .master = .{
+        .gpa = gpa,
+        .name = @constCast(names[j]),
+        .formula = @constCast(if (j == 1) "Ti" else ""),
+        .side = 0,
+        .raw = &.{},
+        .lattice = cells[j],
+        .laue = laues[j],
+        .space_group = sgs[j],
+        .point_group = pgs[j],
+    } };
+    // Only the members read by exportText are initialized. No GPU object is constructed.
+    var e: Engine = undefined;
+    e.gpa = gpa;
+    e.geo = .{ .step_x_um = 0.25, .step_y_um = 0.5 };
+    e.source = .{ .memory = .{ .data = &.{}, .info = .{ .rows = 1, .cols = 2, .pat_h = 8, .pat_w = 8, .voltage_kv = 20 } } };
+    const q = rot.fromBunge(.{ 0.37, 0.83, 1.21 });
+    var quats: [24]f32 = undefined;
+    for (0..6) |j| for (0..4) |k| {
+        quats[4 * j + k] = @floatCast(q[k]);
+    };
+    var ncc = [_]f32{0.8} ** 6;
+    var nmi = [_]f32{0.7} ** 6;
+    var ids = [_]i32{ 0, -1, 0, 0, 0, 0 };
+    e.res = .{ .quat = &quats, .ncc = &ncc, .nmi = &nmi, .phase = &ids };
+    for (0..5) |j| {
+        e.phases = .{ .items = phases[j..][0..1], .capacity = 1 };
+        for (0..2) |kind| {
+            const text = try exportText(&e, @intCast(kind));
+            defer gpa.free(text);
+            try saveExportFixture(names[j], if (kind == 0) "ang" else "ctf", text);
+            if (kind == 0) {
+                try std.testing.expect(std.mem.indexOf(u8, text, "# Phase 1\n") != null);
+                try std.testing.expect(std.mem.indexOf(u8, text, " 1      0  0.000\n") != null);
+                try std.testing.expect(std.mem.indexOf(u8, text, "-1.000  0      0  0.000\n") != null);
+                if (j == 4) {
+                    try std.testing.expect(std.mem.indexOf(u8, text, "PointGroupID") == null);
+                    try std.testing.expect(std.mem.indexOf(u8, text, "SpaceGroup=164; SourcePointGroup=20") != null);
+                }
+                if (j == 1) {
+                    try std.testing.expect(std.mem.indexOf(u8, text, "2.95111000 2.95111000 4.68433000  90.00000000  90.00000000  120.00000000") != null);
+                    try std.testing.expect(std.mem.indexOf(u8, text, "# Formula     \tTi\n") != null);
+                }
+            } else if (j == 1) try std.testing.expect(std.mem.indexOf(u8, text, "2.95111000;2.95111000;4.68433000\t90.00000000;90.00000000;120.00000000\thexagonal\t9\t194") != null);
+        }
+    }
+    e.phases = .{ .items = &phases, .capacity = phases.len };
+    e.source.memory.info.cols = 6;
+    ids = .{ 0, 1, 2, 3, 4, -1 };
+    for (0..2) |kind| {
+        const text = try exportText(&e, @intCast(kind));
+        defer gpa.free(text);
+        try saveExportFixture("multiphase", if (kind == 0) "ang" else "ctf", text);
+        if (kind == 0) try std.testing.expect(std.mem.indexOf(u8, text, " 5      0  0.000\n") != null);
+    }
+    // Optional original master fixture, for testing the complete importer-to-export boundary.
+    if (try fixtureEnvironment("ZEBSDSOLVE_EXPORT_MASTER")) |path| {
+        defer gpa.free(path);
+        var loaded = try @import("master.zig").load(gpa, path);
+        defer loaded.deinit();
+        var loaded_phase: [1]engine.Phase = .{.{ .master = loaded }};
+        e.phases = .{ .items = &loaded_phase, .capacity = 1 };
+        e.source.memory.info.cols = 2;
+        ids[0] = 0;
+        ids[1] = -1;
+        for (0..2) |kind| {
+            const text = try exportText(&e, @intCast(kind));
+            defer gpa.free(text);
+            try saveExportFixture("loaded", if (kind == 0) "ang" else "ctf", text);
+        }
+        e.phases = .{ .items = &phases, .capacity = phases.len };
+    }
+    phases[4].master.lattice = null;
+    try std.testing.expectError(error.MissingPhaseLattice, exportText(&e, 0));
+    phases[4].master.invalid_lattice = true;
+    try std.testing.expectError(error.InvalidPhaseLattice, exportText(&e, 1));
+    phases[4].master.crystal_basis = .emsoft_rhombohedral;
+    try std.testing.expectError(error.UnsupportedCrystalBasis, exportText(&e, 0));
+}
+
+test "text export does not claim unresolved EDAX point-group settings" {
+    for ([_]u32{ 0, 14, 18, 19, 20, 26, 33 }) |pg| try std.testing.expect(edaxPointGroupId(pg) == null);
+    try std.testing.expectEqual(@as(?u32, 124), edaxPointGroupId(25));
+    try std.testing.expectEqual(@as(?u32, 126), edaxPointGroupId(27));
+    try std.testing.expectEqual(@as(?u32, 131), edaxPointGroupId(32));
 }
