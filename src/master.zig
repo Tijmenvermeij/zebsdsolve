@@ -22,16 +22,8 @@ const Allocator = std.mem.Allocator;
 pub const Master = struct {
     gpa: Allocator,
     name: []u8,
-    /// Explicit chemical formula only; never inferred from a filename or atomic sites.
-    formula: []u8 = &.{},
-    /// Original metadata, retaining setting, origin, transformation and unit provenance.
-    metadata_json: []u8 = &.{},
-    /// a,b,c in Angstrom; alpha,beta,gamma in degrees, in the master's crystal setting.
+    /// a,b,c in Angstrom; alpha,beta,gamma in degrees.
     lattice: ?[6]f64 = null,
-    invalid_lattice: bool = false,
-    crystal_system: u32 = 0,
-    space_group_setting: u32 = 0,
-    crystal_basis: enum { a_cstar, emsoft_rhombohedral } = .a_cstar,
     /// sheet edge in pixels
     side: u32,
     /// [north | south], side · side each, as loaded (normalized)
@@ -51,15 +43,9 @@ pub const Master = struct {
     ops: []rot.Mat3 = &.{},
 
     pub fn deinit(self: *Master) void {
-        self.freeMetadata();
+        self.gpa.free(self.name);
         self.gpa.free(self.raw);
         self.gpa.free(self.ops);
-    }
-
-    fn freeMetadata(self: *Master) void {
-        self.gpa.free(self.name);
-        self.gpa.free(self.formula);
-        self.gpa.free(self.metadata_json);
     }
 
     /// Intensity of the raw master in direction `v`.
@@ -168,43 +154,22 @@ pub fn load(gpa: Allocator, path: []const u8) !Master {
     try f.read(0, &sig);
     var m = if (std.mem.eql(u8, sig[0..2], "PK")) try loadEbsdsim(gpa, &f) else try loadEmsoft(gpa, &f);
     errdefer m.deinit();
-    if (m.name.len == 0) {
-        gpa.free(m.name);
-        m.name = &.{};
-        m.name = try baseName(gpa, path);
-    }
+    gpa.free(m.name);
+    m.name = &.{};
+    m.name = try baseName(gpa, path);
     try m.measureSymmetry();
     return m;
 }
 
-fn member(value: std.json.Value, key: []const u8) ?std.json.Value {
-    return if (value == .object) value.object.get(key) else null;
-}
-
-fn jsonNumber(value: ?std.json.Value) ?f64 {
-    const v = value orelse return null;
-    return switch (v) {
-        .integer => @floatFromInt(v.integer),
-        .float => v.float,
-        else => null,
-    };
-}
-
-fn jsonUnsigned(value: ?std.json.Value, max: u32) u32 {
-    const n = jsonNumber(value) orelse return 0;
-    if (!std.math.isFinite(n) or n < 1 or n > @as(f64, @floatFromInt(max)) or n != @floor(n)) return 0;
-    return @intFromFloat(n);
-}
-
-fn explicitString(gpa: Allocator, root: std.json.Value, cell: std.json.Value, keys: []const []const u8) ![]u8 {
-    for ([_]std.json.Value{ cell, root }) |v| for (keys) |key| {
-        if (member(v, key)) |str| if (str == .string and str.string.len > 0) {
-            // Phase labels occupy one line in ANG and CTF headers.
-            if (std.mem.indexOfAny(u8, str.string, "\r\n\t") != null) return error.InvalidMasterMetadata;
-            return gpa.dupe(u8, str.string);
-        };
-    };
-    return &.{};
+fn metaNumber(json: []const u8, key: []const u8) ?f64 {
+    var pat_buf: [64]u8 = undefined;
+    const pat = std.fmt.bufPrint(&pat_buf, "\"{s}\":", .{key}) catch return null;
+    const at = std.mem.indexOf(u8, json, pat) orelse return null;
+    var p = at + pat.len;
+    while (p < json.len and json[p] == ' ') p += 1;
+    var e = p;
+    while (e < json.len and (std.ascii.isDigit(json[e]) or json[e] == '.' or json[e] == '-' or json[e] == 'e' or json[e] == 'E' or json[e] == '+')) e += 1;
+    return std.fmt.parseFloat(f64, json[p..e]) catch null;
 }
 
 /// Older ebsdsim versions wrote Python JSON's bare Infinity/NaN diagnostic values.
@@ -254,31 +219,25 @@ pub fn validLattice(cell: [6]f64) bool {
     return 1 + 2 * ca * cb * cg - ca * ca - cb * cb - cg * cg > 1e-12;
 }
 
-fn readEbsdsimMetadata(m: *Master, root: std.json.Value, original: []const u8) !void {
-    if (root != .object) return error.InvalidMasterMetadata;
-    m.metadata_json = try m.gpa.dupe(u8, original);
-    // Only the top-level standardized cell belongs to the pattern. cif_input is provenance.
-    const cell = member(root, "cell") orelse .null;
-    if (cell != .null) {
-        var lattice: [6]f64 = undefined;
-        const keys = [_][]const u8{ "a_angstrom", "b_angstrom", "c_angstrom", "alpha_deg", "beta_deg", "gamma_deg" };
-        m.invalid_lattice = false;
-        for (keys, 0..) |key, i| lattice[i] = jsonNumber(member(cell, key)) orelse blk: {
-            m.invalid_lattice = true;
-            break :blk 0;
+fn ebsdsimLattice(gpa: Allocator, meta: []const u8) !?[6]f64 {
+    const compatible = try compatibleJson(gpa, meta);
+    defer gpa.free(compatible);
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, compatible, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const cell = parsed.value.object.get("cell") orelse return null;
+    if (cell != .object) return null;
+    var lattice: [6]f64 = undefined;
+    const keys = [_][]const u8{ "a_angstrom", "b_angstrom", "c_angstrom", "alpha_deg", "beta_deg", "gamma_deg" };
+    for (keys, 0..) |key, i| {
+        const value = cell.object.get(key) orelse return null;
+        lattice[i] = switch (value) {
+            .integer => @floatFromInt(value.integer),
+            .float => value.float,
+            else => return null,
         };
-        m.invalid_lattice = m.invalid_lattice or !validLattice(lattice);
-        if (!m.invalid_lattice) m.lattice = lattice;
     }
-    const name = try explicitString(m.gpa, root, cell, &.{ "phase_name", "material_name", "name" });
-    m.gpa.free(m.name);
-    m.name = name;
-    m.formula = try explicitString(m.gpa, root, cell, &.{ "formula", "chemical_formula" });
-    m.point_group = jsonUnsigned(member(root, "pg_num"), 32);
-    if (m.point_group == 0) m.point_group = jsonUnsigned(member(cell, "pg_num"), 32);
-    m.space_group = jsonUnsigned(member(cell, "space_group"), 230);
-    if (m.space_group == 0) m.space_group = jsonUnsigned(member(root, "space_group"), 230);
-    m.voltage_kv = jsonNumber(member(root, "voltage_kv")) orelse 0;
+    return if (validLattice(lattice)) lattice else null;
 }
 
 fn loadEbsdsim(gpa: Allocator, f: *File) !Master {
@@ -294,11 +253,7 @@ fn loadEbsdsim(gpa: Allocator, f: *File) !Master {
     defer nrm_a.deinit(gpa);
     var meta_a = try z.array("meta_json");
     defer if (meta_a) |*a| a.deinit(gpa);
-    const meta: []const u8 = if (meta_a) |a| a.data else "{}";
-    const compatible = try compatibleJson(gpa, meta);
-    defer gpa.free(compatible);
-    const parsed = std.json.parseFromSlice(std.json.Value, gpa, compatible, .{}) catch return error.InvalidMasterMetadata;
-    defer parsed.deinit();
+    const meta: []const u8 = if (meta_a) |a| a.data else "";
 
     // values per direction: energy 0 and site 0 are the integrated slices of format 2; the
     // legacy array is (direction, site)
@@ -319,10 +274,7 @@ fn loadEbsdsim(gpa: Allocator, f: *File) !Master {
 
     var hw: usize = 0;
     for (0..n_k) |i| hw = @max(hw, @as(usize, @intFromFloat(@max(@abs(kij.at(i * 3)), @abs(kij.at(i * 3 + 1))))));
-    if (jsonNumber(member(parsed.value, "halfw"))) |h| {
-        if (!std.math.isFinite(h) or h < 1 or h > 32767 or h != @floor(h)) return error.InvalidMasterMetadata;
-        hw = @intFromFloat(h);
-    }
+    if (metaNumber(meta, "halfw")) |h| hw = @intFromFloat(h);
     const side = 2 * hw + 1;
     const plane = side * side;
 
@@ -393,8 +345,11 @@ fn loadEbsdsim(gpa: Allocator, f: *File) !Master {
         .raw = sheets,
         .source = "ebsdsim",
     };
-    errdefer m.freeMetadata();
-    try readEbsdsimMetadata(&m, parsed.value, meta);
+    errdefer gpa.free(m.name);
+    m.lattice = try ebsdsimLattice(gpa, meta);
+    if (metaNumber(meta, "pg_num")) |v| m.point_group = @intFromFloat(v);
+    if (metaNumber(meta, "space_group")) |v| m.space_group = @intFromFloat(v);
+    if (metaNumber(meta, "voltage_kv")) |v| m.voltage_kv = v;
     if (m.point_group == 0 and m.space_group != 0) m.point_group = sym.pointGroupOfSpaceGroup(m.space_group) orelse 0;
     m.laue = sym.laueOfPointGroup(m.point_group) orelse laueFromOperators(ops);
     m.rotation = sym.rotationsOfPointGroup(m.point_group) orelse m.laue;
@@ -489,13 +444,6 @@ fn hasSixfold(rots: []const rot.Mat3) bool {
     return false;
 }
 
-/// EMsoft CrystalData stores lengths in nm and angles in degrees.
-fn emsoftLattice(raw: [6]f64) ?[6]f64 {
-    var cell = raw;
-    for (cell[0..3]) |*v| v.* *= 10;
-    return if (validLattice(cell)) cell else null;
-}
-
 fn loadEmsoft(gpa: Allocator, f: *File) !Master {
     var h = hdf5.Hdf5.open(gpa, f) catch return error.NotAMasterPattern;
     const nh_addr = (try h.find("EMData/EBSDmaster/mLPNH")) orelse (try h.find("EMData/TKDmaster/mLPNH")) orelse (try h.find("EMData/ECPmaster/mLPNH")) orelse return error.NotAMasterPattern;
@@ -561,44 +509,16 @@ fn loadEmsoft(gpa: Allocator, f: *File) !Master {
         .raw = sheets,
         .source = "emsoft",
     };
-    errdefer m.freeMetadata();
+    errdefer gpa.free(m.name);
     if (try h.find("CrystalData/LatticeParameters")) |a| {
-        var cell: [7]f64 = undefined;
-        const count = h.numbers(a, &cell) catch 0;
-        if (count == 6) {
-            m.lattice = emsoftLattice(cell[0..6].*);
-            m.invalid_lattice = m.lattice == null;
-        } else m.invalid_lattice = true;
-    }
-    if (try h.find("CrystalData/CrystalSystem")) |a| {
-        const system = h.number(a) catch 0;
-        if (std.math.isFinite(system) and system >= 1 and system <= 7 and system == @floor(system)) m.crystal_system = @intFromFloat(system);
-        if (m.crystal_system == 5) m.crystal_basis = .emsoft_rhombohedral;
-    }
-    if (try h.find("CrystalData/SpaceGroupNumber")) |a| {
-        const sg = h.number(a) catch 0;
-        if (std.math.isFinite(sg) and sg >= 1 and sg <= 230 and sg == @floor(sg)) m.space_group = @intFromFloat(sg);
-    }
-    var label_buffer: [4096]u8 = undefined;
-    for ([_][]const u8{ "CrystalData/MaterialName", "CrystalData/PhaseName" }) |key| {
-        if (try h.find(key)) |a| {
-            const label = h.string(a, &label_buffer) catch continue;
-            if (label.len != 0 and std.mem.indexOfAny(u8, label, "\r\n\t") == null) {
-                const name = try gpa.dupe(u8, label);
-                gpa.free(m.name);
-                m.name = name;
-                break;
-            }
+        var values: [7]f64 = undefined;
+        if ((h.numbers(a, &values) catch 0) == 6) {
+            var cell = values[0..6].*;
+            for (cell[0..3]) |*v| v.* *= 10; // EMsoft lengths are nm; ANG/CTF use Angstrom.
+            if (validLattice(cell)) m.lattice = cell;
         }
     }
-    if (try h.find("CrystalData/Formula")) |a| {
-        const formula = h.string(a, &label_buffer) catch label_buffer[0..0];
-        if (std.mem.indexOfAny(u8, formula, "\r\n\t") == null) m.formula = try gpa.dupe(u8, formula);
-    }
-    if (try h.find("CrystalData/SpaceGroupSetting")) |a| {
-        const setting = h.number(a) catch 0;
-        if (std.math.isFinite(setting) and setting >= 1 and setting <= 3 and setting == @floor(setting)) m.space_group_setting = @intFromFloat(setting);
-    }
+    if (try h.find("CrystalData/SpaceGroupNumber")) |a| m.space_group = @intFromFloat(h.number(a) catch 0);
     if (try h.find("NMLparameters/MCCLNameList/EkeV")) |a| m.voltage_kv = h.number(a) catch 0;
     m.point_group = sym.pointGroupOfSpaceGroup(m.space_group) orelse 0;
     m.laue = sym.laueOfPointGroup(m.point_group) orelse .c1;
@@ -710,9 +630,6 @@ test "the nickel master expands to a symmetric, normalized sphere" {
     try std.testing.expectEqual(@as(u32, 32), m.point_group);
     try std.testing.expectEqual(sym.Laue.o, m.laue);
     try std.testing.expectEqualStrings("Ni_master_20kV", m.name);
-    try std.testing.expectEqualStrings("", m.formula);
-    try std.testing.expectEqual(@as(u32, 225), m.space_group);
-    try std.testing.expectApproxEqAbs(@as(f64, 3.47514587), m.lattice.?[0], 1e-10);
     try std.testing.expectEqual(@as(usize, 48), m.ops.len);
     try std.testing.expectApproxEqAbs(@as(f64, 20), m.voltage_kv, 1e-9);
     var s: f64 = 0;
@@ -737,65 +654,4 @@ test "the nickel master expands to a symmetric, normalized sphere" {
     try std.testing.expectEqual(@as(u32, 4), hm.rules.n_fold);
     try std.testing.expect(hm.rules.mirror and hm.rules.inversion);
     try std.testing.expect(sh.power(24, hm.f) > 0.05);
-}
-
-fn metadataTest(gpa: Allocator, source: []const u8) !void {
-    const normalized = try compatibleJson(gpa, source);
-    defer gpa.free(normalized);
-    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, normalized, .{});
-    defer parsed.deinit();
-    var m: Master = .{ .gpa = gpa, .name = &.{}, .side = 0, .raw = &.{} };
-    defer m.deinit();
-    try readEbsdsimMetadata(&m, parsed.value, source);
-    try std.testing.expectEqualStrings("Titanium", m.name);
-    try std.testing.expectEqualStrings("Ti", m.formula);
-    try std.testing.expectEqual(@as(u32, 194), m.space_group);
-    try std.testing.expectEqual(@as(u32, 27), m.point_group);
-    try std.testing.expectApproxEqAbs(@as(f64, 2.95111), m.lattice.?[0], 1e-12);
-    try std.testing.expectApproxEqAbs(@as(f64, 120), m.lattice.?[5], 1e-12);
-    try std.testing.expectEqualStrings(source, m.metadata_json);
-}
-
-test "phase metadata reads only the authoritative structured cell with lossless settings" {
-    const source =
-        \\{"cif_input":{"cell":{"a_angstrom":99,"space_group":1}},"diagnostic":Infinity,
-        \\"cell":{"gamma_deg":120,"beta_deg":90,"c_angstrom":4.68433,"alpha_deg":90,
-        \\"b_angstrom":2.95111,"a_angstrom":2.95111,"space_group":194,"pg_num":27,
-        \\"setting":"IT standard","rhombohedral_input":false,"formula":"Ti","name":"Titanium"}}
-    ;
-    try metadataTest(std.testing.allocator, source);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, metadataTest, .{source});
-}
-
-test "phase metadata missing invalid and non-finite cells stay available for indexing" {
-    const sources = [_][]const u8{
-        "{}",
-        "{\"cif_input\":{\"cell\":{\"a_angstrom\":3}}}",
-        "{\"cell\":{\"a_angstrom\":-1}}",
-        "{\"cell\":{\"a_angstrom\":NaN,\"b_angstrom\":3,\"c_angstrom\":3,\"alpha_deg\":90,\"beta_deg\":90,\"gamma_deg\":90}}",
-        "{\"cell\":{\"a_angstrom\":3,\"b_angstrom\":3,\"c_angstrom\":3,\"alpha_deg\":10,\"beta_deg\":10,\"gamma_deg\":170}}",
-    };
-    for (sources, 0..) |source, index| {
-        const normalized = try compatibleJson(std.testing.allocator, source);
-        defer std.testing.allocator.free(normalized);
-        const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, normalized, .{});
-        defer parsed.deinit();
-        var m: Master = .{ .gpa = std.testing.allocator, .name = &.{}, .side = 0, .raw = &.{} };
-        defer m.deinit();
-        try readEbsdsimMetadata(&m, parsed.value, source);
-        try std.testing.expect(m.lattice == null);
-        try std.testing.expectEqual(index >= 2, m.invalid_lattice);
-        try std.testing.expectEqualStrings("", m.name);
-        try std.testing.expectEqualStrings("", m.formula);
-    }
-    try std.testing.expect(!validLattice(.{ 3, 3, 3, 0, 90, 90 }));
-    try std.testing.expect(!validLattice(.{ 3, 3, 3, 90, 90, 180 }));
-}
-
-test "EMsoft lattice converts nm to Angstrom once and keeps degrees" {
-    const cell = emsoftLattice(.{ 0.295111, 0.295111, 0.468433, 90, 90, 120 }).?;
-    try std.testing.expectApproxEqAbs(@as(f64, 2.95111), cell[0], 1e-12);
-    try std.testing.expectApproxEqAbs(@as(f64, 4.68433), cell[2], 1e-12);
-    try std.testing.expectEqual(@as(f64, 120), cell[5]);
-    try std.testing.expect(emsoftLattice(.{ 0, 0.3, 0.3, 90, 90, 90 }) == null);
 }

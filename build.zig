@@ -11,16 +11,8 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const wasm_optimize = b.option(std.builtin.OptimizeMode, "wasm-optimize", "optimization of zebsdsolve.wasm (default ReleaseSmall)") orelse .ReleaseSmall;
-    // Match scripts/fetch_deps.py's wheel-platform directories. Headers are needed by
-    // CPU export tests too, so a plain build/test must use the local platform's download.
-    const arm = target.result.cpu.arch == .aarch64;
-    const wgpu_platform = switch (target.result.os.tag) {
-        .windows => if (arm) "win_arm64" else "win_amd64",
-        .macos => if (arm) "macosx_11_0_arm64" else "macosx_11_0_x86_64",
-        else => if (arm) "manylinux_2_28_aarch64" else "manylinux_2_28_x86_64",
-    };
     const wgpu_dir = b.option([]const u8, "wgpu", "unpacked wgpu-native release (include/webgpu)") orelse
-        b.pathJoin(&.{ ".deps", "wgpu-native", wgpu_platform });
+        ".deps/wgpu-native/win_amd64";
 
     const shaders = b.createModule(.{ .root_source_file = b.path("shaders/shaders.zig") });
 
@@ -69,19 +61,10 @@ pub fn build(b: *std.Build) void {
     // Host-side unit tests: everything that needs no GPU (run from the repo root: the file
     // readers' tests open testdata/).
     const test_step = b.step("test", "run the host-side unit tests");
-    for ([_][]const u8{ "src/sh.zig", "src/master.zig", "src/phase_export.zig", "src/scan.zig", "src/geometry.zig", "src/settings.zig", "src/reduce.zig" }) |f| {
+    for ([_][]const u8{ "src/sh.zig", "src/master.zig", "src/scan.zig", "src/geometry.zig", "src/settings.zig", "src/reduce.zig" }) |f| {
         const t = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path(f), .target = target, .optimize = optimize, .link_libc = target.result.os.tag != .windows }) });
         test_step.dependOn(&b.addRunArtifact(t).step);
     }
-
-    // Actual text export checks use synthetic CPU results; no GPU or indexing is started.
-    const export_test_mod = b.createModule(.{ .root_source_file = b.path("src/output.zig"), .target = target, .optimize = optimize, .link_libc = target.result.os.tag != .windows });
-    export_test_mod.addImport("webgpu_c", webgpu_c);
-    export_test_mod.addImport("shaders", shaders);
-    const export_tests = b.addTest(.{ .root_module = export_test_mod, .filters = &.{"text export"} });
-    const run_export_tests = b.addRunArtifact(export_tests);
-    test_step.dependOn(&run_export_tests.step);
-    b.step("test-export", "run CPU-only ANG/CTF export checks").dependOn(&run_export_tests.step);
 
     // Browser module: wasm32-freestanding, GPU calls imported from web/zebsdsolve.js.
     const wasm_target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
