@@ -1,6 +1,10 @@
 {
-  "source_revision": "93e4ff384342e2425248c17a60d9395ae1db5164",
-  "source_url": "https://github.com/Tijmenvermeij/zebsdsolve/tree/93e4ff384342e2425248c17a60d9395ae1db5164",
-  "release_url": "https://github.com/Tijmenvermeij/zebsdsolve/releases/tag/windows-93e4ff3",
-  "wasm_sha256": "b7f7122166cc5d35d43ebe1553536cae35ecec6a17bf4144db47c611be36d8f0"
+  "source_revision": "6cfc01a08a44a58bd7fd848cb20521c324129b2d",
+  "source_dirty": false,
+  "sha256": {
+    "index.html": "874e1ad4dbb4b54fceb455f1ca9f682a242bedfbee49dc1504bfee8bc25ee748",
+    "js/app.js": "e2d649cdffaf833988596f36c91da568ba3baf3c05ca713a82ace10d6ed7eff8",
+    "zebsdsolve/zebsdsolve.js": "4dec48802b385f3dcac42028f8fed4489e6c2566b4fb96f25b986f05325d7fec",
+    "zebsdsolve/zebsdsolve.wasm": "116259f4f6966b476e6fa953a4996bf9e8f5f6ab2799b38d8d0f114f4b3e22d5"
+  }
 }
