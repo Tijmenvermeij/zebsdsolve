@@ -139,13 +139,14 @@ fn tslSymmetry(laue: sym.Laue) u32 {
 /// z the surface normal), those of the stored quaternions (each in its phase's fundamental
 /// zone); cells not indexed carry the formats' own markers.
 pub fn exportText(e: *Engine, kind: u32) ![]u8 {
+    if (!e.res.context_consistent) return error.MixedIndexingContextsReindexScan;
     for (e.phases.items) |p| if (p.master.lattice == null) return error.MissingPhaseLattice;
     const i = try e.info();
     const gpa = e.gpa;
     var out: std.Io.Writer.Allocating = .init(gpa);
     errdefer out.deinit();
     const w = &out.writer;
-    const g = &e.geo;
+    const g = if (e.res.context) |*context| &context.geometry else &e.geo;
     const n_ph = e.phases.items.len;
     const ratio = @as(f64, @floatFromInt(i.pat_w)) / @as(f64, @floatFromInt(i.pat_h));
     switch (kind) {

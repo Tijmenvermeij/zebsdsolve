@@ -421,7 +421,36 @@ const Source = union(enum) {
 };
 
 /// Per map cell (row-major): the chosen phase's orientation and scores; phase −1: not indexed.
+pub const ExportContext = struct {
+    settings: settings_mod.Settings,
+    geometry: Geometry,
+    calibration: @import("oxford.zig").Calibration,
+    phase_generation: u64,
+};
+
+fn sameExportContext(a: ExportContext, b: ExportContext) bool {
+    var x = a.settings;
+    var y = b.settings;
+    inline for (.{ "batch", "tile_mb", "refine_pixels", "wg_fft", "wg_refine" }) |key| {
+        @field(x, key) = 0;
+        @field(y, key) = 0;
+    }
+    x.ipf_colors = .classic;
+    y.ipf_colors = .classic;
+    x.ipf_lightness = 0;
+    y.ipf_lightness = 0;
+    x.ipf_gray = 0;
+    y.ipf_gray = 0;
+    return std.meta.eql(x, y) and std.meta.eql(a.geometry, b.geometry) and @import("oxford.zig").Calibration.eql(a.calibration, b.calibration) and a.phase_generation == b.phase_generation;
+}
+
 pub const Results = struct {
+    context: ?ExportContext = null,
+    context_consistent: bool = true,
+    /// Phase-major, best stored candidate per phase; no within-phase peak search.
+    candidates: []Record = &.{},
+    candidate_sweep: []i32 = &.{},
+    candidate_phases: usize = 0,
     quat: []f32 = &.{},
     ncc: []f32 = &.{},
     nmi: []f32 = &.{},
@@ -446,6 +475,9 @@ pub const Results = struct {
     }
 
     fn clear(self: *Results) void {
+        self.context = null;
+        self.context_consistent = true;
+        @memset(self.candidate_sweep, -1);
         @memset(self.quat, 0);
         @memset(self.ncc, 0);
         @memset(self.nmi, 0);
@@ -456,6 +488,8 @@ pub const Results = struct {
     }
 
     fn free(self: *Results, gpa: Allocator) void {
+        gpa.free(self.candidates);
+        gpa.free(self.candidate_sweep);
         gpa.free(self.quat);
         gpa.free(self.ncc);
         gpa.free(self.nmi);
@@ -464,6 +498,20 @@ pub const Results = struct {
         gpa.free(self.sweep);
         gpa.free(self.settled);
         self.* = .{};
+    }
+
+    fn prepareCandidates(self: *Results, gpa: Allocator, phases: usize) !void {
+        const count = try std.math.mul(usize, self.phase.len, phases);
+        if (self.candidates.len == count and self.candidate_phases == phases) return;
+        const records = try gpa.alloc(Record, count);
+        errdefer gpa.free(records);
+        const sweeps = try gpa.alloc(i32, count);
+        @memset(sweeps, -1);
+        gpa.free(self.candidates);
+        gpa.free(self.candidate_sweep);
+        self.candidates = records;
+        self.candidate_sweep = sweeps;
+        self.candidate_phases = phases;
     }
 };
 
@@ -495,7 +543,12 @@ pub const Engine = struct {
     dev: *gpu_mod.Backend.Device,
     g: Gpu,
     set: Settings = .{},
+    /// Manual and restored project mask choices persist across scans; automatic choices
+    /// are recalculated from every newly opened format and never become explicit.
+    mask_explicit: bool = false,
     geo: Geometry = .{},
+    calibration: @import("oxford.zig").Calibration = .{},
+    phase_generation: u64 = 0,
     events: events_mod.Sink,
     source: Source = .none,
     phases: std.ArrayList(Phase) = .empty,
@@ -673,7 +726,8 @@ pub const Engine = struct {
     // ── settings ──
 
     pub fn configure(self: *Engine, json: []const u8) !void {
-        try self.set.apply(self.gpa, json);
+        const explicit = try self.set.applyTrackingMask(self.gpa, json);
+        self.mask_explicit = self.mask_explicit or explicit;
     }
 
     // ── scan ──
@@ -685,6 +739,7 @@ pub const Engine = struct {
             .none => {},
         }
         self.source = .none;
+        self.calibration = .{};
         self.tuneFree();
         self.cache.deinit(self.gpa);
         self.ahead = &.{};
@@ -732,6 +787,7 @@ pub const Engine = struct {
         self.closeScan();
         self.source = .{ .file = s };
         try self.adoptInfo(s.info);
+        if (!self.mask_explicit) self.set.mask = s.format.defaultMask();
         self.events.log("opened {s}: {d} × {d} patterns of {d} × {d}", .{ s.formatName(), s.info.rows, s.info.cols, s.info.pat_h, s.info.pat_w });
     }
 
@@ -748,10 +804,12 @@ pub const Engine = struct {
         self.closeScan();
         self.source = .{ .memory = .{ .data = copy, .info = .{ .rows = rows, .cols = cols, .pat_h = h, .pat_w = w, .pixel = pixel } } };
         try self.res.resize(self.gpa, @as(usize, rows) * cols);
+        if (!self.mask_explicit) self.set.mask = true;
     }
 
     fn adoptInfo(self: *Engine, si: scan_mod.Info) !void {
         try self.res.resize(self.gpa, @as(usize, si.rows) * si.cols);
+        self.calibration = si.calibration;
         const g = &self.geo;
         if (!std.math.isNan(si.pc[0]) and !std.math.isNan(si.pc[1]) and !std.math.isNan(si.pc[2])) {
             g.pc = si.pc;
@@ -762,6 +820,15 @@ pub const Engine = struct {
         if (!std.math.isNan(si.px_um)) g.px_um = si.px_um;
         if (!std.math.isNan(si.step_x_um)) g.step_x_um = si.step_x_um;
         if (!std.math.isNan(si.step_y_um)) g.step_y_um = si.step_y_um;
+        if (si.calibration.metadata != null) {
+            // Oxford has a full calibrated baseline; `rot` is only its fitted
+            // residual. Never inherit unknown pixel size from a previous scan.
+            g.rot = .{ 0, 0, 0 };
+            g.detector_tilt_deg = 0;
+            g.px_um = if (std.math.isFinite(si.px_um)) si.px_um else 0;
+            if (si.calibration.status() != .supported)
+                self.events.log("Oxford automatic frame unavailable: {s}", .{@tagName(si.calibration.status())});
+        }
     }
 
     pub fn info(self: *const Engine) !scan_mod.Info {
@@ -1365,7 +1432,7 @@ pub const Engine = struct {
 
     pub fn frame(self: *const Engine, lv: Level) !spherical.Frame {
         const hw = try self.patternShape(lv);
-        const R = self.geo.rotation();
+        const R = self.calibration.rotation(&self.geo);
         return .{
             .c0 = .{ @floatCast(R[0]), @floatCast(R[3]), @floatCast(R[6]) },
             .c1 = .{ @floatCast(R[1]), @floatCast(R[4]), @floatCast(R[7]) },
@@ -1379,7 +1446,7 @@ pub const Engine = struct {
     /// The detector's position under `geo` in a level's pixels (the reference cell's).
     pub fn translationOf(self: *const Engine, geo: *const Geometry, lv: Level) !rot.Vec3 {
         const sz = try self.sizeOf(lv);
-        return geo.translation(sz[0], sz[1]);
+        return self.calibration.translation(geo, sz[0], sz[1]);
     }
 
     /// Beam offset of a cell from the map's reference (its centre), in a level's pixels.
@@ -1407,6 +1474,8 @@ pub const Engine = struct {
         self.peaks.appendAssumeCapacity(.{});
         for (self.bands.items) |b| b.ph.appendAssumeCapacity(null);
         self.events.log("phase {d}: {s} ({s}, {d} px, point group {s})", .{ self.phases.items.len - 1, m.name, m.source, m.side, if (m.point_group >= 1 and m.point_group <= 32) sym.point_group_names[m.point_group - 1] else "?" });
+        self.res.clear();
+        self.phase_generation += 1;
         return @intCast(self.phases.items.len - 1);
     }
 
@@ -1420,6 +1489,8 @@ pub const Engine = struct {
         for (self.peaks.items) |*b| self.g.release(b);
         self.peaks.clearRetainingCapacity();
         self.clearFit();
+        self.res.clear();
+        self.phase_generation += 1;
     }
 
     pub fn phaseInfo(self: *Engine, index: u32) !PhaseInfo {
@@ -1896,6 +1967,7 @@ pub const Engine = struct {
         var h = std.hash.Wyhash.init(n_ph);
         h.update(json);
         h.update(std.mem.asBytes(&self.geo));
+        self.calibration.hash(&h);
         for (self.phases.items) |*p| h.update(std.mem.asBytes(&p.serial));
         const key = h.final() | 1;
         if (key == self.chance_key and self.chance_med.len == n_ph) return;
@@ -1992,7 +2064,27 @@ pub const Engine = struct {
 
     pub fn indexBegin(self: *Engine) !void {
         if (self.phases.items.len == 0) return error.NoPhases;
+        try self.res.prepareCandidates(self.gpa, self.phases.items.len);
         const cells = try self.regionCells();
+        const included = self.gpa.alloc(bool, self.res.phase.len) catch |err| {
+            self.gpa.free(cells);
+            return err;
+        };
+        defer self.gpa.free(included);
+        @memset(included, false);
+        for (cells) |cell| included[@intCast(cell)] = true;
+        var outside = false;
+        for (self.res.phase, 0..) |phase, cell| if (phase >= 0 and !included[cell]) {
+            outside = true;
+            break;
+        };
+        const context: ExportContext = .{ .settings = self.set, .geometry = self.geo, .calibration = self.calibration, .phase_generation = self.phase_generation };
+        if (!outside) {
+            self.res.context_consistent = true;
+        } else if (self.res.context) |old| {
+            if (!sameExportContext(old, context)) self.res.context_consistent = false;
+        }
+        self.res.context = context;
         self.gpa.free(self.index_cells);
         self.index_cells = cells;
         self.nl_report = if (self.set.nlpar) .wanted else .off;
@@ -2003,6 +2095,7 @@ pub const Engine = struct {
         self.index_accepted = 0;
         self.cancel = false;
         for (cells) |c| {
+            for (0..self.res.candidate_phases) |p| self.res.candidate_sweep[p * self.res.phase.len + @as(usize, @intCast(c))] = -1;
             self.res.phase[@intCast(c)] = -1;
             self.res.sweep[@intCast(c)] = -1;
             self.res.z[@intCast(c)] = 0;
@@ -2054,6 +2147,9 @@ pub const Engine = struct {
     /// refinement had settled (settings.accept_step_deg). Every cell keeps the best match any
     /// sweep gave it, accepted or not.
     pub fn indexStep(self: *Engine) !usize {
+        if (self.res.context) |context| {
+            if (!sameExportContext(context, .{ .settings = self.set, .geometry = self.geo, .calibration = self.calibration, .phase_generation = self.phase_generation })) self.res.context_consistent = false;
+        }
         const s = &self.set;
         const left = self.index_cells.len - self.index_done;
         if (left == 0 or self.cancel) return 0;
@@ -2068,6 +2164,17 @@ pub const Engine = struct {
         try self.indexCells(cells, .{ .method = sw.method, .bandwidth = sw.bandwidth, .dict_grid = sw.dict_grid }, recs);
         const settle: f32 = @floatCast(std.math.degreesToRadians(s.accept_step_deg));
         for (cells, 0..) |c, b| {
+            const cell: usize = @intCast(c);
+            for (0..n_ph) |pi| {
+                const slot = pi * self.res.phase.len + cell;
+                const candidate = recs[pi * n + b];
+                const value = if (s.phase_by == .nmi) candidate.nmi else candidate.ncc;
+                const previous = if (self.res.candidate_sweep[slot] < 0) -std.math.inf(f32) else if (s.phase_by == .nmi) self.res.candidates[slot].nmi else self.res.candidates[slot].ncc;
+                if (self.res.candidate_sweep[slot] < 0 or value > previous) {
+                    self.res.candidates[slot] = candidate;
+                    self.res.candidate_sweep[slot] = @intCast(self.index_sweep);
+                }
+            }
             const p = self.choosePhase(recs, n, b);
             const r = recs[p * n + b];
             const at: usize = @intCast(c);
@@ -2382,6 +2489,18 @@ pub const Engine = struct {
         }
     }
 
+    pub fn storedOverviewKind(self: *const Engine) scan_mod.OverviewKind {
+        return switch (self.source) { .file => |s| s.overview_kind, else => .none };
+    }
+
+    pub fn storedOverviewCount(self: *const Engine) usize {
+        return switch (self.source) { .file => |s| if (s.overview_addr != null) @intCast(s.count()) else 0, else => 0 };
+    }
+
+    pub fn readStoredOverview(self: *Engine, out: []f32) !void {
+        switch (self.source) { .file => |s| try s.readStoredOverview(out), else => return error.NoStoredOverview }
+    }
+
     /// Simulated patterns of a phase at the given orientations, each as cell `cells[k]` would
     /// record it at a level, from the master as filtered for that level.
     pub fn simulate(self: *Engine, phase: u32, cells: []const u64, quats: []const f32, lv: Level, out: []f32) !void {
@@ -2421,7 +2540,9 @@ pub const Engine = struct {
         defer gpa.free(data);
         @memset(data, 0);
         // an empty scan of the shape first: a cell's place in it is part of its geometry
+        const calibration = self.calibration;
         try self.setPatterns(std.mem.sliceAsBytes(data), .f32, s.toy_rows, s.toy_cols, s.toy_height, s.toy_width);
+        self.calibration = calibration;
 
         // the microstructure
         var structure = std.Random.DefaultPrng.init(s.toy_seed);

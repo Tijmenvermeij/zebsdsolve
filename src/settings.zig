@@ -134,6 +134,7 @@ pub const Settings = struct {
     bp_fine: f64 = 1,
     bp_coarse: f64 = 8,
     /// Circular mask; its radius is mask_radius × half the pattern's smaller side.
+    /// Until explicitly configured, opening a scan uses its format's default.
     mask: bool = true,
     mask_radius: f64 = 1,
 
@@ -313,6 +314,12 @@ pub const Settings = struct {
 
     /// Apply a JSON object of overrides. Unknown keys are an error (so typos are caught).
     pub fn apply(self: *Settings, gpa: std.mem.Allocator, json: []const u8) !void {
+        _ = try self.applyTrackingMask(gpa, json);
+    }
+
+    /// Apply overrides and report whether a mask choice was explicitly supplied. Only a
+    /// successful transaction changes either the settings or the caller's provenance.
+    pub fn applyTrackingMask(self: *Settings, gpa: std.mem.Allocator, json: []const u8) !bool {
         const parsed = try std.json.parseFromSlice(std.json.Value, gpa, json, .{});
         defer parsed.deinit();
         const obj = switch (parsed.value) {
@@ -332,6 +339,7 @@ pub const Settings = struct {
         }
         try next.check();
         self.* = next;
+        return obj.contains("mask");
     }
 
     /// Reject values the pipeline cannot run with (rather than clamping them silently).
@@ -411,6 +419,27 @@ test "apply" {
     const j = try s.toJson(std.testing.allocator);
     defer std.testing.allocator.free(j);
     try std.testing.expect(std.mem.indexOf(u8, j, "\"method\":\"dictionary\"") != null);
+}
+
+test "mask override provenance includes unchanged values and restored projects" {
+    const gpa = std.testing.allocator;
+    var s: Settings = .{};
+    try std.testing.expect(!try s.applyTrackingMask(gpa, "{\"bandwidth\":88}"));
+    // Supplying the existing value is still an explicit choice.
+    try std.testing.expect(try s.applyTrackingMask(gpa, "{\"mask\":true}"));
+    try std.testing.expect(s.mask);
+    try std.testing.expect(try s.applyTrackingMask(gpa, "{\"mask\":false}"));
+    try std.testing.expect(!s.mask);
+    try std.testing.expect(!try s.applyTrackingMask(gpa, "{\"mask_radius\":0.9}"));
+    try std.testing.expectError(error.BadSetting, s.applyTrackingMask(gpa, "{\"mask\":true,\"binning\":0}"));
+    try std.testing.expect(!s.mask);
+    try std.testing.expectError(error.UnknownSetting, s.applyTrackingMask(gpa, "{\"mask\":true,\"unknown\":0}"));
+    try std.testing.expect(!s.mask);
+    const project = try s.toJson(gpa);
+    defer gpa.free(project);
+    var restored: Settings = .{};
+    try std.testing.expect(try restored.applyTrackingMask(gpa, project));
+    try std.testing.expect(!restored.mask);
 }
 
 test "sweeps climb to the final bandwidth and dictionary" {

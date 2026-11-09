@@ -161,6 +161,8 @@ body[data-resize] { user-select: none; }
 body[data-resize="row"] * { cursor: row-resize !important; }
 body[data-resize="col"] * { cursor: col-resize !important; }
 .pane-bar { min-height: var(--bar); flex: none; display: flex; align-items: center; gap: 4px 10px; padding: 0 10px; background: var(--panel); border-bottom: 1px solid var(--line); user-select: none; overflow: hidden; }
+.overview-bar { flex-wrap: wrap; padding-top: 4px; padding-bottom: 4px; }
+#overview-source { width: auto; min-width: 155px; height: 24px; }
 .ttl { font-size: 10.5px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
 .meta { color: var(--faint); font: 11.5px var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .meta.cell { color: var(--muted); }
@@ -245,6 +247,7 @@ button.mini { height: 20px; padding: 0 8px; font-size: 11.5px; }
 .status.err { color: var(--bad); }
 .progress { width: 180px; height: 6px; border-radius: 3px; background: var(--raise); overflow: hidden; flex: none; }
 .progress > span { display: block; height: 100%; width: 0; background: var(--accent); transition: width .15s; }
+#index-progress { width: 100%; accent-color: var(--accent); }
 .compile { color: var(--faint); font: 11.5px var(--mono); }
 .statusbar .stop svg { width: 10px; height: 10px; }
 .app[data-busy="1"] .act, .app[data-busy="1"] #btn-open, .app[data-busy="1"] #btn-example, .app[data-busy="1"] #btn-phase, .app[data-busy="1"] .phases button { opacity: .38; pointer-events: none; transition: opacity .15s linear .35s; }

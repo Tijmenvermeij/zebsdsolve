@@ -22,9 +22,26 @@ const Allocator = std.mem.Allocator;
 /// What the HDF5 reader could not handle when the last open failed with UnsupportedHdf5.
 pub var last_why: []const u8 = "";
 
-pub const Format = enum { h5_kikuchipy, h5_bruker, h5_edax, h5_oxford, edax_up, oxford_ebsp, nordif, h5_emsoft };
+pub const Format = enum {
+    h5_kikuchipy,
+    h5_bruker,
+    h5_edax,
+    h5_oxford,
+    edax_up,
+    oxford_ebsp,
+    nordif,
+    h5_emsoft,
+
+    /// Oxford h5oina uses the complete rectangular detector. Other formats retain the
+    /// circular default, including EDAX's h5ebsd and up1/up2 detector patterns.
+    pub fn defaultMask(self: Format) bool {
+        return self != .h5_oxford;
+    }
+};
 
 pub const Pixel = enum(u32) { u8 = 0, u16 = 1, f32 = 2 };
+
+pub const OverviewKind = enum(u32) { none = 0, band_contrast = 1, image_quality = 2, radon_quality = 3, pattern_quality = 4 };
 
 /// What the caller knows that the file may not say (0: not given).
 pub const Hints = struct {
@@ -38,6 +55,7 @@ pub const Hints = struct {
 
 /// Metadata as the file gives it; NaN where it gives none.
 pub const Info = struct {
+    calibration: @import("oxford.zig").Calibration = .{},
     rows: u32 = 0,
     cols: u32 = 0,
     pat_h: u32 = 0,
@@ -70,6 +88,10 @@ pub const Scan = struct {
     offsets: []u64 = &.{},
     /// static background (pat_h · pat_w), when the file stores one
     background: []f32 = &.{},
+    /// Optional scalar map in the same acquisition Data group as the patterns.
+    /// Discovery reads metadata only; values are fetched on request.
+    overview_addr: ?u64 = null,
+    overview_kind: OverviewKind = .none,
     why: []const u8 = "",
 
     pub fn count(self: *const Scan) u64 {
@@ -86,6 +108,53 @@ pub const Scan = struct {
 
     pub fn patternBytes(self: *const Scan) u64 {
         return @as(u64, self.info.pat_h) * self.info.pat_w * self.bytesPerPx();
+    }
+
+    pub fn readStoredOverview(self: *Scan, out: []f32) !void {
+        const address = self.overview_addr orelse return error.NoStoredOverview;
+        const n: usize = @intCast(self.count());
+        if (out.len != n) return error.BadLength;
+        const values = try self.gpa.alloc(f64, n);
+        defer self.gpa.free(values);
+        if ((try self.h5.?.numbers(address, values)) != n) return error.InvalidStoredOverview;
+        for (values, out) |x, *v| v.* = if (std.math.isFinite(x) and @abs(x) <= std.math.floatMax(f32)) @floatCast(x) else std.math.nan(f32);
+    }
+
+    fn discoverOverview(self: *Scan, data: u64) void {
+        const Candidate = struct { name: []const u8, kind: OverviewKind };
+        // Ordered preference is deterministic, with no fallback to pattern IO.
+        const candidates = [_]Candidate{
+            .{ .name = "Band Contrast", .kind = .band_contrast },
+            .{ .name = "band_contrast", .kind = .band_contrast },
+            .{ .name = "Image Quality", .kind = .image_quality },
+            .{ .name = "IQ", .kind = .image_quality },
+            .{ .name = "image_quality", .kind = .image_quality },
+            .{ .name = "iq", .kind = .image_quality },
+            .{ .name = "RadonQuality", .kind = .radon_quality },
+            .{ .name = "Pattern Quality", .kind = .pattern_quality },
+        };
+        const h = &self.h5.?;
+        const original_why = h.why;
+        defer h.why = original_why;
+        for (candidates) |candidate| {
+            const address = (h.child(data, candidate.name) catch null) orelse continue;
+            var ds = h.dataset(address) catch continue;
+            defer ds.deinit(self.gpa);
+            const n = self.count();
+            const vector = (ds.rank == 1 and ds.dims[0] == n) or
+                (ds.rank == 2 and ((ds.dims[0] == n and ds.dims[1] == 1) or (ds.dims[0] == 1 and ds.dims[1] == n)));
+            const raster = ds.rank == 2 and ds.dims[0] == self.info.rows and ds.dims[1] == self.info.cols;
+            if (!vector and !raster) continue;
+            const numeric = switch (ds.dtype.class) {
+                .uint, .int => ds.dtype.size == 1 or ds.dtype.size == 2 or ds.dtype.size == 4 or ds.dtype.size == 8,
+                .float => ds.dtype.size == 4 or ds.dtype.size == 8,
+                else => false,
+            };
+            if (!numeric) continue;
+            self.overview_addr = address;
+            self.overview_kind = candidate.kind;
+            return;
+        }
     }
 
     pub fn formatName(self: *const Scan) []const u8 {
@@ -378,6 +447,7 @@ pub const Scan = struct {
                 info.cols = @intCast(n_stored);
             } else return error.ScanIsNotAFullGrid;
         }
+        self.discoverOverview(data);
         info.step_x_um = num.get(h, header, v.step_x);
         info.step_y_um = num.get(h, header, v.step_y);
         info.sample_tilt_deg = num.get(h, header, v.tilt);
@@ -422,6 +492,18 @@ pub const Scan = struct {
                 const y = num.mean(h, gpa, data, "Pattern Center Y");
                 const z = num.mean(h, gpa, data, "Detector Distance");
                 info.pc = .{ x, 1 - y * ratio, z * ratio };
+                var m: @import("oxford.zig").Metadata = .{
+                    .tilt_axis = num.get(h, header, "Tilt Axis"),
+                    .scanning_rotation = num.get(h, header, "Scanning Rotation Angle"),
+                    .original_tilt = info.sample_tilt_deg,
+                };
+                if (try h.child(header, "Detector Orientation Euler")) |a| {
+                    if ((h.numbers(a, &m.detector_euler) catch 0) != 3) m.detector_euler = @splat(std.math.nan(f64));
+                }
+                if (try h.child(header, "Specimen Orientation Euler")) |a| {
+                    if ((h.numbers(a, &m.specimen_euler) catch 0) != 3) m.specimen_euler = @splat(std.math.nan(f64));
+                }
+                info.calibration = .{ .metadata = m };
                 info.sample_tilt_deg = std.math.radiansToDegrees(info.sample_tilt_deg);
                 info.voltage_kv = num.get(h, header, "Beam Voltage");
             },
@@ -716,4 +798,10 @@ test "the nickel scan opens with its metadata" {
     try s.read(4000, 1, buf[0..3600]);
     try std.testing.expectEqualSlices(u8, buf[0..3600], some[7200..]);
     try std.testing.expectError(error.CellsNotAscending, s.readCells(&.{ 5, 4 }, some[0..7200]));
+}
+
+test "detector mask defaults follow the acquisition format" {
+    inline for (std.meta.tags(Format)) |format| {
+        try std.testing.expectEqual(format != .h5_oxford, format.defaultMask());
+    }
 }

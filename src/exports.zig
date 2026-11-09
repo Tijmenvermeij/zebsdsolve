@@ -205,6 +205,22 @@ export fn ze_pattern_stats(e: *Engine, cells: [*]const u64, n: usize, out: [*]f3
     return 0;
 }
 
+/// Stored scalar quality kind: 0 absent, 1 BC, 2 IQ, 3 Radon, 4 pattern quality.
+export fn ze_scan_overview_kind(e: *Engine) u32 {
+    return @intFromEnum(e.storedOverviewKind());
+}
+
+/// Query the stored scalar map size without reading values; fill returns the
+/// same count. No pattern pixels are read and no quality map means zero.
+export fn ze_scan_overview(e: *Engine, out: ?[*]f32, cap: usize) i64 {
+    const n = e.storedOverviewCount();
+    if (out) |p| {
+        if (cap < n) return failed(e, "scan_overview", error.BufferTooSmall);
+        if (n != 0) e.readStoredOverview(p[0..n]) catch |err| return failed(e, "scan_overview", err);
+    }
+    return @intCast(n);
+}
+
 /// Simulated patterns of a phase: n cells with n orientations (4 f32 each: w, x, y, z), at the
 /// reduced size or (`full`) the stored one.
 export fn ze_simulate(e: *Engine, phase: u32, cells: [*]const u64, quats: [*]const f32, n: usize, full: u32, out: [*]f32, len: usize) i32 {
@@ -455,6 +471,31 @@ export fn ze_export(e: *Engine, kind: u32, buf: ?[*]u8, cap: usize) i64 {
     defer e.gpa.free(text);
     if (buf) |b| if (cap >= text.len) @memcpy(b[0..text.len], text);
     return @intCast(text.len);
+}
+
+/// Shared HDF5 export snapshot; optional active engine→Oxford-CS1 wxyz frame.
+export fn ze_export_snapshot(e: *Engine, frame: ?[*]const f64, buf: ?[*]u8, cap: usize) i64 {
+    const transform: ?rot.Quat = if (frame) |p| p[0..4].* else null;
+    const bytes = @import("export_snapshot.zig").snapshot(e, transform) catch |err| return failed(e, "export_snapshot", err);
+    defer e.gpa.free(bytes);
+    if (buf) |p| {
+        if (cap < bytes.len) return failed(e, "export_snapshot", error.BufferTooSmall);
+        @memcpy(p[0..bytes.len], bytes);
+    }
+    return @intCast(bytes.len);
+}
+
+/// Oxford CS1 snapshot, including native per-phase master -> Oxford crystal
+/// conversion. Null frame inherits the frozen original acquisition calibration.
+export fn ze_export_oxford_snapshot(e: *Engine, frame: ?[*]const f64, buf: ?[*]u8, cap: usize) i64 {
+    const transform: ?rot.Quat = if (frame) |p| p[0..4].* else null;
+    const bytes = @import("export_snapshot.zig").snapshotOxford(e, transform) catch |err| return failed(e, "export_oxford_snapshot", err);
+    defer e.gpa.free(bytes);
+    if (buf) |p| {
+        if (cap < bytes.len) return failed(e, "export_oxford_snapshot", error.BufferTooSmall);
+        @memcpy(p[0..bytes.len], bytes);
+    }
+    return @intCast(bytes.len);
 }
 
 /// An orientation as the results store one: `q` is replaced by its representative in the

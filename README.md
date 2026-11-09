@@ -9,7 +9,7 @@ EBSD pattern-centre fitting and indexing on the GPU, in the browser or from Pyth
 - **Indexes** by spherical cross-correlation over all orientations, refined on the detector: about 23 000 patterns per second on a desktop GPU, 67 000 in two sweeps. Dictionary indexing is there too.
 - **Fits the geometry**: the pattern centre by a vote of a few patterns, then the detector's whole pose (position, rotation and, optionally, pixel size) together with the patterns' orientations.
 - **Prepares patterns**: binning, neighbour averaging (NLPAR), static and dynamic background, CLAHE, band pass, mask.
-- **Handles several phases**, and writes `.ang` and `.ctf`.
+- **Handles several phases**, and writes `.ang`, `.ctf` and EMSphInx-compatible `.h5` with alternate-phase candidates. Oxford `.h5oina` export preserves the original acquisition and requires a verified CS1 frame conversion ([export options](docs/hdf5-export.md)).
 - **Reads** h5ebsd (kikuchipy, Bruker, EDAX, Oxford `.h5oina`), EDAX `.up1` / `.up2`, Oxford `.ebsp`, NORDIF `Pattern.dat`. Master patterns: [ebsdsim](https://github.com/ZacharyVarley/ebsdsim) `.npz` and EMsoft `.h5`.
 
 One engine (Zig and WGSL) runs natively through wgpu-native and as WebAssembly on WebGPU, so the app and the Python package do the same thing.

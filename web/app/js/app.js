@@ -4,6 +4,7 @@ import { Zebsdsolve } from "../zebsdsolve/zebsdsolve.js";
 import { GEOMETRY, buildFields, groupOf } from "./fields.js";
 import { drawGray, drawSigned, drawHeat, fit, svg, download, quantiles } from "./draw.js";
 import { createVotes } from "./votes.js";
+import { exportH5, exportOxford } from "./hdf5-export.js";
 
 const $ = (id) => document.getElementById(id);
 const app = $("app");
@@ -20,10 +21,16 @@ const st = {
   ze: null,
   scan: null,          // engine scan info, or null
   scanName: "",
+  sourceFile: null,
   settings: {},
   cell: -1,            // selected map cell
   mapKind: "overview",
-  overview: null,      // Float32Array(rows · cols): pattern contrast, NaN where not read yet
+  overview: null,      // Current scalar background, in row-major pixel order.
+  storedOverview: null,
+  calculatedOverview: null,
+  overviewSource: null,
+  overviewLoading: false,
+  overviewCalculating: false,
   overviewRun: 0,
   results: null,       // engine results after indexing
   fit: null,           // fit patterns { cells, phases, quats, ncc }
@@ -43,6 +50,8 @@ const st = {
   truth: null,         // a toy scan's own answer: { quaternions, phase } per cell
   tuned: "",
   busy: 0,
+  gpuLost: null,
+  masterRun: 0,
   stop: false,
   showRun: 0,
   roiDrag: null,
@@ -57,6 +66,33 @@ function status(text, err = false) {
   const el = $("status");
   el.textContent = text;
   el.classList.toggle("err", err);
+}
+
+function gpuLossMessage() {
+  const n = st.results?.phase.reduce((count, phase) => count + (phase >= 0), 0) || 0;
+  return `GPU device lost. ${n.toLocaleString()} indexed results retained. Export before reloading.`;
+}
+
+// Device loss may arrive while WASM is suspended. This callback only touches JS/DOM state.
+function deviceLost(info) {
+  if (st.gpuLost) return;
+  st.gpuLost = info;
+  st.roiDrag = null;
+  ++st.showRun;
+  ++st.masterRun;
+  app.dataset.gpuLost = "1";
+  invalidateOverview();
+  for (const id of ["btn-open", "btn-example", "btn-phase", "btn-toy", "btn-fit-pc", "btn-fit-pose", "btn-index", "btn-tune", "btn-roi-full", "btn-geo-undo", "btn-geo-file", "pat-live", "file-scan", "file-phase"]) $(id).disabled = true;
+  for (const input of document.querySelectorAll(".panel .fields input, .panel .fields select")) input.disabled = true;
+  for (const button of $("phases").querySelectorAll("button")) button.disabled = true;
+  log(`GPU device lost: ${JSON.stringify({ ...info, adapter: st.ze.adapterInfo, bandwidth: st.settings.bandwidth, batch: st.settings.batch, tile_mb: st.settings.tile_mb })}`, true);
+  if (!st.busy) status(gpuLossMessage(), true);
+}
+
+function gpuAvailable() {
+  if (!st.gpuLost) return true;
+  status(gpuLossMessage(), true);
+  return false;
 }
 
 function log(text, err = false) {
@@ -85,19 +121,29 @@ async function busy(label, fn) {
   $("btn-stop").hidden = false;
   status(label);
   const t0 = performance.now();
+  let succeeded = false;
   try {
     await fn();
-    status(`${label.replace(/…$/, "")}: done in ${((performance.now() - t0) / 1000).toFixed(2)} s`);
+    succeeded = true;
+    status(st.gpuLost ? gpuLossMessage() : `${label.replace(/…$/, "")}: done in ${((performance.now() - t0) / 1000).toFixed(2)} s`, !!st.gpuLost);
   } catch (e) {
+    ++st.showRun;
+    ++st.masterRun;
     const msg = String(e.message || e);
-    if (/Cancelled/.test(msg)) status("stopped"); else { status(msg, true); log(msg, true); console.error(e); }
+    if (/Cancelled/.test(msg)) status("stopped"); else { status(st.gpuLost ? gpuLossMessage() : msg, true); log(msg, true); console.error(e); }
   } finally {
     st.busy = 0;
     app.dataset.busy = "0";
     $("btn-stop").hidden = true;
+    if (!$("index-progress").hidden) {
+      const readout = $("index-readout");
+      readout.textContent = readout.textContent.replace(/Preparing indexing…|~[^\n]+remaining[^\n]*|estimating time remaining…[^\n]*/, st.stop ? "stopped" : "interrupted");
+    }
+    $("index-progress").hidden = true;
     progress(null);
     st.live.clear();
-    showCell();
+    if (st.gpuLost) updateEnabled();
+    if (succeeded && !st.gpuLost) showCell();
   }
 }
 
@@ -126,6 +172,7 @@ const METHOD_NAMES = { spherical: "spherical", dictionary: "dictionary", pca: "d
 const sweepLabel = (p) => (p.method === "spherical" ? `spherical ${p.bandwidth}` : `${METHOD_NAMES[p.method]} ${p.dictGrid}`);
 
 async function applySetting(key, value) {
+  if (!gpuAvailable()) return;
   try {
     st.ze.configure({ [key]: value });
   } catch (e) {
@@ -197,9 +244,9 @@ function showGeometry() {
     const v = input.dataset.i !== undefined ? g[input.dataset.geo][+input.dataset.i] : g[input.dataset.geo];
     input.value = String(+(v * per[input.dataset.geo]).toFixed(6));
   }
-  $("btn-geo-undo").disabled = !st.geoBefore;
+  $("btn-geo-undo").disabled = !st.geoBefore || !!st.gpuLost;
   $("btn-geo-undo").textContent = st.geoIsBefore ? "after the last fit" : "before the last fit";
-  $("btn-geo-file").disabled = !st.geoOpened;
+  $("btn-geo-file").disabled = !st.geoOpened || !!st.gpuLost;
   showAngle();
   drawPc();
 }
@@ -288,16 +335,24 @@ function sortScanFiles(files) {
 }
 
 async function openScan(files) {
+  if (!gpuAvailable()) return;
   files = sortScanFiles(files);
   if (!files.length) return;
+  invalidateOverview();
+  ++st.showRun;
   await busy(`opening ${files[0].name}…`, async () => {
     await st.ze.openScan(files);
     st.scanName = files[0].name;
     afterOpen();
+    st.sourceFile = files[0];
+    updateEnabled();
   });
 }
 
 function afterOpen() {
+  invalidateOverview();
+  ++st.showRun;
+  st.sourceFile = null;
   const s = st.ze.scan;
   st.scan = s;
   st.truth = null;
@@ -312,6 +367,11 @@ function afterOpen() {
   st.chance = null;
   st.live.clear();
   st.overview = new Float32Array(s.rows * s.cols).fill(NaN);
+  st.storedOverview = st.calculatedOverview = null;
+  st.overviewSource = null;
+  st.overviewLoading = true;
+  st.stage = "stored";
+  updateOverviewControls();
   st.view = { k: 1, cx: s.cols / 2, cy: s.rows / 2, s: 1 };
   app.dataset.scan = "1";
   done("geometry", false);
@@ -334,54 +394,106 @@ function afterOpen() {
   drawVotes();
   drawZ();
   selectCell(Math.floor(s.rows / 2) * s.cols + Math.floor(s.cols / 2));
-  runOverview();
+  loadStoredOverview();
   updateEnabled();
 }
 
-/** The overview: every pattern's contrast, on a lattice of patterns when the map is large (at
- *  most about 40 000 patterns or 1.5 GiB of them). Whole lattice rows are read, each once (a
- *  file reads neighbours fastest), every fourth first and then the rows between: the whole map
- *  shows at once and sharpens. It yields to the engine's jobs between pieces. */
+function invalidateOverview() {
+  ++st.overviewRun;
+  st.overviewCalculating = false;
+  st.overviewLoading = false;
+  updateOverviewControls();
+}
+
+function updateOverviewControls() {
+  const selector = $("overview-source");
+  selector.replaceChildren();
+  if (st.storedOverview) selector.add(new Option(st.storedOverview.label, "stored"));
+  else {
+    const empty = new Option("Overview", "none");
+    empty.disabled = true;
+    selector.add(empty);
+  }
+  selector.add(new Option("Pattern contrast", "calculated"));
+  selector.disabled = !st.scan || st.overviewLoading || !!st.gpuLost;
+  selector.value = st.overviewSource || "none";
+  $("btn-overview").disabled = !st.scan || st.overviewLoading || !!st.gpuLost;
+  $("btn-overview").textContent = st.overviewCalculating ? "Stop contrast calculation" : "Calculate pattern contrast";
+}
+
+async function loadStoredOverview() {
+  const run = st.overviewRun, ze = st.ze;
+  try {
+    const stored = await ze.storedOverview();
+    if (run !== st.overviewRun || ze !== st.ze) return;
+    st.storedOverview = stored;
+    if (stored) {
+      st.overview = stored.values;
+      st.overviewSource = "stored";
+      drawMap();
+      log(`overview: stored ${stored.label.toLowerCase()}, ${stored.values.length.toLocaleString()} pixels`);
+    }
+  } catch (e) {
+    if (run === st.overviewRun && ze === st.ze) log(String(e.message || e), true);
+  } finally {
+    if (run === st.overviewRun && ze === st.ze) {
+      st.overviewLoading = false;
+      updateOverviewControls();
+    }
+  }
+}
+
+/** Explicit progressive contrast calculation. Each batch yields to other engine jobs. */
 async function runOverview() {
-  const run = ++st.overviewRun;
+  const run = ++st.overviewRun, ze = st.ze;
   const { rows, cols, patH, patW, pixel } = st.scan;
+  const values = new Float32Array(rows * cols).fill(NaN);
+  st.calculatedOverview = { label: "Pattern contrast (standard deviation)", values };
+  st.overview = values;
+  st.overviewSource = "calculated";
+  st.overviewCalculating = true;
+  updateOverviewControls();
+  setMapKind("overview");
+  const current = () => run === st.overviewRun && ze === st.ze;
+  const redraw = () => { if (st.overview === values && (st.mapKind === "overview" || !st.results)) drawMap(); };
   const budget = Math.max(1000, Math.min(40000, Math.floor((1.5 * 2 ** 30) / (patH * patW * [1, 2, 4][pixel]))));
   const stride = Math.max(1, Math.ceil(Math.sqrt((rows * cols) / budget)));
   const nr = Math.ceil(rows / stride);
-  // passes over the lattice rows at steps 2^top … 1, the first of about a dozen rows
   let top = 0;
   while (nr >> (top + 1) >= 12) top++;
   const t0 = performance.now();
   let read = 0, lastDraw = 0;
-  for (let p = top; p >= 0; p--) {
-    const step = 1 << p;
-    const todo = [];
-    for (let j = 0; j < nr; j += step) if (p === top || j % (2 * step) !== 0) todo.push(j);
-    for (let i = 0; i < todo.length;) {
-      // as many lattice rows as make a batch of about 256 patterns
-      const part = [];
-      do {
-        const r = todo[i++] * stride;
-        for (let c = 0; c < cols; c += stride) part.push(r * cols + c);
-      } while (i < todo.length && part.length < 256);
-      while (st.busy) await sleep(150);
-      if (run !== st.overviewRun) return;
-      let res;
-      try { res = await st.ze.patternStats(part); } catch (e) { log(String(e.message || e), true); return; }
-      if (run !== st.overviewRun) return;
-      read += part.length;
-      // each value fills its lattice cell, and the rows below it no finer pass has read yet
-      for (let k = 0; k < part.length; k++) {
-        const r0 = Math.floor(part[k] / cols), c0 = part[k] % cols;
-        const r1 = Math.min(rows, r0 + stride * step), c1 = Math.min(cols, c0 + stride);
-        for (let r = r0; r < r1; r++) st.overview.fill(res.std[k], r * cols + c0, r * cols + c1);
+  try {
+    for (let p = top; p >= 0; p--) {
+      const step = 1 << p, todo = [];
+      for (let j = 0; j < nr; j += step) if (p === top || j % (2 * step) !== 0) todo.push(j);
+      for (let i = 0; i < todo.length;) {
+        const part = [];
+        do {
+          const r = todo[i++] * stride;
+          for (let c = 0; c < cols; c += stride) part.push(r * cols + c);
+        } while (i < todo.length && part.length < 256);
+        while (st.busy && current()) await sleep(150);
+        if (!current()) return;
+        const res = await ze.patternStats(part);
+        if (!current()) return;
+        read += part.length;
+        for (let k = 0; k < part.length; k++) {
+          const r0 = Math.floor(part[k] / cols), c0 = part[k] % cols;
+          const r1 = Math.min(rows, r0 + stride * step), c1 = Math.min(cols, c0 + stride);
+          for (let r = r0; r < r1; r++) values.fill(res.std[k], r * cols + c0, r * cols + c1);
+        }
+        if (performance.now() - lastDraw > 100) { redraw(); lastDraw = performance.now(); }
       }
-      if (performance.now() - lastDraw > 100 && (st.mapKind === "overview" || !st.results)) { drawMap(); lastDraw = performance.now(); }
     }
+    if (!current()) return;
+    redraw();
+    log(`overview: ${read.toLocaleString()} patterns${stride > 1 ? ` (every ${stride}${stride === 2 ? "nd" : stride === 3 ? "rd" : "th"} each way)` : ""} in ${((performance.now() - t0) / 1000).toFixed(2)} s`);
+  } catch (e) {
+    if (current()) log(String(e.message || e), true);
+  } finally {
+    if (current()) { st.overviewCalculating = false; updateOverviewControls(); }
   }
-  if (st.mapKind === "overview" || !st.results) drawMap();
-  const io = st.ze.stats();
-  log(`overview: ${read.toLocaleString()} patterns${stride > 1 ? ` (every ${stride}${stride === 2 ? "nd" : stride === 3 ? "rd" : "th"} each way)` : ""} in ${((performance.now() - t0) / 1000).toFixed(2)} s, ${(io.fileBytes / 2 ** 20).toFixed(0)} MiB in ${io.fileReads.toLocaleString()} reads`);
 }
 
 // ── phases ──
@@ -398,6 +510,7 @@ function phasesChanged() {
 }
 
 async function addPhases(files) {
+  if (!gpuAvailable()) return;
   await busy("reading master pattern…", async () => {
     for (const f of files) { await st.ze.addPhase(f); st.phaseFiles.push(f); }
     phasesChanged();
@@ -406,6 +519,7 @@ async function addPhases(files) {
 
 /** Remove one phase: the engine drops them all and takes the others again. */
 async function removePhase(i) {
+  if (!gpuAvailable()) return;
   await busy("removing the phase…", async () => {
     const keep = st.phaseFiles.filter((_, k) => k !== i);
     st.ze.clearPhases();
@@ -436,9 +550,11 @@ function showPhases() {
 }
 
 async function showMaster() {
-  if (!st.ze.phases.length || $("dock-master").hidden) return;
+  if (st.gpuLost || !st.ze.phases.length || $("dock-master").hidden) return;
+  const run = ++st.masterRun, phase = st.phase;
   try {
-    const { side, data } = await st.ze.masterImage(st.phase);
+    const { side, data } = await st.ze.masterImage(phase);
+    if (run !== st.masterRun || st.gpuLost || phase !== st.phase) return;
     // the two hemispheres side by side
     const both = new Float32Array(2 * side * side);
     for (let r = 0; r < side; r++) {
@@ -447,7 +563,7 @@ async function showMaster() {
     }
     drawGray($("master"), both, 2 * side, side);
     $("dock-meta").textContent = `${st.ze.phases[st.phase].name} · ${side} × ${side} per hemisphere`;
-  } catch (e) { log(String(e.message || e), true); }
+  } catch (e) { if (run === st.masterRun && !st.gpuLost) log(String(e.message || e), true); }
 }
 
 // ── the map ──
@@ -491,7 +607,9 @@ function drawLegend() {
   const bar = () => { const b = document.createElement("span"); b.className = "bar"; return b; };
   if (!st.scan) { box.hidden = true; return; }
   if (kind === "overview" || !R) {
-    box.append(text("pattern contrast"), bar());
+    const source = st.overviewSource === "stored" ? st.storedOverview : st.calculatedOverview;
+    if (!source) { box.hidden = true; return; }
+    box.append(text(source.label), bar());
   } else if (kind === "ncc" || kind === "nmi" || kind === "z") {
     // gray between the indexed cells' extremes, as the engine draws it
     let lo = Infinity, hi = -Infinity;
@@ -765,7 +883,7 @@ function showNlpar(a) {
 }
 
 async function showCell() {
-  if (!st.scan || st.cell < 0) return;
+  if (!st.scan || st.cell < 0 || st.gpuLost) return;
   const run = ++st.showRun;
   const cell = st.cell;
   const { cols } = st.scan;
@@ -886,37 +1004,74 @@ async function fitPose() {
 
 // ── indexing ──
 
+function remainingTime(seconds) {
+  if (!Number.isFinite(seconds) || seconds < 0) return "estimating time remaining…";
+  const minutes = Math.ceil(seconds / 60);
+  if (seconds < 60) return `~${Math.max(1, Math.ceil(seconds))} s remaining`;
+  if (minutes < 60) return `~${minutes} min remaining`;
+  return `~${Math.floor(minutes / 60)} h${minutes % 60 ? ` ${minutes % 60} min` : ""} remaining`;
+}
+
 async function runIndex() {
   await busy("indexing…", async () => {
-    await st.ze.indexBegin();
-    if (st.mapKind === "overview") setMapKind("ipf_z");
-    const t0 = performance.now();
-    let last = 0, visited = 0, s = null;
-    for (;;) {
-      const before = st.ze.indexStatus;
-      s = await st.ze.indexStep();
-      visited += Math.min(before.total - before.done, st.settings.batch);
-      const dt = (performance.now() - t0) / 1000;
-      progress(s.done / Math.max(s.total, 1));
-      const head = s.sweeps > 1 ? `sweep ${s.sweep + 1} of ${s.sweeps}, ${sweepLabel(s)}\n` : "";
-      $("index-readout").textContent = `${head}${s.done.toLocaleString()} of ${s.total.toLocaleString()} patterns  ·  ${(visited / Math.max(dt, 1e-6)).toFixed(0)} patterns/s\n${s.accepted.toLocaleString()} of ${s.region.toLocaleString()} accepted (${acceptText()})`;
-      if (performance.now() - last > 250 || s.left === 0) { st.results = st.ze.results(); drawMap(); last = performance.now(); await sleep(0); }
-      if (s.left === 0 || st.stop) break;
+    try {
+      const bar = $("index-progress");
+      bar.hidden = false;
+      bar.removeAttribute("value");
+      $("index-readout").textContent = "Preparing indexing…";
+      await st.ze.indexBegin();
+      if (st.mapKind === "overview") setMapKind("ipf_z");
+      const t0 = performance.now();
+      let last = 0, visited = 0, s = null, timedSweep = -1, sweepStart = t0, sweepVisited = 0;
+      for (;;) {
+        const before = st.ze.indexStatus;
+        if (before.sweep !== timedSweep) {
+          timedSweep = before.sweep;
+          sweepStart = performance.now();
+          sweepVisited = 0;
+        }
+        s = await st.ze.indexStep();
+        const processed = Math.min(before.total - before.done, st.settings.batch);
+        visited += processed;
+        sweepVisited += processed;
+        const dt = (performance.now() - t0) / 1000;
+        const advanced = s.sweep !== before.sweep;
+        const fraction = advanced ? 0 : s.done / Math.max(s.total, 1);
+        progress(fraction);
+        bar.value = Math.max(0, Math.min(1, fraction));
+        bar.setAttribute("aria-label", s.sweeps > 1 ? `Indexing sweep ${s.sweep + 1} of ${s.sweeps}` : "Indexing progress");
+        const seconds = (performance.now() - sweepStart) / 1000;
+        const eta = s.left === 0 ? "complete" : advanced ? "estimating time remaining…"
+          : remainingTime((s.total - s.done) * seconds / Math.max(sweepVisited, 1));
+        const head = s.sweeps > 1 ? `sweep ${s.sweep + 1} of ${s.sweeps}, ${sweepLabel(s)}\n` : "";
+        $("index-readout").textContent = `${head}${s.done.toLocaleString()} of ${s.total.toLocaleString()} patterns  ·  ${(visited / Math.max(dt, 1e-6)).toFixed(0)} patterns/s\n${(100 * bar.value).toFixed(0)}%  ·  ${eta}${s.sweeps > 1 && s.left !== 0 ? " in this sweep" : ""}\n${s.accepted.toLocaleString()} of ${s.region.toLocaleString()} accepted (${acceptText()})`;
+        if (performance.now() - last > 250 || s.left === 0) { st.results = st.ze.results(); drawMap(); last = performance.now(); await sleep(0); }
+        if (s.left === 0 || st.stop) break;
+      }
+      st.results = st.ze.results();
+      $("index-readout").textContent += againstTruth();
+      // what chance gives on this scan: the scale z is read on, measured once for the run
+      try { st.chance = await st.ze.chance(0); } catch { st.chance = null; }
+      showSweeps();
+      done("index");
+      drawMap();
+      // (with no search to show, the dock shows how the matches stand)
+      if (!st.votes) selectDock("z"); else drawZ();
+      updateEnabled();
+      const R = st.results;
+      let n = 0, sum = 0;
+      for (let i = 0; i < R.ncc.length; i++) if (R.phase[i] >= 0) { n++; sum += R.ncc[i]; }
+      log(`indexed ${n.toLocaleString()} patterns in ${((performance.now() - t0) / 1000).toFixed(2)} s${s.sweeps > 1 ? ` (${visited.toLocaleString()} pattern visits over ${s.sweep + 1} sweeps)` : ""}: mean NCC ${(sum / Math.max(n, 1)).toFixed(4)}, ${s.accepted.toLocaleString()} accepted`);
+    } catch (error) {
+      // Native indexStep commits only successful batches. Read them after the failed call
+      // has settled, and keep the original exception if any recovery display also fails.
+      try { st.results = st.ze.results(); } catch (secondary) { log(`Retaining previous result view: ${secondary.message || secondary}`, true); }
+      done("index", false);
+      try { drawMap(); updateEnabled(); } catch (secondary) { log(`Result display: ${secondary.message || secondary}`, true); }
+      const n = st.results?.phase.reduce((count, phase) => count + (phase >= 0), 0) || 0;
+      $("index-readout").textContent = `Interrupted · ${n.toLocaleString()} indexed results retained`;
+      throw error;
     }
-    st.results = st.ze.results();
-    $("index-readout").textContent += againstTruth();
-    // what chance gives on this scan: the scale z is read on, measured once for the run
-    try { st.chance = await st.ze.chance(0); } catch { st.chance = null; }
-    showSweeps();
-    done("index");
-    drawMap();
-    // (with no search to show, the dock shows how the matches stand)
-    if (!st.votes) selectDock("z"); else drawZ();
-    updateEnabled();
-    const R = st.results;
-    let n = 0, sum = 0;
-    for (let i = 0; i < R.ncc.length; i++) if (R.phase[i] >= 0) { n++; sum += R.ncc[i]; }
-    log(`indexed ${n.toLocaleString()} patterns in ${((performance.now() - t0) / 1000).toFixed(2)} s${s.sweeps > 1 ? ` (${visited.toLocaleString()} pattern visits over ${s.sweep + 1} sweeps)` : ""}: mean NCC ${(sum / Math.max(n, 1)).toFixed(4)}, ${s.accepted.toLocaleString()} accepted`);
   });
 }
 
@@ -1003,11 +1158,17 @@ function selectDock(kind) {
 }
 
 function updateEnabled() {
-  const ready = !!st.scan && st.ze.phases.length > 0;
+  const ready = !!st.scan && !st.gpuLost && st.ze.phases.length > 0;
   for (const id of ["btn-fit-pc", "btn-fit-pose", "btn-index", "btn-tune"]) $(id).disabled = !ready;
   for (const b of document.querySelectorAll(".needs-results")) b.disabled = !st.results;
   for (const b of $("map-kind").children) if (RESULT_KINDS.includes(b.dataset.kind)) b.disabled = !st.results;
   $("btn-json").disabled = !st.scan;
+  $("btn-roi-full").disabled = !st.scan || !!st.gpuLost;
+  const oxford = !!st.sourceFile && /Oxford/i.test(st.scan?.format || "");
+  const oxfordReason = !oxford ? "Open the original Oxford H5OINA scan."
+    : !st.results ? "Index the scan first." : "";
+  $("btn-h5oina").disabled = !!oxfordReason;
+  $("btn-h5oina").title = oxfordReason;
   done("data", ready);
   done("patterns", ready);
 }
@@ -1020,6 +1181,7 @@ function isMaster(f) {
  *  side files, master patterns. The project's settings go in before the scan opens (they may
  *  say how to read it) and its geometry after (over what the scan's file gives). */
 async function takeFiles(files) {
+  if (!gpuAvailable()) return;
   const projects = files.filter((f) => /\.json$/i.test(f.name));
   const masters = files.filter((f) => !projects.includes(f) && isMaster(f));
   const scans = files.filter((f) => !projects.includes(f) && !masters.includes(f));
@@ -1027,6 +1189,7 @@ async function takeFiles(files) {
   if (projects.length) {
     try {
       project = JSON.parse(await projects[0].text());
+      if (!gpuAvailable()) return;
       if (!project || typeof project !== "object" || (!project.settings && !project.geometry)) throw new Error("no settings or geometry in it");
     } catch (e) {
       status(`${projects[0].name}: not a zebsdsolve project (${e.message || e})`, true);
@@ -1040,14 +1203,22 @@ async function takeFiles(files) {
   if (scans.length) await openScan(scans);
   if (masters.length) await addPhases(masters);
   if (project) {
+    if (project.geometry && /Oxford h5oina/i.test(st.scan?.format || "") && project.geometry_convention !== "oxford-calibrated-v1") {
+      const message = "This Oxford project uses the previous geometry convention. The original calibration is loaded; reindex and save a new project.";
+      log(message, true); status(message, true); updateEnabled(); return;
+    }
     if (project.geometry) { beforeFit(); st.ze.setGeometry(project.geometry); geometryChanged(); }
     log(`project ${projects[0].name}: ${[project.settings && "settings", project.geometry && "geometry"].filter(Boolean).join(" and ")} taken`);
     if (!st.busy) status(`${projects[0].name}: ${[project.settings && "settings", project.geometry && "geometry"].filter(Boolean).join(" and ")} taken`);
+    updateEnabled();
   }
 }
 
 /** A toy scan from the phases loaded: the engine makes it and hands back its answer. */
 async function makeToy() {
+  if (!gpuAvailable()) return;
+  invalidateOverview();
+  ++st.showRun;
   await busy("making a toy scan…", async () => {
     const truth = await st.ze.synthesize();
     st.scanName = `toy scan, seed ${st.ze.settings.toy_seed}`;
@@ -1090,6 +1261,9 @@ function againstTrueGeometry() {
 }
 
 async function loadExample() {
+  if (!gpuAvailable()) return;
+  invalidateOverview();
+  ++st.showRun;
   await busy("loading the example…", async () => {
     const get = async (name) => {
       const r = await fetch(`./presets/nickel/${name}`);
@@ -1103,12 +1277,13 @@ async function loadExample() {
     await st.ze.addPhase(master);
     st.phaseFiles = [master];
     afterOpen();
+    st.sourceFile = scan;
     phasesChanged();
   });
 }
 
 function projectJson() {
-  return JSON.stringify({ zebsdsolve: st.ze.version, scan: st.scanName, geometry: st.ze.geometry, settings: st.ze.settings, phases: st.ze.phases.map((p) => p.name) }, null, 2);
+  return JSON.stringify({ zebsdsolve: st.ze.version, scan: st.scanName, geometry_convention: /Oxford h5oina/i.test(st.scan?.format || "") ? "oxford-calibrated-v1" : "generic-v1", geometry: st.ze.geometry, settings: st.ze.settings, phases: st.ze.phases.map((p) => p.name) }, null, 2);
 }
 
 // ── start ──
@@ -1119,7 +1294,7 @@ async function main() {
   votes = createVotes({
     geometry: () => st.ze.geometry,
     // the candidate under the cross-hair becomes the pattern centre, to fit again from there
-    setPc: (pc) => { beforeFit(); st.ze.setGeometry({ pc }); geometryChanged(); },
+    setPc: (pc) => { if (!gpuAvailable()) return; beforeFit(); st.ze.setGeometry({ pc }); geometryChanged(); },
   });
   updateWiring();
   try {
@@ -1142,6 +1317,8 @@ async function main() {
     $("compile").textContent = `compiling shaders ${n}/${total}`;
   });
   ze.onEvent((ev) => {
+    if (ev.kind === "deviceLost") { deviceLost(ev); return; }
+    if (st.gpuLost) return;
     if (ev.kind === "log") { log(ev.text); if (ev.text.startsWith("tuned on")) st.tuned = ev.text; }
     else if (ev.kind === "progress" && ev.stage === "pca") { progress(ev.done / Math.max(ev.total, 1)); status(`learning the dictionary's components: step ${ev.done} of ${ev.total}`); }
     else if (ev.kind === "progress" && ev.stage === "tune") { progress(ev.done / Math.max(ev.total, 1)); if (ev.done < ev.total) status(`tuning: ${TUNE_MOVES[ev.done]}…`); }
@@ -1152,10 +1329,11 @@ async function main() {
     else if (ev.kind === "pc") status(`pattern centre, level ${ev.level + 1}: ${ev.pc.map((v) => v.toFixed(4)).join("  ")}   mean NCC ${ev.score.toFixed(4)}${ev.at_border ? "  (at the border: moving the grid)" : ""}`);
     else if (ev.kind === "pose") status(`pose fit, iteration ${ev.iter + 1}: mean NCC ${ev.ncc.toFixed(5)}   pattern centre ${ev.pc.map((v) => v.toFixed(5)).join("  ")}`);
   });
+  if (ze.deviceLost) deviceLost(ze.deviceLost);
   updateEnabled();
   // the example scan is served by the site and by a checkout, not carried in the wheels
   fetch("./presets/nickel/Ni_master_20kV.npz", { method: "HEAD" }).then((r) => { $("btn-example").hidden = !r.ok; }, () => { $("btn-example").hidden = true; });
-  status(`ready · zebsdsolve ${ze.version}`);
+  status(st.gpuLost ? gpuLossMessage() : `ready · zebsdsolve ${ze.version}`, !!st.gpuLost);
   log(`zebsdsolve ${ze.version} on ${ze.adapter}`);
 }
 
@@ -1220,7 +1398,7 @@ function updateWiring() {
   $("btn-fit-pc").addEventListener("click", fitPc);
   $("btn-fit-pose").addEventListener("click", fitPose);
   $("btn-geo-undo").addEventListener("click", () => {
-    if (!st.geoBefore) return;
+    if (!st.geoBefore || !gpuAvailable()) return;
     // back to before the fit, or forward to after it: the two change places
     const g = st.ze.geometry;
     const other = { pc: g.pc, rot: g.rot };
@@ -1230,16 +1408,43 @@ function updateWiring() {
     geometryChanged();
   });
   $("btn-geo-file").addEventListener("click", () => {
-    if (!st.geoOpened) return;
+    if (!st.geoOpened || !gpuAvailable()) return;
     beforeFit();
     st.ze.setGeometry(st.geoOpened);
     geometryChanged();
   });
   $("btn-index").addEventListener("click", runIndex);
   $("btn-tune").addEventListener("click", runTune);
+  $("btn-roi-full").addEventListener("click", () => {
+    const set = { roi_x: 0, roi_y: 0, roi_w: 0, roi_h: 0 };
+    try { st.ze.configure(set); } catch (err) { status(String(err.message || err), true); return; }
+    st.roiDrag = null;
+    afterSettings(Object.keys(set));
+  });
   $("btn-stop").addEventListener("click", () => { st.stop = true; st.ze.cancel(); status("stopping…"); });
   $("btn-ang").addEventListener("click", () => download(st.scanName.replace(/\.[^.]+$/, "") + ".ang", st.ze.exportText("ang"), "text/plain"));
   $("btn-ctf").addEventListener("click", () => download(st.scanName.replace(/\.[^.]+$/, "") + ".ctf", st.ze.exportText("ctf"), "text/plain"));
+  $("btn-h5").addEventListener("click", () => busy("exporting HDF5…", async () => download(st.scanName.replace(/\.[^.]+$/, "") + ".h5", await exportH5(st.ze.exportSnapshot()), "application/x-hdf5")));
+  $("btn-h5oina").addEventListener("click", () => busy("exporting Oxford HDF5…", async () => {
+    const snapshot = st.ze.exportOxfordSnapshot();
+    download(st.scanName.replace(/\.[^.]+$/, "") + ".h5oina", await exportOxford(snapshot, st.sourceFile, snapshot.oxford_frame), "application/x-hdf5");
+  }));
+  $("btn-overview").addEventListener("click", () => {
+    if (st.overviewCalculating) { invalidateOverview(); updateOverviewControls(); }
+    else if (st.scan && !st.overviewLoading) runOverview();
+  });
+  $("overview-source").addEventListener("change", (event) => {
+    if (event.target.value === "none") return;
+    if (event.target.value === "calculated" && !st.calculatedOverview) {
+      if (st.scan && !st.overviewLoading) runOverview();
+      return;
+    }
+    const source = event.target.value === "stored" ? st.storedOverview : st.calculatedOverview;
+    if (!source) return;
+    st.overviewSource = event.target.value;
+    st.overview = source.values;
+    setMapKind("overview");
+  });
   $("btn-json").addEventListener("click", () => download(st.scanName.replace(/\.[^.]+$/, "") + ".zebsdsolve.json", projectJson(), "application/json"));
   $("map-kind").addEventListener("click", (e) => { const b = e.target.closest("button"); if (b && !b.disabled) setMapKind(b.dataset.kind); });
   $("dock-kind").addEventListener("click", (e) => { const b = e.target.closest("button"); if (b) selectDock(b.dataset.dock); });
@@ -1276,6 +1481,7 @@ function updateWiring() {
     well.focus({ preventScroll: true });
     const p = mapCellAt(e);
     if (e.shiftKey) {
+      if (!gpuAvailable()) return;
       if (p) { st.roiDrag = { r0: p.r, c0: p.c, r1: p.r, c1: p.c }; drawMapOverlay(); }
       e.preventDefault();
       return;

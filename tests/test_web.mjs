@@ -121,6 +121,11 @@ try {
   check("the app starts on WebGPU", /^ready/.test(ready.status), `${ready.status} on ${ready.adapter}`);
   if (!/^ready/.test(ready.status)) throw new Error("no WebGPU: " + ready.status);
 
+  await evaluate(`
+    window.overviewCalls = 0;
+    const patternStats = window.ze.patternStats.bind(window.ze);
+    window.ze.patternStats = (...args) => { window.overviewCalls++; return patternStats(...args); };
+  `);
   // the example: the module reads the HDF5 scan and the master pattern itself
   const opened = await evaluate(`${job("btn-example")}
     const s = window.ze.scan, g = window.ze.geometry;
@@ -129,14 +134,24 @@ try {
     `${opened.s.format}, ${opened.s.rows} × ${opened.s.cols}, phase ${opened.phases[0]?.name} (${opened.phases[0]?.pointGroupName})`);
   const pcFile = opened.pc;
 
-  // the overview fills in by itself; the steps are tabs
+  // No stored scalar map: opening stays neutral until calculation is requested.
+  const idle = await evaluate(`
+    for (let i = 0; i < 200 && !/found now/.test(document.getElementById("pat-sim-cap").textContent); i++) await new Promise(r => setTimeout(r, 100));
+    await window.ze._queue;
+    window.ze.stats();
+    await new Promise(r => setTimeout(r, 250));
+    return {calls:window.overviewCalls,io:window.ze.stats(),legend:document.getElementById("map-legend").hidden,
+      stage:document.querySelector('#pat-stage [aria-pressed=true]').dataset.stage,live:document.getElementById('pat-live').checked};
+  `);
+  check("opening leaves contrast optional and on-spot indexing enabled", idle.calls === 0 && idle.io.fileBytes === 0 && idle.legend && idle.stage === "stored" && idle.live, JSON.stringify(idle));
   const seen = await evaluate(`
+    document.getElementById("btn-overview").click();
     for (let i = 0; i < 300 && !/overview:/.test(document.getElementById("log").textContent); i++) await new Promise((r) => setTimeout(r, 100));
     const shown = () => [...document.querySelectorAll("#panels .panel")].filter((p) => !p.hidden).map((p) => p.dataset.tab).join();
     const before = shown();
     document.getElementById("tab-index").click();
     return { overview: (/overview: [^\\n]*/.exec(document.getElementById("log").textContent) || [""])[0], before, after: shown(), done: document.getElementById("tab-data").dataset.done };`);
-  check("the overview reads every pattern", /overview: 4,125 patterns/.test(seen.overview), seen.overview);
+  check("explicit contrast calculation reads every pattern", /overview: 4,125 patterns/.test(seen.overview), seen.overview);
   check("the steps are tabs, one panel at a time", seen.before === "data" && seen.after === "index" && seen.done === "1", `${seen.before} → ${seen.after}`);
 
   // before anything is fitted or indexed, the selected pattern is indexed on the spot
@@ -226,6 +241,27 @@ try {
   check("Index covers the map", idx.n === 4125 && idx.kind === "ipf_z" && idx.map === 4125 * 4, `${idx.n} patterns in ${idx.secs.toFixed(2)} s (${(idx.n / idx.secs).toFixed(0)} patterns/s)`);
   check("the orientations are the ones kikuchipy refined", idx.median < 0.6 && idx.within3 > 0.97 && idx.ncc > 0.45, `median ${idx.median.toFixed(3)}° apart, within 3°: ${(100 * idx.within3).toFixed(1)} %, mean NCC ${idx.ncc.toFixed(3)}`);
   check("the export has every cell", idx.ang === 4125, `${idx.ang} lines`);
+  const hdf5 = await evaluate(`
+    const before = window.ze.indexStatus;
+    const snapshot = window.ze.exportSnapshot();
+    const writer = await import('./js/hdf5-export.js');
+    const bytes = await writer.exportH5(snapshot);
+    const h = await import('./js/vendor/h5wasm/hdf5_hl.js'); await h.ready;
+    h.FS.writeFile('/roundtrip.h5', bytes);
+    const f = new h.File('/roundtrip.h5', 'r');
+    const phases = Array.from(f.get('Scan 1/EBSD/Data/Phase').value);
+    const phi = Array.from(f.get('Scan 1/EBSD/Data/Phi1').value);
+    const correct = phases.every((p,i) => p === (snapshot.results.phase[i] < 0 ? 255 : snapshot.results.phase[i]))
+      && phi.every((p,i) => p === snapshot.results.euler[3*i]);
+    const rows = f.get('Scan 1/EBSD/Header/nRows').value[0];
+    f.close(); h.FS.unlink('/roundtrip.h5');
+    const end = window.ze.indexStatus;
+    return { correct, rows, bytes:bytes.length, same:JSON.stringify(before)===JSON.stringify(end),
+      enabled:!document.getElementById('btn-h5').disabled,
+      oxfordDisabled:document.getElementById('btn-h5oina').disabled };
+  `);
+  check("HDF5 export uses stored results without another solve", hdf5.correct && hdf5.rows===55 && hdf5.same && hdf5.enabled && hdf5.oxfordDisabled,
+    `${hdf5.bytes} bytes; selected phases and raw Euler angles match; Oxford requires an original Oxford source/frame`);
   check("the map says what its colours mean", idx.key.w > 20 && idx.key.names === "001 101 111", `an inverse pole figure key ${idx.key.w} px wide, corners ${idx.key.names}`);
   // another colouring from the Index tab: the map and its key follow it
   const keyed = await evaluate(`
@@ -307,6 +343,9 @@ try {
         said: document.getElementById("nlpar-readout").textContent, shares: document.getElementById("pat-shares").hidden ? 0 : document.getElementById("pat-shares").width };
     };`;
   const pre = await evaluate(`${setField("sweeps", 1)} ${look}
+    document.querySelector('#pat-stage [data-stage="filtered"]').click();
+    await window.ze._queue;
+    await new Promise(r => setTimeout(r, 100));
     const c = document.getElementById("pat-exp");
     const plain = Array.from(c.getContext("2d").getImageData(0, 0, c.width, c.height).data.filter((_, i) => i % 4 === 0));
     ${setField("average with neighbours (NLPAR)", true)}

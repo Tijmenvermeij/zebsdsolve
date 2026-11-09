@@ -19,6 +19,20 @@ const hdf5 = @import("io/hdf5.zig");
 
 const Allocator = std.mem.Allocator;
 
+/// Cartesian axes of the stored master directions, established from the file
+/// format's implementation, independently of the container/producer name.
+pub const CrystalFrame = enum {
+    unknown,
+    x_a_z_cstar,
+
+    pub fn label(self: CrystalFrame) []const u8 {
+        return switch (self) {
+            .unknown => "unknown",
+            .x_a_z_cstar => "X||a,Z||c*",
+        };
+    }
+};
+
 pub const Master = struct {
     gpa: Allocator,
     name: []u8,
@@ -38,6 +52,8 @@ pub const Master = struct {
     voltage_kv: f64 = 0,
     /// "ebsdsim" or "emsoft"
     source: []const u8 = "",
+    crystal_frame: CrystalFrame = .unknown,
+    source_format_version: ?u32 = null,
     /// the point-group operators the master itself obeys (row-major 3 × 3 each), measured
     /// from the raw sheets by `measureSymmetry`
     ops: []rot.Mat3 = &.{},
@@ -240,6 +256,40 @@ fn ebsdsimLattice(gpa: Allocator, meta: []const u8) !?[6]f64 {
     return if (validLattice(lattice)) lattice else null;
 }
 
+const FrameInfo = struct { frame: CrystalFrame = .unknown, version: ?u32 = null };
+
+fn ebsdsimFrameInfo(gpa: Allocator, meta: []const u8) !FrameInfo {
+    const compatible = try compatibleJson(gpa, meta);
+    defer gpa.free(compatible);
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, compatible, .{}) catch return .{};
+    defer parsed.deinit();
+    if (parsed.value != .object) return .{};
+    const format = parsed.value.object.get("format") orelse return .{};
+    const version = parsed.value.object.get("format_version") orelse return .{};
+    if (format != .string or !std.mem.eql(u8, format.string, "ebsdsim-master-pattern")) return .{};
+    if (version != .integer or version.integer < 0 or version.integer > std.math.maxInt(u32)) return .{};
+    const number: u32 = @intCast(version.integer);
+    // ebsdsim v3 save.py writes Cartesian khat unchanged; crystal/build.py
+    // defines the triangular direct structure matrix with X||a, Z||c*.
+    // A producer name or an unverified archive version is insufficient.
+    return .{ .version = number, .frame = if (number == 3) .x_a_z_cstar else .unknown };
+}
+
+test "ebsdsim archive metadata identifies only source-verified crystal conventions" {
+    const gpa = std.testing.allocator;
+    const known = try ebsdsimFrameInfo(gpa, "{\"format\":\"ebsdsim-master-pattern\",\"format_version\":3}");
+    try std.testing.expectEqual(CrystalFrame.x_a_z_cstar, known.frame);
+    try std.testing.expectEqual(@as(?u32, 3), known.version);
+    inline for (.{
+        "{}",
+        "{\"format\":\"ebsdsim-master-pattern\",\"format_version\":2}",
+        "{\"format\":\"ebsdsim-master-pattern\",\"format_version\":4}",
+        "{\"format\":\"other-master\",\"format_version\":3}",
+        "{\"format\":\"ebsdsim-master-pattern\",\"format_version\":\"3\"}",
+        "not json",
+    }) |meta| try std.testing.expectEqual(CrystalFrame.unknown, (try ebsdsimFrameInfo(gpa, meta)).frame);
+}
+
 fn loadEbsdsim(gpa: Allocator, f: *File) !Master {
     var z = try Npz.open(gpa, f);
     defer z.deinit();
@@ -254,6 +304,7 @@ fn loadEbsdsim(gpa: Allocator, f: *File) !Master {
     var meta_a = try z.array("meta_json");
     defer if (meta_a) |*a| a.deinit(gpa);
     const meta: []const u8 = if (meta_a) |a| a.data else "";
+    const frame_info = try ebsdsimFrameInfo(gpa, meta);
 
     // values per direction: energy 0 and site 0 are the integrated slices of format 2; the
     // legacy array is (direction, site)
@@ -344,6 +395,8 @@ fn loadEbsdsim(gpa: Allocator, f: *File) !Master {
         .side = @intCast(side),
         .raw = sheets,
         .source = "ebsdsim",
+        .crystal_frame = frame_info.frame,
+        .source_format_version = frame_info.version,
     };
     errdefer gpa.free(m.name);
     m.lattice = try ebsdsimLattice(gpa, meta);
@@ -508,6 +561,7 @@ fn loadEmsoft(gpa: Allocator, f: *File) !Master {
         .side = @intCast(side),
         .raw = sheets,
         .source = "emsoft",
+        .crystal_frame = .x_a_z_cstar,
     };
     errdefer gpa.free(m.name);
     if (try h.find("CrystalData/LatticeParameters")) |a| {

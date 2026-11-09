@@ -178,6 +178,7 @@ class Solver:
                 paths.append(side)
         joined = "\n".join(paths).encode()
         self._check(self._lib.ze_open_scan(self._e, joined, len(joined)), "open")
+        self._source_path = paths[0]
         return self
 
     def synthesize(self, **settings):
@@ -205,6 +206,7 @@ class Solver:
         geometry = self.geometry
         i32p = ctypes.POINTER(ctypes.c_int32)
         self._check(self._lib.ze_synthesize(self._e, _ptr(q, _n.f32p), ph.ctypes.data_as(i32p), gr.ctypes.data_as(i32p), n), "synthesize")
+        self._source_path = None
         return {"quaternions": q.reshape(rows, cols, 4), "phase": ph.reshape(rows, cols), "grain": gr.reshape(rows, cols), "geometry": geometry}
 
     def set_patterns(self, patterns):
@@ -224,6 +226,7 @@ class Solver:
         a = np.ascontiguousarray(a)
         rows, cols, h, w = a.shape
         self._check(self._lib.ze_set_patterns(self._e, a.ctypes.data, a.nbytes, pixel, rows, cols, h, w), "set_patterns")
+        self._source_path = None
         return self
 
     @property
@@ -305,6 +308,18 @@ class Solver:
             self._check(self._lib.ze_pattern_stats(self._e, _ptr(part, _n.u64p), len(part), _ptr(o, _n.f32p), o.size), "pattern_stats")
         mean, std = out[0::2], out[1::2]
         return (mean.reshape(s["rows"], s["cols"]), std.reshape(s["rows"], s["cols"])) if whole else (mean, std)
+
+    def stored_overview(self):
+        """Stored acquisition quality map, or None; never computes pattern statistics."""
+        n = self._check(self._lib.ze_scan_overview(self._e, None, 0), "stored_overview")
+        if not n:
+            return None
+        values = np.empty(n, dtype=np.float32)
+        self._check(self._lib.ze_scan_overview(self._e, _ptr(values, _n.f32p), n), "stored_overview")
+        kind = self._lib.ze_scan_overview_kind(self._e)
+        label = {1: "Band contrast", 2: "Image quality", 3: "Radon quality", 4: "Pattern quality"}[kind]
+        info = self.scan
+        return {"kind": kind, "label": label, "values": values.reshape(info["rows"], info["cols"])}
 
     # ── phases ──
 
@@ -592,11 +607,59 @@ class Solver:
         self._check(self._lib.ze_ipf_key(self._e, int(phase), int(size), int(bool(lower)), _ptr(out, _n.u8p), out.size, _ptr(box, _n.f32p)), "ipf_key")
         return out.reshape(size, size, 4), tuple(float(v) for v in box[:4])
 
-    def export(self, path):
-        """Write the results as an EDAX .ang or an HKL .ctf file, by the path's extension."""
+    def export_snapshot(self, engine_to_cs1=None):
+        """Stored results and alternate-phase candidates; optional active engine→CS1 wxyz rotation."""
+        frame = None
+        if engine_to_cs1 is not None:
+            frame = np.ascontiguousarray(engine_to_cs1, dtype=np.float64).reshape(4)
+        ptr = _ptr(frame, _n.f64p) if frame is not None else None
+        n = self._check(self._lib.ze_export_snapshot(self._e, ptr, None, 0), "export_snapshot")
+        buf = ctypes.create_string_buffer(n)
+        self._check(self._lib.ze_export_snapshot(self._e, ptr, buf, n), "export_snapshot")
+        return json.loads(buf.raw)
+
+    def export_oxford_snapshot(self, engine_to_cs1=None):
+        """Oxford CS1 results with native per-phase crystal-basis conversion.
+
+        The default inherits the frozen original Oxford calibration. An explicit
+        active wxyz engine-to-CS1 rotation supports legacy/manual inputs; it
+        cannot redefine the frozen frame of a calibrated Oxford acquisition.
+        """
+        frame = None if engine_to_cs1 is None else np.ascontiguousarray(engine_to_cs1, dtype=np.float64).reshape(4)
+        ptr = _ptr(frame, _n.f64p) if frame is not None else None
+        n = self._check(self._lib.ze_export_oxford_snapshot(self._e, ptr, None, 0), "export_oxford_snapshot")
+        buf = ctypes.create_string_buffer(n)
+        self._check(self._lib.ze_export_oxford_snapshot(self._e, ptr, buf, n), "export_oxford_snapshot")
+        return json.loads(buf.raw)
+
+    def export(self, path, *, reference=None, engine_to_cs1=None, frame_provenance=None, phase_id_map=None):
+        """Write ANG, CTF, EMSphInx-compatible H5, or a baseline-preserving Oxford H5OINA.
+
+        H5OINA omits diffraction patterns and inherits the original Oxford
+        calibration and native crystal-basis conversion automatically. Explicit
+        engine_to_cs1 overrides require frame_provenance.
+        HDF5 exports require the optional h5py dependency.
+        """
+        suffix = str(path).rsplit(".", 1)[-1].lower()
+        if suffix in ("h5", "hdf5"):
+            from .hdf5_export import write_emsphinx
+            return write_emsphinx(path, self.export_snapshot())
+        if suffix == "h5oina":
+            from .hdf5_export import write_oxford
+            if engine_to_cs1 is not None and (not isinstance(frame_provenance, str) or not frame_provenance.strip()):
+                raise Error("OxfordFrameUnresolved: explicit engine_to_cs1 requires frame_provenance")
+            reference = reference or getattr(self, "_source_path", None)
+            if not reference:
+                raise Error("H5OINA export requires the original Oxford file")
+            snapshot = self.export_oxford_snapshot(engine_to_cs1)
+            frame = snapshot["oxford_frame"]
+            if engine_to_cs1 is not None:
+                frame["provenance"] = frame_provenance.strip()
+            return write_oxford(path, reference, snapshot, frame["engine_to_cs1"],
+                                frame["provenance"], phase_id_map=phase_id_map)
         kind = {"ang": 0, "ctf": 1}.get(str(path).rsplit(".", 1)[-1].lower())
         if kind is None:
-            raise Error("export writes .ang or .ctf")
+            raise Error("export writes .ang, .ctf, .h5 or .h5oina")
         n = self._check(self._lib.ze_export(self._e, kind, None, 0), "export")
         buf = ctypes.create_string_buffer(n)
         self._check(self._lib.ze_export(self._e, kind, buf, n), "export")

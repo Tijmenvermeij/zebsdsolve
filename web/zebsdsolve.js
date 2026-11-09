@@ -145,12 +145,19 @@ function gpuImports(state) {
     recorded = [];
     for (const r of state.reads) {
       if (r.promise || !r.issued) continue;
-      r.promise = r.staging.mapAsync(GPUMapMode.READ).then(() => {
-        // wasm memory may have grown since the read was requested: take a fresh view.
-        new Uint8Array(mem(), r.dst, r.size).set(new Uint8Array(r.staging.getMappedRange(), 0, r.size));
-        r.staging.unmap();
-        r.staging.destroy();
-      });
+      r.promise = (async () => {
+        let mapped = false;
+        try {
+          await r.staging.mapAsync(GPUMapMode.READ);
+          mapped = true;
+          // wasm memory may have grown since the read was requested: take a fresh view.
+          new Uint8Array(mem(), r.dst, r.size).set(new Uint8Array(r.staging.getMappedRange(), 0, r.size));
+        } finally {
+          try { if (mapped) r.staging.unmap(); } finally { r.staging.destroy(); }
+        }
+      })();
+      // A submit may precede wait while the host reads the next batch's file ranges.
+      r.promise.catch(() => {});
     }
   };
   const doDestroy = (b) => { if (enc) recorded.push(b); else b.destroy(); }; // never under an open batch
@@ -305,6 +312,9 @@ function gpuImports(state) {
       if (backlog) defer(doSubmit); else doSubmit();
     },
     takeError(ptr, cap) {
+      // Fatal GPU diagnostics are retained separately. Residual asynchronous adapter errors
+      // must not turn a successful CPU-only results/export call into another GPU failure.
+      if (state.deviceLoss) { state.errors.length = 0; return 0; }
       if (!state.errors.length) return 0;
       const b = utf8enc.encode(state.errors.shift()).subarray(0, cap);
       bytes(ptr, b.length).set(b);
@@ -319,7 +329,11 @@ function gpuImports(state) {
         if (drained) { await drained.promise; st.compileWaitMs += performance.now() - t0; }
         const reads = state.reads;
         state.reads = [];
-        await Promise.all(reads.map((r) => r.promise));
+        // Never unwind the native stack (and free its destinations) while another mapping
+        // can still copy into wasm memory, even when an earlier mapping has failed.
+        const settled = await Promise.allSettled(reads.map((r) => r.promise));
+        const failed = settled.find((r) => r.status === "rejected");
+        if (failed) throw failed.reason;
         return 0;
       } catch (e) { state.errors.push(String(e)); return 1; } finally { st.waitMs += performance.now() - t0; }
     }),
@@ -385,9 +399,9 @@ function ioImports(state) {
 // Exports that never wait (plain calls); every other function export may suspend (on the GPU
 // or on a file read) and is called through WebAssembly.promising.
 const SYNC_EXPORTS = new Set(["ze_alloc", "ze_free", "ze_version", "ze_create", "ze_destroy", "ze_adapter", "ze_error",
-  "ze_configure", "ze_settings", "ze_events", "ze_cancel", "ze_close_scan", "ze_scan_info", "ze_scan_format",
+  "ze_configure", "ze_settings", "ze_events", "ze_cancel", "ze_close_scan", "ze_scan_info", "ze_scan_format", "ze_scan_overview_kind",
   "ze_get_geometry", "ze_set_geometry", "ze_clear_phases", "ze_phase_count", "ze_phase_info", "ze_pattern_shape", "ze_nlpar_view",
-  "ze_pc_scores", "ze_fit_patterns", "ze_results", "ze_map", "ze_ipf_key", "ze_export", "ze_reduce", "ze_disorientation", "ze_shader",
+  "ze_pc_scores", "ze_fit_patterns", "ze_results", "ze_map", "ze_ipf_key", "ze_export", "ze_export_snapshot", "ze_export_oxford_snapshot", "ze_reduce", "ze_disorientation", "ze_shader",
   "ze_index_status", "ze_tune_begin", "ze_tune_report", "ze_pixel_angle", "ze_lattice", "ze_sweep", "ze_pc_level_count", "ze_pc_level", "ze_pc_level_ballots",
   "ze_gpu_counts", "ze_profile", "ze_profile_report", "ze_compile_wgsl"]);
 
@@ -422,6 +436,7 @@ export class Zebsdsolve {
   /** Load the module and open a high-performance device with the limits the engine needs. */
   static async create({ wasm = new URL("../zig-out/web/zebsdsolve.wasm", import.meta.url), device = null, warm = true, onCompile = null } = {}) {
     let info = "";
+    let adapterInfo = {};
     if (!device) {
       const adapter = await navigator.gpu?.requestAdapter({ powerPreference: "high-performance" });
       if (!adapter) throw new Error("WebGPU is not available");
@@ -430,11 +445,20 @@ export class Zebsdsolve {
       const requiredFeatures = adapter.features.has("shader-f16") ? ["shader-f16"] : [];
       device = await adapter.requestDevice({ requiredLimits, requiredFeatures });
       const ai = adapter.info || {};
+      adapterInfo = Object.fromEntries(["vendor", "architecture", "device", "description"].map((k) => [k, String(ai[k] || "")]));
       info = `${ai.vendor || "gpu"} ${ai.architecture || ai.device || ""}`.trim();
     }
     const compiling = { done: 0, total: 0, listeners: onCompile ? [onCompile] : [] };
-    const state = { device, memory: null, reads: [], errors: [], info, listeners: [], stats: newStats(), compiling,
+    const state = { device, memory: null, reads: [], errors: [], info, adapterInfo: Object.freeze(adapterInfo), deviceLoss: null, listeners: [], stats: newStats(), compiling,
       files: [null], io: { reads: 0, slices: 0, bytes: 0, ms: 0 } };
+    // This callback only reports JS state. It must never enter wasm while an operation is
+    // suspended, nor race that operation's lifetime against device.lost.
+    device.lost?.then((loss) => {
+      if (state.deviceLoss) return;
+      state.deviceLoss = Object.freeze({ reason: String(loss.reason || "unknown"), message: String(loss.message || "") });
+      const ev = { kind: "deviceLost", ...state.deviceLoss };
+      for (const fn of state.listeners) try { fn(ev); } catch (e) { console.error(e); }
+    });
     const warmOn = warm && typeof localStorage !== "undefined";
     // This origin's own list when it belongs to this build; else the shipped one, downloaded
     // alongside the wasm on a first visit (or after the wasm changed).
@@ -478,6 +502,8 @@ export class Zebsdsolve {
   }
 
   get device() { return this.state.device; }
+  get deviceLost() { return this.state.deviceLoss || null; }
+  get adapterInfo() { return this.state.adapterInfo; }
   get mem() { return this.state.memory.buffer; }
 
   get version() {
@@ -503,7 +529,7 @@ export class Zebsdsolve {
     return s;
   }
 
-  /** Listen to progress events ({kind: "log" | "progress" | "pc" | "pose", …}); returns an unsubscribe. */
+  /** Listen to progress and deviceLost events; returns an unsubscribe. */
   onEvent(fn) {
     this.state.listeners.push(fn);
     return () => { this.state.listeners = this.state.listeners.filter((f) => f !== fn); };
@@ -549,13 +575,27 @@ export class Zebsdsolve {
 
   _check(rc, what) {
     const err = this._error();
-    if (Number(rc) < 0 || err) throw new Error(`${what}: ${err || rc}`);
+    if (Number(rc) < 0 || err) {
+      // Native failure text takes precedence over takeError's adapter queue. Consume the
+      // remaining adapter diagnostics with this failed call, not the next results/export.
+      const extra = Number(rc) < 0 ? this.state.errors?.splice(0) || [] : [];
+      if (this.deviceLost) extra.push(this._deviceLossError().message);
+      throw new Error(`${what}: ${[err || rc, ...extra].join("; ")}`);
+    }
     return Number(rc);
+  }
+
+  _deviceLossError() {
+    const loss = this.deviceLost;
+    const e = new Error(`GPU device lost (${loss.reason})${loss.message ? `: ${loss.message}` : ""}. Reload to resume GPU work; completed results remain available for export.`);
+    e.name = "GPUDeviceLost";
+    return e;
   }
 
   /** Calls are serialized: one operation on the module at a time (only cancel() may interleave). */
   _serial(fn) {
-    const run = this._queue.then(fn, fn);
+    const guarded = () => { if (this.deviceLost) throw this._deviceLossError(); return fn(); };
+    const run = this._queue.then(guarded, guarded);
     this._queue = run.catch(() => {});
     return run;
   }
@@ -669,6 +709,21 @@ export class Zebsdsolve {
     s.format = this._text((p, cap) => this.x.ze_scan_format(this.e, p, cap), 64);
     s.dtype = ["uint8", "uint16", "float32"][s.pixel];
     return s;
+  }
+
+  /** The acquisition's stored scalar map, without reading diffraction patterns. */
+  storedOverview() {
+    return this._serial(() => this._frame(async (f) => {
+      const n = this._check(await this.x.ze_scan_overview(this.e, 0, 0), "stored overview");
+      if (!n) return null;
+      const kind = this.x.ze_scan_overview_kind(this.e);
+      const label = [null, "Band contrast", "Image quality", "Radon quality", "Pattern quality"][kind];
+      if (!label) throw new Error("Unknown stored overview kind.");
+      const p = f.alloc(n * 4);
+      const count = this._check(await this.x.ze_scan_overview(this.e, p, n), "stored overview");
+      if (count !== n) throw new Error("Stored overview size changed while reading.");
+      return { kind, label, values: new Float32Array(this.mem, p, n).slice() };
+    }));
   }
 
   /** [height, width] of a pattern: reduced by the binning setting, or (full) as stored. */
@@ -951,9 +1006,25 @@ export class Zebsdsolve {
       const pick = (s) => ({ batch: s.batch, refine_pixels: s.refine_pixels, wg_refine: s.wg_refine, wg_fft: s.wg_fft });
       const before = pick(this.settings);
       this._check(this.x.ze_tune_begin(this.e), "tune");
+      const lostTrialError = () => {
+        // The trial has settled: consume its native failure before a later CPU export can
+        // mistake that stale error for its own. Keep the trial diagnostic with the loss.
+        const detail = this._error();
+        const error = this._deviceLossError();
+        if (detail) error.message += `; ${detail}`;
+        return error;
+      };
       for (let done = 1; ; done++) {
         const t0 = performance.now();
-        const rc = await this.x.ze_tune_trial(this.e);
+        let rc;
+        try { rc = await this.x.ze_tune_trial(this.e); }
+        catch (error) {
+          if (!this.deviceLost) throw error;
+          const fatal = lostTrialError();
+          fatal.cause = error;
+          throw fatal;
+        }
+        if (this.deviceLost) throw lostTrialError();
         let seconds = (performance.now() - t0) / 1000;
         if (rc !== 0) {
           // a value this machine cannot run just loses
@@ -961,6 +1032,7 @@ export class Zebsdsolve {
           if (/Cancelled/.test(message)) throw new Error(`tune: ${message}`);
           seconds = -1;
         }
+        if (this.deviceLost) throw lostTrialError();
         const more = this.x.ze_tune_report(this.e, seconds);
         if (!more || (progress && progress(done) === false)) break;
       }
@@ -1036,6 +1108,38 @@ export class Zebsdsolve {
       const p = f.alloc(n);
       this._check(this.x.ze_export(this.e, k, p, n), "export");
       return new Uint8Array(this.mem, p, n).slice();
+    });
+  }
+
+  /** Native export data. Optional active wxyz engine→Oxford CS1 frame transformation. */
+  exportSnapshot(engineToCs1 = null) {
+    return this._frame((f) => {
+      let frame = 0;
+      if (engineToCs1 !== null) {
+        if (!Array.isArray(engineToCs1) || engineToCs1.length !== 4 || !engineToCs1.every(Number.isFinite)) throw new Error("Expected engine→CS1 quaternion [w,x,y,z].");
+        frame = f.alloc(32);
+        new Float64Array(this.mem, frame, 4).set(engineToCs1);
+      }
+      const n = this._check(this.x.ze_export_snapshot(this.e, frame, 0, 0), "export snapshot");
+      const p = f.alloc(n);
+      this._check(this.x.ze_export_snapshot(this.e, frame, p, n), "export snapshot");
+      return JSON.parse(utf8.decode(new Uint8Array(this.mem, p, n)));
+    });
+  }
+
+  /** Oxford CS1 results, converted natively using frozen source and crystal frames. */
+  exportOxfordSnapshot(engineToCs1 = null) {
+    return this._frame((f) => {
+      let frame = 0;
+      if (engineToCs1 !== null) {
+        if (!Array.isArray(engineToCs1) || engineToCs1.length !== 4 || !engineToCs1.every(Number.isFinite)) throw new Error("Expected engine→CS1 quaternion [w,x,y,z].");
+        frame = f.alloc(32);
+        new Float64Array(this.mem, frame, 4).set(engineToCs1);
+      }
+      const n = this._check(this.x.ze_export_oxford_snapshot(this.e, frame, 0, 0), "Oxford export snapshot");
+      const p = f.alloc(n);
+      this._check(this.x.ze_export_oxford_snapshot(this.e, frame, p, n), "Oxford export snapshot");
+      return JSON.parse(utf8.decode(new Uint8Array(this.mem, p, n)));
     });
   }
 

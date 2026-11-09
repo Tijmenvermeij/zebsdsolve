@@ -111,6 +111,7 @@
             <button type="button" class="act" id="btn-tune" title="Before a large scan: index a sample of the region, sized by the bandwidth, a few times over, and keep the batch size and workgroup sizes that run fastest on this machine. About ten short trials.">Tune speed</button>
           </div>
           <p class="readout" id="index-readout"></p>
+          <progress id="index-progress" max="1" value="0" aria-label="Indexing progress" hidden></progress>
           <div class="fields" data-group="index"></div>
           <h4>sweeps</h4>
           <div class="fields" data-group="sweeps"></div>
@@ -123,6 +124,7 @@
             <summary>region of interest</summary>
             <p class="hint">In map cells. Zero width or height: the whole map. Shift-drag on the map sets it.</p>
             <div class="fields" data-group="roi"></div>
+            <button type="button" class="act" id="btn-roi-full">Full ROI</button>
           </details>
           <h4>maps</h4>
           <div class="fields" data-group="maps"></div>
@@ -130,9 +132,10 @@
           <div class="row">
             <button type="button" class="needs-results" id="btn-ang"><svg><use href="#i-down"/></svg>.ang</button>
             <button type="button" class="needs-results" id="btn-ctf"><svg><use href="#i-down"/></svg>.ctf</button>
+            <button type="button" class="needs-results" id="btn-h5"><svg><use href="#i-down"/></svg>.h5</button>
+            <button type="button" class="needs-results" id="btn-h5oina"><svg><use href="#i-down"/></svg>.h5oina</button>
             <button type="button" id="btn-json" title="The geometry and every setting, as JSON. Dropped on the window (or opened with a scan), it brings them back."><svg><use href="#i-down"/></svg>project .json</button>
           </div>
-          <p class="hint">Orientations are Bunge angles in the sample frame of the geometry: x down the tilted surface toward the detector, z along the surface normal. Each is the Bunge triplet of the orientation's quaternion in the phase's fundamental zone.</p>
         </section>
       </div>
     </aside>
@@ -142,7 +145,7 @@
         <div class="pane-bar">
           <span class="ttl" title="Click or drag to select a pattern; the arrow keys step it (with shift: by ten). Scroll zooms about the pointer, a drag moves a zoomed map, shift-drag sets the region of interest.">map</span>
           <div class="seg" id="map-kind" role="tablist">
-            <button type="button" data-kind="overview" aria-pressed="true" title="Contrast of each stored pattern (its standard deviation): visible before anything is indexed">overview</button>
+            <button type="button" data-kind="overview" aria-pressed="true">overview</button>
             <button type="button" data-kind="ipf_z" aria-pressed="false" title="Inverse pole figure colour of the sample normal">IPF Z</button>
             <button type="button" data-kind="ipf_x" aria-pressed="false" title="Inverse pole figure colour of the sample's x: down the tilted surface">IPF X</button>
             <button type="button" data-kind="ipf_y" aria-pressed="false" title="Inverse pole figure colour of the sample's y">IPF Y</button>
@@ -156,6 +159,10 @@
           <span class="grow"></span>
           <span class="meta" id="map-hover"></span>
           <label class="check" title="The lattice of patterns the fits use (green once a fit has given them orientations)"><input type="checkbox" id="show-fit" checked> fit patterns</label>
+        </div>
+        <div class="pane-bar overview-bar">
+          <select id="overview-source" aria-label="Overview source" disabled><option value="none">Overview</option><option value="calculated">Pattern contrast</option></select>
+          <button type="button" class="ghost mini" id="btn-overview" disabled>Calculate pattern contrast</button>
         </div>
         <div class="well" id="map-well" tabindex="0">
           <canvas id="map" width="1" height="1"></canvas>

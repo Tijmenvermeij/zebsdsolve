@@ -344,7 +344,7 @@ pub fn run(e: *Engine) !Result {
     try e.indexCells(cells, .{ .bandwidth = s.fit_bandwidth, .dict_grid = s.dict_grid }, recs);
     const phase = try gpa.alloc(i32, n);
     errdefer gpa.free(phase);
-    var st: State = .{ .R = e.geo.rotation(), .t = e.geo.translation(sz[0], sz[1]), .q = try gpa.alloc(rot.Quat, n) };
+    var st: State = .{ .R = e.calibration.rotation(&e.geo), .t = e.calibration.translation(&e.geo, sz[0], sz[1]), .q = try gpa.alloc(rot.Quat, n) };
     defer gpa.free(st.q);
     var trial: State = .{ .R = st.R, .t = st.t, .q = try gpa.alloc(rot.Quat, n) };
     defer gpa.free(trial.q);
@@ -465,7 +465,7 @@ pub fn run(e: *Engine) !Result {
 
     // the geometry takes the fitted pose
     e.geo.pc = Geometry.pcOf(st.R, st.t, sz[0], sz[1]);
-    e.geo.rot = rot.so3Log(rot.fromMat(rot.matMul(rot.transpose(e.geo.nominal()), st.R)));
+    e.geo.rot = rot.so3Log(rot.fromMat(rot.matMul(rot.transpose(e.calibration.nominal(&e.geo)), st.R)));
     if (free[6]) e.geo.px_um /= st.k;
     if (free[6] and st.k < 0.1) e.events.log("pose fit: the fitted scale leaves {d:.1} % of the beam's travel the pixel size and the steps give. A scale that runs away like this says the patterns do not move the way the scan says they should: the scan directions (scan_x_sign, scan_y_sign) are probably the wrong way round.", .{100 * st.k});
     res.px_um = e.geo.px_um;
