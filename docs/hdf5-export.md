@@ -15,6 +15,13 @@ The browser's `.h5` button and Python `solver.export("results.h5")` write:
   phase candidates. The root `Manufacturer=EMSphInx` identifies the compatible
   layout; the producer is zebsdsolve.
 
+Batch H5 exports additionally contain `zebsdsolve/Maps/IPFZ_RGBA` and
+`NCC_RGBA` as row-major `[rows, columns, 4]` byte arrays, copied from the native
+GUI maps. `zebsdsolve/Maps/NCC` stores the numeric detector NCC raster, with NaN
+where no solution was computed. The maps use the existing native GUI frame and
+colour settings; this adds no orientation conversion. Separate full-raster PNGs
+use the same native pixels.
+
 Export does not run another search. All computed solver solutions remain
 exported, including low-scoring or unconverged matches and results whose
 acceptance sweep is −1. No quality threshold is applied; users can filter

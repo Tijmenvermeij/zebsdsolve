@@ -311,3 +311,32 @@ MIT ([LICENSE](../LICENSE)). The wheels bundle [wgpu-native](https://github.com/
 6. Y. H. Chen, S. U. Park, D. Wei, G. Newstadt, M. A. Jackson, J. P. Simmons, M. De Graef, A. O. Hero. A dictionary approach to electron backscatter diffraction indexing. *Microscopy and Microanalysis* 21 (2015) 739–752. [doi:10.1017/S1431927615000756](https://doi.org/10.1017/S1431927615000756)
 7. G. Nolze, R. Hielscher. Orientations – perfectly colored. *Journal of Applied Crystallography* 49 (2016) 1786–1802. [doi:10.1107/S1600576716012942](https://doi.org/10.1107/S1600576716012942)
 8. H. W. Ånes, J. Hjelen, A. T. J. van Helvoort, K. Marthinsen. Electron backscatter diffraction patterns from a single crystal silicon wafer. Zenodo (2022). [doi:10.5281/zenodo.7491388](https://doi.org/10.5281/zenodo.7491388)
+
+
+### Browser batch queue
+
+Configure a file-backed scan in the usual tabs, then choose **Add to batch**.
+Each job freezes its ordered scan/side files and masters, ROI, processing,
+refinement, original file-opening hints, effective geometry, and phase metadata.
+Opening the next scan does not change queued jobs. In **Batch**, edit the output
+name, or **Load** an unstarted job into the normal controls and use **Update batch
+job** to save adjustments. Loading a completed job creates a new configuration;
+it does not alter its saved outputs.
+
+Choose an output folder once, then **Run batch**. Edge/Chrome's folder-access API
+writes files directly. Jobs run sequentially on a separate engine/device, with
+the interactive scan preserved. Each scan gets its own directory and five files:
+an EMSphInx-style H5, an Oxford H5OINA (without patterns) or ANG for other sources,
+a settings JSON, and native IPF-Z/NCC PNG maps. H5 also contains the native map
+pixels and numeric NCC raster. Existing names get a suffix; completed files are
+not replaced. The batch manifest records inputs, frozen settings, output status
+and errors. Source file identities are recorded by name, size and modification
+time; these descriptors are not cryptographic file hashes.
+
+**Stop** cancels indexing at a safe batch boundary; it finishes an export already
+in progress. A save failure pauses the queue and retains the completed engine.
+**Retry export** retries unfinished outputs without indexing again. A changed
+output or an uncertain committed write is left untouched and reported for manual
+inspection. Clearing the queue discards retained unsaved results; it does not
+delete files already saved. Keep the page open until the batch completes: durable
+queue restoration after closing/reloading the browser is not implemented.

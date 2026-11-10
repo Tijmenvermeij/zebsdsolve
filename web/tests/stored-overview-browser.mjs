@@ -151,6 +151,9 @@ try {
   const first = await evaluate(`
     await waitPreview(()=>document.getElementById('map-legend').textContent==='Band contrast' && !document.getElementById('btn-overview').disabled && previewCalls.patterns.length>0);
     await ze._queue;
+    // Progressive chunk metadata warmup is independently tested by the scheduler
+    // suite; pause it here to isolate unintended pattern/contrast traffic.
+    ze.pauseIndexPreparation();await ze._queue;
     const before = ze.stats();await new Promise(r=>setTimeout(r,250));const idle=ze.stats();
     return {calls:previewCalls,initialBytes:before.fileBytes,idleBytes:idle.fileBytes,live:document.getElementById('pat-live').checked,stage:document.querySelector('#pat-stage [aria-pressed=true]').dataset.stage};
   `);

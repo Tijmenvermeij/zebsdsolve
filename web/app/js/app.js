@@ -5,12 +5,14 @@ import { GEOMETRY, buildFields, groupOf } from "./fields.js";
 import { drawGray, drawSigned, drawHeat, fit, svg, download, quantiles } from "./draw.js";
 import { createVotes } from "./votes.js";
 import { exportH5, exportOxford } from "./hdf5-export.js";
+import { BatchQueue } from "./batch.js";
+import { batchArtifacts } from "./batch-artifacts.js";
 
 const $ = (id) => document.getElementById(id);
 const app = $("app");
 const PHASE_COLORS = ["#3b82f6", "#f59e0b", "#10b981", "#ef4444", "#8b5cf6", "#14b8a6", "#ec4899", "#84cc16"];
 const RESULT_KINDS = ["ipf_z", "ipf_x", "ipf_y", "ncc", "nmi", "z", "phase", "sweep"];
-const TABS = ["data", "patterns", "geometry", "index"];
+const TABS = ["data", "patterns", "geometry", "index", "batch"];
 // settings outside the pattern's own groups that change what the pattern view shows of a
 // pattern indexed on the spot
 const LIVE_KEYS = new Set(["fit_bandwidth", "refine", "refine_iters", "refine_step", "nmi_bins", "phase_by", "scan_x_sign", "scan_y_sign"]);
@@ -22,7 +24,12 @@ const st = {
   scan: null,          // engine scan info, or null
   scanName: "",
   sourceFile: null,
+  sourceFiles: [],
+  sourceOpenHints: null,
+  batchRunning: false,
+  batchEditing: null,
   settings: {},
+  exampleBackground: null, // background settings from before the example was first opened
   cell: -1,            // selected map cell
   mapKind: "overview",
   overview: null,      // Current scalar background, in row-major pixel order.
@@ -118,6 +125,7 @@ async function busy(label, fn) {
   st.busy = 1;
   st.stop = false;
   app.dataset.busy = "1";
+  renderBatch();
   $("btn-stop").hidden = false;
   status(label);
   const t0 = performance.now();
@@ -134,6 +142,7 @@ async function busy(label, fn) {
   } finally {
     st.busy = 0;
     app.dataset.busy = "0";
+    renderBatch();
     $("btn-stop").hidden = true;
     if (!$("index-progress").hidden) {
       const readout = $("index-readout");
@@ -153,6 +162,9 @@ const factRows = (facts) => facts.flatMap(([k, v]) => { const dt = document.crea
 // ── the steps ──
 
 function selectTab(name) {
+  if (st.batchRunning && name !== "batch") return;
+  app.dataset.tab = name;
+  $("batch-workspace").hidden = name !== "batch";
   for (const b of $("tabs").children) {
     const on = b.dataset.tab === name;
     b.setAttribute("aria-selected", String(on));
@@ -334,25 +346,56 @@ function sortScanFiles(files) {
   return [...files].sort((a, b) => rank(a) - rank(b));
 }
 
-async function openScan(files) {
+const openHints = () => Object.fromEntries(["map_rows", "map_cols", "pattern_height", "pattern_width"].map((k) => [k, st.ze.settings[k]]));
+
+const backgroundSettings = () => {
+  const { static_background, dynamic_background } = st.ze.settings;
+  return { static_background, dynamic_background };
+};
+
+async function openScan(files, projectSettings = null, projectHints = null) {
   if (!gpuAvailable() || st.busy) return;
   files = sortScanFiles(files);
   if (!files.length) return;
   invalidateOverview();
   ++st.showRun;
+  let opened = false;
   await busy(`opening ${files[0].name}…`, async () => {
-    await st.ze.openScan(files);
+    const previousBackground = backgroundSettings();
+    let originalHints;
+    try {
+      if (st.exampleBackground) st.ze.configure(st.exampleBackground);
+      if (projectSettings) st.ze.configure(projectSettings);
+      if (projectHints) st.ze.configure(projectHints);
+      originalHints = openHints();
+      await st.ze.openScan(files);
+      if (projectSettings) st.ze.configure(projectSettings);
+    } catch (e) {
+      st.ze.configure(previousBackground);
+      if (projectSettings) afterSettings(Object.keys(projectSettings));
+      else { st.settings = st.ze.settings; fields.show(st.settings); }
+      throw e;
+    }
+    st.exampleBackground = null;
+    opened = true;
     st.scanName = files[0].name;
     afterOpen();
+    if (projectSettings) afterSettings(Object.keys(projectSettings));
     st.sourceFile = files[0];
+    st.sourceFiles = [...files];
+    st.sourceOpenHints = originalHints;
     updateEnabled();
   });
+  return opened;
 }
 
 function afterOpen() {
   invalidateOverview();
   ++st.showRun;
   st.sourceFile = null;
+  st.sourceFiles = [];
+  st.sourceOpenHints = null;
+  st.batchEditing = null;
   const s = st.ze.scan;
   st.scan = s;
   st.truth = null;
@@ -557,7 +600,7 @@ function showPhases() {
 }
 
 async function showMaster() {
-  if (st.gpuLost || !st.ze.phases.length || $("dock-master").hidden) return;
+  if (st.batchRunning || st.gpuLost || !st.ze.phases.length || $("dock-master").hidden) return;
   const run = ++st.masterRun, phase = st.phase;
   try {
     const { side, data } = await st.ze.masterImage(phase);
@@ -890,7 +933,7 @@ function showNlpar(a) {
 }
 
 async function showCell() {
-  if (!st.scan || st.cell < 0 || st.gpuLost || st.overviewLoading) return;
+  if (!st.scan || st.cell < 0 || st.gpuLost || st.overviewLoading || st.batchRunning) return;
   const run = ++st.showRun;
   const cell = st.cell;
   const { cols } = st.scan;
@@ -1176,6 +1219,7 @@ function updateEnabled() {
     : !st.results ? "Index the scan first." : "";
   $("btn-h5oina").disabled = !!oxfordReason;
   $("btn-h5oina").title = oxfordReason;
+  renderBatch();
   done("data", ready);
   done("patterns", ready);
 }
@@ -1202,12 +1246,12 @@ async function takeFiles(files) {
       status(`${projects[0].name}: not a zebsdsolve project (${e.message || e})`, true);
       return;
     }
-    if (project.settings) {
+    if (project.settings && !scans.length) {
       try { st.ze.configure(project.settings); } catch (e) { status(String(e.message || e), true); log(String(e.message || e), true); return; }
       afterSettings(Object.keys(project.settings));
     }
   }
-  if (scans.length) await openScan(scans);
+  if (scans.length && !await openScan(scans, project?.settings, project?.opening_hints)) return;
   if (masters.length) await addPhases(masters);
   if (project) {
     if (project.geometry && /Oxford h5oina/i.test(st.scan?.format || "") && project.geometry_convention !== "oxford-calibrated-v1") {
@@ -1228,6 +1272,10 @@ async function makeToy() {
   ++st.showRun;
   await busy("making a toy scan…", async () => {
     const truth = await st.ze.synthesize();
+    if (st.exampleBackground) {
+      st.ze.configure(st.exampleBackground);
+      st.exampleBackground = null;
+    }
     st.scanName = `toy scan, seed ${st.ze.settings.toy_seed}`;
     afterOpen();
     st.truth = truth;
@@ -1278,19 +1326,25 @@ async function loadExample() {
       return new File([await r.blob()], name);
     };
     const [scan, master] = await Promise.all([get("patterns_v2.h5"), get("Ni_master_20kV.npz")]);
+    const previousBackground = st.exampleBackground || backgroundSettings();
+    const originalHints = openHints();
     await st.ze.openScan([scan]);
     st.scanName = scan.name;
     st.ze.clearPhases();
     await st.ze.addPhase(master);
+    st.ze.configure({ static_background: "file", dynamic_background: "subtract" });
+    st.exampleBackground = previousBackground;
     st.phaseFiles = [master];
     afterOpen();
     st.sourceFile = scan;
+    st.sourceFiles = [scan];
+    st.sourceOpenHints = originalHints;
     phasesChanged();
   });
 }
 
 function projectJson() {
-  return JSON.stringify({ zebsdsolve: st.ze.version, scan: st.scanName, geometry_convention: /Oxford h5oina/i.test(st.scan?.format || "") ? "oxford-calibrated-v1" : "generic-v1", geometry: st.ze.geometry, settings: st.ze.settings, phases: st.ze.phases.map((p) => p.name) }, null, 2);
+  return JSON.stringify({ zebsdsolve: st.ze.version, scan: st.scanName, geometry_convention: /Oxford h5oina/i.test(st.scan?.format || "") ? "oxford-calibrated-v1" : "generic-v1", geometry: st.ze.geometry, settings: st.ze.settings, opening_hints: st.sourceOpenHints, phases: st.ze.phases.map((p) => p.name) }, null, 2);
 }
 
 /** Keep independent browser directory memories for scans and master patterns. */
@@ -1449,7 +1503,7 @@ function updateWiring() {
     st.roiDrag = null;
     afterSettings(Object.keys(set));
   });
-  $("btn-stop").addEventListener("click", () => { st.stop = true; st.ze.cancel(); status("stopping…"); });
+  $("btn-stop").addEventListener("click", () => { st.stop = true; if (st.batchRunning) batch.stop(); else st.ze.cancel(); status("stopping…"); });
   $("btn-ang").addEventListener("click", () => download(st.scanName.replace(/\.[^.]+$/, "") + ".ang", st.ze.exportText("ang"), "text/plain"));
   $("btn-ctf").addEventListener("click", () => download(st.scanName.replace(/\.[^.]+$/, "") + ".ctf", st.ze.exportText("ctf"), "text/plain"));
   $("btn-h5").addEventListener("click", () => busy("exporting HDF5…", async () => download(st.scanName.replace(/\.[^.]+$/, "") + ".h5", await exportH5(st.ze.exportSnapshot()), "application/x-hdf5")));
@@ -1473,6 +1527,7 @@ function updateWiring() {
     st.overview = source.values;
     setMapKind("overview");
   });
+  wireBatch();
   $("btn-json").addEventListener("click", () => download(st.scanName.replace(/\.[^.]+$/, "") + ".zebsdsolve.json", projectJson(), "application/json"));
   $("map-kind").addEventListener("click", (e) => { const b = e.target.closest("button"); if (b && !b.disabled) setMapKind(b.dataset.kind); });
   $("dock-kind").addEventListener("click", (e) => { const b = e.target.closest("button"); if (b) selectDock(b.dataset.dock); });
@@ -1571,5 +1626,155 @@ function updateWiring() {
   window.addEventListener("dragover", (e) => e.preventDefault());
   window.addEventListener("drop", (e) => { e.preventDefault(); depth = 0; $("dropveil").hidden = true; if (e.dataTransfer?.files.length) takeFiles([...e.dataTransfer.files]); });
 }
+
+// ── batch queue ──
+const batch = new BatchQueue({
+  createEngine: () => Zebsdsolve.create({ wasm: new URL("../zebsdsolve/zebsdsolve.wasm", import.meta.url), warm: false }),
+  artifacts: batchArtifacts,
+  onChange: () => renderBatch(),
+});
+
+function renderBatch() {
+  const ready = !!st.ze && !!st.sourceFiles.length && st.phaseFiles.length > 0 && !st.gpuLost && !st.busy;
+  for (const id of ["btn-batch-add", "btn-batch-current"]) {
+    $(id).disabled = !ready;
+    $(id).textContent = st.batchEditing ? "Update batch job" : id === "btn-batch-add" ? "Add to batch" : "Add current scan";
+  }
+  const waiting = batch.jobs.some((job) => ["queued", "export-pending"].includes(job.status));
+  $("btn-batch-run").disabled = st.busy || !batch.directory || !waiting;
+  $("btn-batch-stop").disabled = !batch.running;
+  $("btn-batch-clear").disabled = st.busy || !batch.jobs.length;
+  $("btn-batch-folder").disabled = st.busy || batch.jobs.some((job) => !!job.folderName);
+  $("batch-folder").textContent = batch.directory?.name || "";
+  $("batch-editing").textContent = st.batchEditing ? `Editing ${batch.jobs.find((job) => job.id === st.batchEditing)?.outputStem || "job"}` : "";
+  $("btn-batch-new").hidden = !st.batchEditing;
+  $("batch-empty").hidden = batch.jobs.length > 0;
+  $("batch-table").hidden = batch.jobs.length === 0;
+  const completed = batch.jobs.filter((job) => job.status === "complete").length;
+  $("batch-count").textContent = batch.jobs.length ? `${completed} / ${batch.jobs.length} complete` : "";
+  const active = batch.jobs.find((job) => ["indexing", "exporting"].includes(job.status));
+  const bar = $("batch-progress"); bar.hidden = !batch.running;
+  if (active?.progress && active.status === "indexing") {
+    const p = active.progress;
+    bar.value = Math.min(1, Math.max(0, p.done / Math.max(p.total, 1)));
+    $("batch-readout").textContent = `${active.sourceFiles[0].name}\nsweep ${p.sweep + 1}/${p.sweeps} · ${p.done.toLocaleString()} / ${p.total.toLocaleString()}\n${p.pps.toFixed(0)} patterns/s · ${remainingTime(p.etaSeconds)}`;
+  } else if (active) {
+    bar.removeAttribute("value");
+    $("batch-readout").textContent = `${active.sourceFiles[0].name}\n${active.status === "exporting" ? "Saving outputs…" : "Preparing indexing…"}`;
+  } else $("batch-readout").textContent = batch.error || (batch.jobs.length ? `${completed} of ${batch.jobs.length} jobs complete` : "");
+  const labels = { queued: "Queued", indexing: "Indexing", exporting: "Saving", complete: "Complete", cancelled: "Stopped", failed: "Failed", "export-pending": "Export failed" };
+  $("batch-jobs").replaceChildren(...batch.jobs.map((job) => {
+    const row = document.createElement("tr"); row.dataset.status = job.status; row.dataset.job = job.id;
+    const cell = (text, className) => { const td = document.createElement("td"); td.textContent = text; if (className) td.className = className; row.append(td); return td; };
+    const name = document.createElement("input"); name.type = "text"; name.value = job.outputStem; name.setAttribute("aria-label", `Output name for ${job.sourceFiles[0].name}`);
+    name.disabled = batch.running || !!job.folderName;
+    name.addEventListener("change", () => { try { batch.rename(job.id, name.value); } catch (e) { status(e.message, true); } });
+    cell("").append(name);
+    cell(job.sourceFiles[0].name, "batch-source");
+    cell(job.phases.map((phase) => phase.name).join(", "));
+    cell(String(job.settings.bandwidth));
+    const s = job.settings, scan = job.scanInfo;
+    cell(`${Math.min(s.roi_w || scan.cols, Math.max(0, scan.cols - s.roi_x))} × ${Math.min(s.roi_h || scan.rows, Math.max(0, scan.rows - s.roi_y))}\n@ ${s.roi_x}, ${s.roi_y}`);
+    const state = cell(labels[job.status] || job.status, "batch-status");
+    if (job.error) { const error = document.createElement("div"); error.className = "batch-error"; error.textContent = job.error; state.append(error); }
+    const actions = cell("", "batch-actions");
+    const button = (text, fn, disabled = false) => { const b = document.createElement("button"); b.type = "button"; b.className = "mini"; b.textContent = text; b.disabled = st.busy || disabled; b.addEventListener("click", fn); actions.append(b); };
+    button("Load", () => loadBatchJob(job), job.status === "export-pending");
+    if (["failed", "cancelled", "export-pending"].includes(job.status)) button(job.status === "export-pending" ? "Retry export" : "Retry", async () => {
+      try { batch.retry(job.id); if (job.status === "export-pending") await runBatch(); } catch (e) { status(e.message, true); }
+    });
+    if (job.status !== "export-pending") button("Remove", () => { try { batch.remove(job.id); if (st.batchEditing === job.id) { st.batchEditing = null; renderBatch(); } } catch (e) { status(e.message, true); } });
+    return row;
+  }));
+}
+
+async function addBatchJob() {
+  if (!gpuAvailable() || st.busy || !st.sourceFiles.length || !st.phaseFiles.length) return;
+  const files = st.sourceFiles;
+  try {
+    await st.ze._queue;
+    if (files !== st.sourceFiles || st.busy) return;
+    const spec = { sourceFiles: files, masterFiles: st.phaseFiles, settings: st.ze.settings, geometry: st.ze.geometry,
+      openHints: st.sourceOpenHints, openGeometry: st.geoOpened, scanInfo: st.scan, phases: st.ze.phases, version: st.ze.version };
+    if (st.batchEditing) { batch.replace(st.batchEditing, spec); st.batchEditing = null; }
+    else batch.add(spec);
+    selectTab("batch"); renderBatch();
+  } catch (e) { status(String(e.message || e), true); }
+}
+
+async function loadBatchJob(job) {
+  if (st.busy || !gpuAvailable()) return;
+  invalidateOverview(); ++st.showRun;
+  await busy("loading batch job…", async () => {
+    await st.ze._queue;
+    st.ze.configure(job.openHints);
+    await st.ze.openScan(job.sourceFiles);
+    const acquired = structuredClone(job.openGeometry || st.ze.geometry);
+    // From this point native state is the new acquisition, even if a master fails.
+    st.exampleBackground = null; st.scanName = job.sourceFiles[0].name;
+    afterOpen(); st.sourceFile = job.sourceFiles[0]; st.sourceFiles = [...job.sourceFiles]; st.sourceOpenHints = structuredClone(job.openHints);
+    st.geoOpened = acquired; st.pcFile = st.scan.hasPc ? [...acquired.pc] : null;
+    st.ze.clearPhases(); st.phaseFiles = [];
+    try {
+      st.ze.configure(job.settings); st.ze.setGeometry(job.geometry);
+      st.settings = st.ze.settings; fields.show(st.settings); showGeometry();
+      showResolution(); showStage(); showSweeps(); showAngle();
+      for (const file of job.masterFiles) { await st.ze.addPhase(file); st.phaseFiles.push(file); }
+      st.batchEditing = job.status === "queued" && !job.folderName ? job.id : null;
+      selectTab("index");
+    } finally { phasesChanged(); updateEnabled(); }
+  });
+  renderBatch();
+}
+
+async function chooseBatchFolder() {
+  if (st.busy) return;
+  if (!window.showDirectoryPicker) { status("Automatic batch saving requires Edge or Chrome with folder access.", true); return; }
+  try { batch.setDirectory(await window.showDirectoryPicker({ id: "zebsdsolve-batch-output", mode: "readwrite" })); }
+  catch (e) { if (e.name !== "AbortError") status(String(e.message || e), true); }
+}
+
+async function runBatch() {
+  if (st.busy || st.batchRunning) return;
+  selectTab("batch");
+  // Take ownership before any permission or engine await.
+  st.batchRunning = true; app.dataset.batchRunning = "1";
+  for (const b of $("tabs").children) if (b.dataset.tab !== "batch") b.disabled = true;
+  let launchError = null;
+  try {
+    await busy("batch indexing…", async () => {
+      try {
+        if (batch.directory?.requestPermission && await batch.directory.requestPermission({ mode: "readwrite" }) !== "granted") throw new Error("Write access to the output folder was not granted.");
+        invalidateOverview(); ++st.showRun; ++st.masterRun; st.ze.pauseIndexPreparation();
+        await st.ze._queue;
+        if (!st.stop) await batch.run();
+      } catch (e) { launchError = e; throw e; }
+    });
+  } finally {
+    st.batchRunning = false; app.dataset.batchRunning = "0";
+    for (const b of $("tabs").children) b.disabled = false;
+    renderBatch();
+    if (launchError) status(String(launchError.message || launchError), true);
+    else if (batch.error) status(batch.error, true);
+    else if (st.stop) status("Batch stopped");
+    else if (batch.jobs.length) status(`${batch.jobs.filter((job) => job.status === "complete").length} of ${batch.jobs.length} batch jobs complete`);
+  }
+}
+
+function wireBatch() {
+  $("btn-batch-add").addEventListener("click", addBatchJob);
+  $("btn-batch-current").addEventListener("click", addBatchJob);
+  $("btn-batch-folder").addEventListener("click", chooseBatchFolder);
+  $("btn-batch-run").addEventListener("click", runBatch);
+  $("btn-batch-stop").addEventListener("click", () => batch.stop());
+  $("btn-batch-new").addEventListener("click", () => { st.batchEditing = null; renderBatch(); });
+  $("btn-batch-clear").addEventListener("click", async () => {
+    if (st.busy) return;
+    if (batch.jobs.some((job) => job.status === "export-pending") && !window.confirm("Discard unsaved batch results?")) return;
+    try { await batch.clear(); st.batchEditing = null; renderBatch(); } catch (e) { status(e.message, true); }
+  });
+  renderBatch();
+}
+
 
 main();

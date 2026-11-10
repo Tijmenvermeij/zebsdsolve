@@ -125,6 +125,16 @@ export async function exportH5(s) {
   return fileBytes(null, (f) => {
     put(f, "Manufacturer", "EMSphInx"); put(f, "Version", String(s.version));
     provenance(f, s);
+    if (s.maps) {
+      const maps = group(f, "zebsdsolve/Maps");
+      put(maps, "Source", "Native zebsdsolve GUI map pixels; IPF-Z and detector NCC");
+      for (const [key, name] of [["ipf_z", "IPFZ_RGBA"], ["ncc", "NCC_RGBA"]]) {
+        const rgba = s.maps[key];
+        if (!rgba || rgba.length !== n * 4) throw new Error(`Incomplete ${key} map.`);
+        put(maps, name, new Uint8Array(rgba), [s.scan.rows, s.scan.cols, 4]);
+      }
+      put(maps, "NCC", Float64Array.from(s.results.ncc, (v, i) => s.results.phase[i] >= 0 ? v : NaN), [s.scan.rows, s.scan.cols]);
+    }
     const ranks = rest.reduce((r, v) => Math.max(r, v.length + 1), 1);
     for (let rank = 0; rank < ranks; rank++) {
       const g = group(f, `Scan ${rank + 1}/EBSD`), hd = g.create_group("Header"), d = g.create_group("Data"), geo = s.geometry;

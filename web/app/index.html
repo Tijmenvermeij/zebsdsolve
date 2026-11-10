@@ -31,6 +31,7 @@
         <button type="button" role="tab" id="tab-patterns" data-tab="patterns" aria-selected="false"><span class="step">2</span>Patterns</button>
         <button type="button" role="tab" id="tab-geometry" data-tab="geometry" aria-selected="false"><span class="step">3</span>Geometry</button>
         <button type="button" role="tab" id="tab-index" data-tab="index" aria-selected="false"><span class="step">4</span>Index</button>
+        <button type="button" role="tab" id="tab-batch" data-tab="batch" aria-selected="false"><span class="step">5</span>Batch</button>
       </nav>
 
       <div class="panels" id="panels">
@@ -108,6 +109,7 @@
         <section class="panel" data-tab="index" role="tabpanel" aria-labelledby="tab-index" hidden>
           <div class="row">
             <button type="button" class="primary act" id="btn-index"><svg><use href="#i-play"/></svg>Index</button>
+            <button type="button" class="act" id="btn-batch-add">Add to batch</button>
             <button type="button" class="act" id="btn-tune" title="Before a large scan: index a sample of the region, sized by the bandwidth, a few times over, and keep the batch size and workgroup sizes that run fastest on this machine. About ten short trials.">Tune speed</button>
           </div>
           <p class="readout" id="index-readout"></p>
@@ -137,10 +139,29 @@
             <button type="button" id="btn-json" title="The geometry and every setting, as JSON. Dropped on the window (or opened with a scan), it brings them back."><svg><use href="#i-down"/></svg>project .json</button>
           </div>
         </section>
+        <section class="panel" data-tab="batch" role="tabpanel" aria-labelledby="tab-batch" hidden>
+          <div class="row"><button type="button" class="primary act" id="btn-batch-current">Add current scan</button></div>
+          <button type="button" class="act" id="btn-batch-folder">Output folder…</button>
+          <output id="batch-folder"></output>
+          <div class="row"><button type="button" class="primary act" id="btn-batch-run">Run batch</button><button type="button" id="btn-batch-stop" disabled>Stop</button></div>
+          <progress id="batch-progress" max="1" value="0" aria-label="Batch indexing progress" hidden></progress>
+          <p class="readout" id="batch-readout"></p>
+          <p class="readout" id="batch-editing"></p>
+          <button type="button" class="act" id="btn-batch-new" hidden>Finish editing</button>
+          <button type="button" class="act" id="btn-batch-clear">Clear batch</button>
+        </section>
       </div>
     </aside>
 
     <main class="stage" id="stage">
+      <section id="batch-workspace" class="batch-workspace" aria-label="Batch queue" hidden>
+        <div class="batch-heading"><h2>Batch queue</h2><span id="batch-count"></span></div>
+        <p id="batch-empty">No queued scans</p>
+        <div class="batch-table-wrap"><table class="batch-table" id="batch-table" hidden>
+          <thead><tr><th scope="col">Output name</th><th scope="col">Scan</th><th scope="col">Phases</th><th scope="col">BW</th><th scope="col">ROI</th><th scope="col">Status</th><th scope="col">Actions</th></tr></thead>
+          <tbody id="batch-jobs"></tbody>
+        </table></div>
+      </section>
       <section class="pane map-pane" id="map-pane">
         <div class="pane-bar">
           <span class="ttl" title="Click or drag to select a pattern; the arrow keys step it (with shift: by ten). Scroll zooms about the pointer, a drag moves a zoomed map, shift-drag sets the region of interest.">map</span>
