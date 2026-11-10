@@ -2,7 +2,9 @@
 
 EBSD pattern-centre fitting and indexing on the GPU, in the browser or from Python.
 
-**[Open the web app](https://zacharyvarley.github.io/zebsdsolve/)**: it runs on your GPU inside the page (Chrome or Edge 137+). Scans are read in place, in pieces, so a 100 GB file is neither uploaded nor loaded into memory. Click **Example** for a small nickel scan, or **Make toy scan** to simulate one from a master pattern.
+**[Open the web app — this fork](https://tijmenvermeij.github.io/zebsdsolve/)**: it runs on your GPU inside the page (Chrome or Edge 137+). Scans are read in place, in pieces, so a 100 GB file is neither uploaded nor loaded into memory. Click **Example** for a small nickel scan, or **Make toy scan** to simulate one from a master pattern.
+
+The [original upstream web app by Zachary Varley](https://zacharyvarley.github.io/zebsdsolve/) is also available. The link above runs this fork; the upstream link runs the original project.
 
 ## What it does
 
