@@ -27,9 +27,20 @@ function snapshot(s) {
   const n = s.scan.rows * s.scan.cols;
   if (!Number.isSafeInteger(n) || n <= 0 || s.results.phase.length !== n || s.results.euler.length !== n * 3 || s.results.quaternions.length !== n * 4)
     throw new Error("Incomplete HDF5 export snapshot.");
-  if (!s.phases.length || s.phases.length > 254) throw new Error("HDF5 export supports 1–254 master phases.");
+  if (!s.phases.length || s.phases.length > 255) throw new Error("HDF5 export supports 1–255 master phases.");
   if (s.phases.some((p) => !Number.isInteger(p.laue) || p.laue < 1 || p.laue > 11 || !Array.isArray(p.lattice) || p.lattice.length !== 6 || !p.lattice.every((v) => Number.isFinite(v) && v > 0))) throw new Error("HDF5 export requires complete phase lattice and Laue metadata.");
   return n;
+}
+function currentSnapshot(s) {
+  const n = snapshot(s), results = structuredClone(s.results), candidates = structuredClone(s.candidates);
+  const first = selected(s, n), indexed = first.map((v) => valid(v, s.phases.length));
+  const clear = (values, i, width, fill) => { for (let k = 0; k < width; k++) values[i * width + k] = fill; };
+  for (let i = 0; i < n; i++) if (!indexed[i]) for (const key of Object.keys(results)) clear(results[key], i, key === "quaternions" ? 4 : key === "euler" ? 3 : 1, key === "phase" || key === "sweep" ? -1 : 0);
+  for (let phase = 0; phase < candidates.phase_count; phase++) for (let i = 0; i < n; i++) {
+    const j = phase * n + i, v = { phase, euler: candidates.euler.slice(3*j, 3*j+3), q: candidates.quaternions.slice(4*j, 4*j+4), ncc: candidates.ncc[j], nmi: candidates.nmi[j], z: candidates.z[j], sweep: candidates.sweep[j] };
+    if (!(v.sweep >= 0) || !valid(v, s.phases.length)) for (const key of Object.keys(candidates)) if (key !== "phase_count") clear(candidates[key], j, key === "quaternions" ? 4 : key === "euler" ? 3 : 1, key === "sweep" ? -1 : 0);
+  }
+  return { ...s, results, candidates };
 }
 function group(f, path) {
   let g = f;
@@ -49,7 +60,7 @@ function provenance(f, s, frame) {
   const g = group(f, "zebsdsolve");
   if (g.get("Producer")) throw new Error("Source already contains a zebsdsolve export; use the original acquisition file.");
   put(g, "Producer", `zebsdsolve ${s.version}`);
-  put(g, "CandidateScope", "best stored per phase; no within-phase peaks");
+  put(g, "CandidateScope", "Best computed candidate per phase; independent of acceptance; no within-phase secondary peaks");
   put(g, "Frame", frame ? "Oxford CS1; q_out = conjugate(crystal_to_master) * q_engine * conjugate(engine_to_cs1)" : "ANG setting 2 compatible");
   put(g, "SettingsJSON", JSON.stringify(s.settings));
   put(g, "GeometryJSON", JSON.stringify(s.geometry));
@@ -91,7 +102,7 @@ function selected(s, n) {
   const r = s.results;
   return Array.from({ length: n }, (_, i) => ({ phase: r.phase[i], euler: r.euler.slice(i * 3, i * 3 + 3), q: r.quaternions.slice(i * 4, i * 4 + 4), ncc: r.ncc[i], nmi: r.nmi[i], z: r.z[i], sweep: r.sweep[i] }));
 }
-function valid(v, p) { return Number.isInteger(v.phase) && v.phase >= 0 && v.phase < p && v.euler.every(Number.isFinite) && v.q.every(Number.isFinite) && v.q.some((x) => x !== 0) && Number.isFinite(v.ncc) && Number.isFinite(v.nmi) && Number.isFinite(v.z); }
+function valid(v, p) { return Number.isInteger(v.phase) && v.phase >= 0 && v.phase < p && v.euler.every(Number.isFinite) && v.q.every(Number.isFinite) && v.q.some((x) => x !== 0); }
 function alternatives(s, n) {
   const c = s.candidates, p = s.phases.length;
   return Array.from({ length: n }, (_, i) => {
@@ -103,11 +114,13 @@ function alternatives(s, n) {
       if (v.sweep >= 0 && valid(v, p)) choices.push(v);
     }
     const metric = s.settings.phase_by === "ncc" ? "ncc" : "nmi";
-    choices.sort((a, b) => b[metric] - a[metric] || a.phase - b.phase);
+    const score = (v) => Number.isFinite(v[metric]) ? v[metric] : -Infinity;
+    choices.sort((a, b) => score(b) - score(a) || a.phase - b.phase);
     return choices;
   });
 }
 export async function exportH5(s) {
+  s = currentSnapshot(s);
   const n = snapshot(s), first = selected(s, n), rest = alternatives(s, n);
   return fileBytes(null, (f) => {
     put(f, "Manufacturer", "EMSphInx"); put(f, "Version", String(s.version));
@@ -132,7 +145,7 @@ export async function exportH5(s) {
       const good = values.map((v) => v && valid(v, s.phases.length));
       put(d, "Phase", Uint8Array.from(values, (v, i) => good[i] ? v.phase : 255));
       for (const [name, j] of [["Phi1", 0], ["Phi", 1], ["Phi2", 2]]) put(d, name, Float64Array.from(values, (v, i) => good[i] ? v.euler[j] : 0));
-      for (const [name, key] of [["Metric", "ncc"], ["IQ", "nmi"], ["CI", "ncc"], ["NMI", "nmi"], ["Z", "z"], ["Sweep", "sweep"]]) put(d, name, Float64Array.from(values, (v, i) => good[i] ? v[key] : key === "sweep" ? -1 : 0));
+      for (const [name, key] of [["Metric", "ncc"], ["IQ", "nmi"], ["CI", "ncc"], ["NMI", "nmi"], ["Z", "z"], ["Sweep", "sweep"]]) put(d, name, Float64Array.from(values, (v, i) => good[i] ? v[key] ?? NaN : key === "sweep" ? -1 : 0));
       put(d, "PixelID", Uint32Array.from({ length: n }, (_, i) => i));
       put(d, "X Position", Float64Array.from({ length: n }, (_, i) => i % s.scan.cols * geo.step_x_um));
       put(d, "Y Position", Float64Array.from({ length: n }, (_, i) => Math.floor(i / s.scan.cols) * geo.step_y_um));
@@ -213,6 +226,7 @@ export async function exportOxford(s, source, frameValue) {
 // The browser worker passes a WORKERFS path; exposed separately for real-runtime
 // Node checks without substituting a mock HDF5 implementation.
 export async function exportOxfordFromPath(s, sourcePath, frameValue) {
+  s = currentSnapshot(s);
   const frame = oxfordFrame(frameValue), n = snapshot(s), h = await hdf5();
   const source = new h.File(sourcePath, "r");
   try {
@@ -253,13 +267,8 @@ function writeOxford(f, h, s, frame, n) {
     const phaseValues = phase.value, eulerValues = euler.value;
     const maxID = phaseValues instanceof Uint8Array ? 255 : phaseValues instanceof Int8Array ? 127 : phaseValues instanceof Uint16Array ? 65535 : phaseValues instanceof Int16Array ? 32767 : phaseValues instanceof Int32Array ? 2147483647 : 4294967295;
     if (map.some((id) => id > maxID)) throw new Error("New Oxford phase IDs exceed the source phase dataset type; use Python export.");
-    const selectedValues = selected(s, n), indexed = new Uint8Array(n), replaced = new Uint8Array(n);
-    for (let i = 0; i < n; i++) {
-      if (valid(selectedValues[i], s.phases.length)) indexed[i] = replaced[i] = 1;
-      else if (s.results.sweep[i] >= 0 || Array.from({ length: s.candidates?.phase_count || 0 }, (_, p) => s.candidates.sweep[p * n + i]).some((v) => v >= 0)) replaced[i] = 1;
-    }
-    const z = provenance(f, s, frame), original = z.create_group("OriginalIndexing");
-    put(original, "SourcePath", path);
+    const selectedValues = selected(s, n), indexed = Uint8Array.from(selectedValues, (v) => valid(v, s.phases.length) ? 1 : 0), replaced = new Uint8Array(n).fill(1);
+    const z = provenance(f, s, frame);
     for (const [name, field, count] of [["Detector Orientation Euler", "effective_detector_euler_radians", 3], ["Tilt Angle", "effective_tilt_radians", 1]]) {
       const effective = s.calibration?.[field];
       if (effective === undefined) continue;
@@ -269,17 +278,13 @@ function writeOxford(f, h, s, frame, n) {
       copyDataset(group(f, "zebsdsolve/OriginalCalibration"), name, d);
       d.write_slice(d.shape.map((size) => [0, size]), new d.value.constructor(values));
     }
-    for (const name of ["Euler", "Phase", ...PC_FIELDS, ...INDEX_METRICS]) {
-      const d = data.get(name); if (!(d instanceof h.Dataset)) continue;
-      copyDataset(original, name, d);
-    }
     for (const [id, p] of pending) {
       const g = pg.create_group(String(id));
       put(g, "Phase Name", [p.name]); put(g, "Reference", ["zebsdsolve master pattern"]); put(g, "Space Group", new Uint32Array([p.space_group])); put(g, "Laue Group", new Uint32Array([p.laue]));
       put(g, "Lattice Dimensions", new Float64Array(p.lattice.slice(0, 3)), [1, 3]).create_attribute("Unit", "angstrom");
       put(g, "Lattice Angles", Float64Array.from(p.lattice.slice(3), (v) => v * Math.PI / 180), [1, 3]).create_attribute("Unit", "rad");
     }
-    for (let i = 0; i < n; i++) if (replaced[i]) {
+    for (let i = 0; i < n; i++) {
       phaseValues[i] = indexed[i] ? map[s.results.phase[i]] : 0;
       for (let j = 0; j < 3; j++) eulerValues[3 * i + j] = indexed[i] ? s.results.euler[3 * i + j] : 0;
     }
@@ -288,9 +293,9 @@ function writeOxford(f, h, s, frame, n) {
       const name = PC_FIELDS[j], d = data.get(name);
       if (d && (d.shape?.join() !== `${n}` || !/^Float(32|64)Array$/.test(d.value?.constructor?.name))) throw new Error(`Unsupported Oxford ${name} layout; use Python export.`);
       const values = d ? d.value : new Float64Array(n).fill(NaN);
-      for (let i = 0; i < n; i++) if (replaced[i]) {
+      for (let i = 0; i < n; i++) {
         const v = s.pattern_centres[3 * i + j], ratio = s.scan.pat_h / s.scan.pat_w;
-        values[i] = j === 0 ? v : (j === 1 ? 1 - v : v) * ratio;
+        values[i] = indexed[i] ? (j === 0 ? v : (j === 1 ? 1 - v : v) * ratio) : NaN;
       }
       if (d) d.write_slice([[0, n]], values);
       else put(data, name, values).create_attribute("Unit", "fraction");
