@@ -335,7 +335,7 @@ function sortScanFiles(files) {
 }
 
 async function openScan(files) {
-  if (!gpuAvailable()) return;
+  if (!gpuAvailable() || st.busy) return;
   files = sortScanFiles(files);
   if (!files.length) return;
   invalidateOverview();
@@ -393,7 +393,8 @@ function afterOpen() {
   setMapKind("overview");
   drawVotes();
   drawZ();
-  selectCell(Math.floor(s.rows / 2) * s.cols + Math.floor(s.cols / 2));
+  st.cell = Math.floor(s.rows / 2) * s.cols + Math.floor(s.cols / 2);
+  drawMapOverlay();
   loadStoredOverview();
   updateEnabled();
 }
@@ -437,8 +438,14 @@ async function loadStoredOverview() {
     if (run === st.overviewRun && ze === st.ze) log(String(e.message || e), true);
   } finally {
     if (run === st.overviewRun && ze === st.ze) {
-      st.overviewLoading = false;
-      updateOverviewControls();
+      // Paint the stored map before preview or automatic indexing can enqueue
+      // pattern preparation. A scan switch or GPU loss may invalidate this yield.
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      if (run === st.overviewRun && ze === st.ze) {
+        st.overviewLoading = false;
+        updateOverviewControls();
+        if (!st.busy) showCell();
+      }
     }
   }
 }
@@ -883,7 +890,7 @@ function showNlpar(a) {
 }
 
 async function showCell() {
-  if (!st.scan || st.cell < 0 || st.gpuLost) return;
+  if (!st.scan || st.cell < 0 || st.gpuLost || st.overviewLoading) return;
   const run = ++st.showRun;
   const cell = st.cell;
   const { cols } = st.scan;
@@ -1181,7 +1188,7 @@ function isMaster(f) {
  *  side files, master patterns. The project's settings go in before the scan opens (they may
  *  say how to read it) and its geometry after (over what the scan's file gives). */
 async function takeFiles(files) {
-  if (!gpuAvailable()) return;
+  if (!gpuAvailable() || st.busy) return;
   const projects = files.filter((f) => /\.json$/i.test(f.name));
   const masters = files.filter((f) => !projects.includes(f) && isMaster(f));
   const scans = files.filter((f) => !projects.includes(f) && !masters.includes(f));
@@ -1216,7 +1223,7 @@ async function takeFiles(files) {
 
 /** A toy scan from the phases loaded: the engine makes it and hands back its answer. */
 async function makeToy() {
-  if (!gpuAvailable()) return;
+  if (!gpuAvailable() || st.busy) return;
   invalidateOverview();
   ++st.showRun;
   await busy("making a toy scan…", async () => {
@@ -1261,7 +1268,7 @@ function againstTrueGeometry() {
 }
 
 async function loadExample() {
-  if (!gpuAvailable()) return;
+  if (!gpuAvailable() || st.busy) return;
   invalidateOverview();
   ++st.showRun;
   await busy("loading the example…", async () => {
@@ -1284,6 +1291,27 @@ async function loadExample() {
 
 function projectJson() {
   return JSON.stringify({ zebsdsolve: st.ze.version, scan: st.scanName, geometry_convention: /Oxford h5oina/i.test(st.scan?.format || "") ? "oxford-calibrated-v1" : "generic-v1", geometry: st.ze.geometry, settings: st.ze.settings, phases: st.ze.phases.map((p) => p.name) }, null, 2);
+}
+
+/** Keep independent browser directory memories for scans and master patterns. */
+async function pickFiles(kind) {
+  const input = $(kind === "scan" ? "file-scan" : "file-phase");
+  if (typeof window.showOpenFilePicker !== "function") { input.click(); return; }
+  try {
+    const handles = await window.showOpenFilePicker({
+      id: kind === "scan" ? "zebsdsolve-scan" : "zebsdsolve-master",
+      multiple: true,
+      ...(kind === "phase" ? { types: [{ description: "Master patterns", accept: { "application/octet-stream": [".npz", ".h5", ".hdf5"] } }] } : {}),
+    });
+    const files = await Promise.all(handles.map((handle) => handle.getFile()));
+    if (files.length) await (kind === "scan" ? takeFiles(files) : addPhases(files));
+  } catch (e) {
+    if (e.name === "AbortError") return;
+    // Retain the input picker where the browser exposes but disallows the API.
+    if (e.name === "SecurityError" || e.name === "NotAllowedError") { input.click(); return; }
+    status(String(e.message || e), true);
+    log(String(e.message || e), true);
+  }
 }
 
 // ── start ──
@@ -1388,12 +1416,12 @@ function updateWiring() {
   });
   selectTab("data");
   wireSplits();
-  $("btn-open").addEventListener("click", () => $("file-scan").click());
+  $("btn-open").addEventListener("click", () => pickFiles("scan"));
   $("file-scan").addEventListener("change", (e) => { const f = [...e.target.files]; e.target.value = ""; takeFiles(f); });
   $("btn-example").addEventListener("click", loadExample);
   $("btn-toy").addEventListener("click", makeToy);
   $("bin-choices").addEventListener("change", (e) => applySetting("binning", +e.target.value));
-  $("btn-phase").addEventListener("click", () => $("file-phase").click());
+  $("btn-phase").addEventListener("click", () => pickFiles("phase"));
   $("file-phase").addEventListener("change", (e) => { const f = [...e.target.files]; e.target.value = ""; addPhases(f); });
   $("btn-fit-pc").addEventListener("click", fitPc);
   $("btn-fit-pose").addEventListener("click", fitPose);
