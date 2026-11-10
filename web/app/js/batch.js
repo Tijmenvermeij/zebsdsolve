@@ -31,6 +31,7 @@ function snapshot(spec) {
   const masterFiles = Object.freeze(Array.from(spec.masterFiles || []));
   if (!sourceFiles.length || !masterFiles.length) throw new Error("A batch job needs scan files and master patterns.");
   if (!spec.settings || !spec.geometry || !spec.scanInfo) throw new Error("A batch job needs settings, geometry and scan metadata.");
+  if (/Oxford h5oina/i.test(spec.scanInfo.format) && spec.geometry.planeKind) throw new Error("Oxford H5OINA export of a fitted source plane is not validated. Use acquisition geometry for this batch; EMSphInx H5 can be exported separately.");
   const openHints = Object.fromEntries(HINTS.map((key) => [key, spec.openHints?.[key] ?? spec.settings[key] ?? 0]));
   return {
     sourceFiles, masterFiles,

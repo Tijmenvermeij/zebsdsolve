@@ -152,17 +152,48 @@ test "Oxford calibrated detector matrices agree with independent native MTEX cas
     // Generated with pyMTEX 1.0.0 by native byEuler/byAxisAngle compositions,
     // independently of this implementation. Rows/columns are detector raster axes.
     const negative: rot.Mat3 = .{
-        0.3446288460628502, -0.0052724508239519, -0.9387242192058842,
+        0.3446288460628502,  -0.0052724508239519, -0.9387242192058842,
         -0.0072285461023605, -0.9999694849061044, 0.0029626639813385,
-        -0.9387111944483426, 0.0057645918267715, -0.3446564418351069,
+        -0.9387111944483426, 0.0057645918267715,  -0.3446564418351069,
     };
     const positive: rot.Mat3 = .{
-        -0.9387111944483427, 0.0057645918267715, -0.3446564418351067,
+        -0.9387111944483427, 0.0057645918267715,  -0.3446564418351067,
         -0.0072285461023606, -0.9999694849061044, 0.0029626639813387,
-        -0.3446288460628500, 0.0052724508239522, 0.9387242192058836,
+        -0.3446288460628500, 0.0052724508239522,  0.9387242192058836,
     };
     for ([_]f64{ -20, 70 }, [_]rot.Mat3{ negative, positive }) |tilt, expected| {
         const g: Geometry = .{ .sample_tilt_deg = tilt };
         for (c.rotation(&g), expected) |a, b| try std.testing.expectApproxEqAbs(a, b, 1e-12);
     }
+}
+
+test "Oxford per-cell positions and plane frame use the calibrated baseline" {
+    const c: Calibration = .{ .metadata = .{ .detector_euler = .{ 0.00722032, 1.5679878, 0.00296268 }, .specimen_euler = .{ 0, 0, 0 }, .tilt_axis = 0, .scanning_rotation = 0, .original_tilt = -std.math.pi / 9.0 } };
+    var g: Geometry = .{ .pc = .{ 0.42, 0.21, 0.5 }, .sample_tilt_deg = -20, .rot = .{ 0.02, -0.03, 0.04 }, .px_um = 70, .step_x_um = 2, .step_y_um = 3 };
+    const R = c.rotation(&g);
+    const t = g.positionForRotation(R, 4, 6, 3, 5, -1, -1, 2.5, 24.4, 32.4);
+    const want = rot.sub(c.translation(&g, 24.4, 32.4), g.scanOffset(4, 6, 3, 5, -1, -1, 2.5));
+    for (t, want) |a, b| try std.testing.expectApproxEqAbs(a, b, 1e-12);
+    // Construct an affine plane from calibrated step-model PCs. Fitting and decoding it
+    // must recover the same residual relative to Oxford's full nominal attitude.
+    const plane = @import("plane.zig");
+    const rows = 30;
+    const cols = 40;
+    const fr = plane.Frame.of(rows, cols, 1.25);
+    var points: [30]plane.Point = undefined;
+    for (0..30) |k| {
+        const row: f64 = @floatFromInt((k * 7) % rows);
+        const col: f64 = @floatFromInt((k * 11) % cols);
+        const p = g.positionForRotation(R, row, col, fr.r0, fr.c0, -1, -1, 1, 60, 75);
+        const pc = Geometry.pcOf(R, p, 60, 75);
+        points[k] = .{ .col = col, .row = row, .y = .{ pc[0] * fr.aspect, pc[1], pc[2] } };
+    }
+    g.plane = plane.fit(.affine, &points, fr).?;
+    g.plane_kind = 1;
+    const pc = plane.at(g.plane, 4, 6);
+    const got = Geometry.pcOf(R, g.positionForRotation(R, 4, 6, fr.r0, fr.c0, -1, -1, 2.5, 24.4, 30.5), 24.4, 30.5);
+    for (pc, got) |a, b| try std.testing.expectApproxEqAbs(a, b, 1e-12);
+    const said = plane.saidWithNominal(g.plane, &g, c.nominal(&g), rows, cols, 1.25, 60, -1, -1);
+    for (g.rot, said.rot) |a, b| try std.testing.expectApproxEqAbs(a, b, 1e-9);
+    for (said.step) |step| try std.testing.expectApproxEqAbs(@as(f64, 1), step, 1e-9);
 }

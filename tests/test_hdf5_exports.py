@@ -422,6 +422,139 @@ class Exports(unittest.TestCase):
         self.s.index()
         self.assertEqual(self.s.export_snapshot()['geometry']['pc'],moved)
 
+    def test_plane_snapshot_uses_frozen_calibrated_pc_and_resets_on_source_change(self):
+        from zebsdsolve._native import Geometry
+        import ctypes
+        self.assertEqual((ctypes.sizeof(Geometry), Geometry.plane_kind.offset, Geometry.plane.offset), (192, 88, 96))
+        s = self.oxford_solver()
+        # Unrelated field edits/replay must not invent an Oxford detector pixel size.
+        s.set_geometry(rot=[.002, -.003, .001])
+        self.assertEqual(s.geometry['px_um'], 0)
+        P = np.array([[.001,.002,.4],[.003,.004,.2],[.005,.006,.5],[0,0,1.]])
+        s.set_geometry(plane_kind='affine', plane=P)
+        self.assertTrue(np.array_equal(s.geometry['plane'], P))
+        centre_pc = (P @ [1., .5, 1.])[:3].tolist()
+        self.assertEqual(s.geometry['pc'], centre_pc)
+        s.index()
+        frozen = s.export_snapshot()
+        self.assertEqual(frozen['geometry']['pc'], centre_pc)
+        target = self.out/'frozen-plane.h5'
+        s.export(target)
+        with h5py.File(target, 'r') as f:
+            self.assertTrue(np.array_equal(f['zebsdsolve/PatternCentres'][()], np.asarray(frozen['pattern_centres']).reshape(6,3)))
+            self.assertIn('Bruker', f['zebsdsolve/PatternCentres'].attrs['Convention'])
+        expected = np.array([P @ [c,r,1.] for r in range(2) for c in range(3)])[:,:3]
+        self.assertTrue(np.allclose(np.asarray(frozen['pattern_centres']).reshape(-1,3), expected, atol=1e-12))
+        with self.assertRaisesRegex(Error, 'OxfordPlaneExportNotValidated'):
+            s.export_oxford_snapshot()
+        s.set_geometry(plane_kind='none', pc=[.2,.3,.4])
+        self.assertEqual(s.export_snapshot(), frozen)
+        s.set_geometry(plane_kind='affine', plane=P)
+        s.set_patterns(np.zeros((2,3,32,40), dtype=np.float32))
+        self.assertEqual(s.geometry['plane_kind'], 'none')
+        s.set_geometry(plane_kind='affine', plane=P)
+        s.open(self.baseline)
+        self.assertEqual(s.geometry['plane_kind'], 'none')
+        self.assertEqual(s.geometry['px_um'], 0)
+
+    def test_native_pattern_centres_are_stored_and_validated(self):
+        target = self.out/'ordinary-native-pcs.h5'
+        write_emsphinx(target, self.snapshot)
+        with h5py.File(target, 'r') as f:
+            self.assertTrue(np.array_equal(f['zebsdsolve/PatternCentres'][()], np.asarray(self.snapshot['pattern_centres']).reshape(6,3)))
+        for invalid in [[0,0,0], [float('nan')]*18]:
+            bad = deepcopy(self.snapshot)
+            bad['pattern_centres'] = invalid
+            with self.assertRaisesRegex(ValueError, 'pattern_centres'):
+                write_emsphinx(self.out/'invalid-native-pcs.h5', bad)
+            self.assertFalse((self.out/'invalid-native-pcs.h5').exists())
+
+    def test_high_level_plane_kind_routes_to_fit_unless_matrix_is_given(self):
+        from zebsdsolve.api import _open
+        class Recorder:
+            def __init__(self): self.settings = {}; self.geometry = {}
+            def configure(self, **kwargs): self.settings.update(kwargs)
+            def set_patterns(self, scan): pass
+            def set_geometry(self, **kwargs): self.geometry.update(kwargs)
+        setting = Recorder()
+        _open(setting, np.zeros((1,1,4,4)), [], {'plane_kind': 'projective'})
+        self.assertEqual(setting.settings, {'plane_kind': 'projective'})
+        self.assertEqual(setting.geometry, {})
+        P = np.array([[.001,.002,.4],[.003,.004,.2],[.005,.006,.5],[0,0,1.]])
+        geometry = Recorder()
+        _open(geometry, np.zeros((1,1,4,4)), [], {'plane_kind': 'projective', 'plane': P})
+        self.assertEqual(geometry.settings, {})
+        self.assertEqual(geometry.geometry['plane_kind'], 'projective')
+        self.assertTrue(np.array_equal(geometry.geometry['plane'], P))
+
+    def test_synthesis_preserves_effective_geometry_and_calibration(self):
+        P = np.array([[.001,.002,.4],[.003,.004,.2],[.005,.006,.5],[0,0,1.]])
+        for oxford, plane in [(False, False), (False, True), (True, False), (True, True)]:
+            with self.subTest(oxford=oxford, plane=plane), Solver() as s:
+                s.configure(static_background='none', dynamic_background='none', master_smooth=0,
+                            toy_rows=2, toy_cols=3, toy_height=32, toy_width=40,
+                            toy_counts=0, toy_contrast=1, toy_background_sigma=0,
+                            toy_blank=0, toy_spread_deg=0, bandwidth=16, refine_iters=1)
+                if oxford:
+                    s.open(self.baseline)
+                s.add_phase(self.master_paths[0])
+                s.set_geometry(rot=[.002,-.003,.001], plane_kind='affine' if plane else 'none', plane=P)
+                before = s.geometry
+                self.assertEqual(before['px_um'], 0)
+                self.assertEqual(s.has_acquisition_calibration, oxford)
+                truth = s.synthesize()
+                self.assertEqual(s.has_acquisition_calibration, oxford)
+                expected = deepcopy(before)
+                if not oxford:
+                    expected['px_um'] = 1000*s.settings['detector_width_mm']/40
+                if plane:
+                    expected['pc'] = (P @ [1., .5, 1.])[:3].tolist()
+                self.assertEqual(truth['geometry'], expected)
+                self.assertEqual(s.geometry, expected)
+                qs = truth['quaternions'].reshape(-1,4)
+                sim = s.simulate(qs, cells=np.arange(6), full=True)
+                raw = np.array([s.pattern(c, processed=False, full=True) for c in range(6)])
+                expected_raw = (sim-sim.min())/(np.mean(sim, dtype=np.float64)-sim.min())
+                self.assertTrue(np.allclose(raw, expected_raw, rtol=2e-6, atol=2e-6))
+                # Both internal pattern replacements must retain the calibration and plane,
+                # so replay with the same seed reproduces the same quaternions and pixels.
+                again = s.synthesize()
+                self.assertEqual(s.has_acquisition_calibration, oxford)
+                self.assertTrue(np.array_equal(again['quaternions'], truth['quaternions']))
+                self.assertTrue(np.array_equal(raw, [s.pattern(c, processed=False, full=True) for c in range(6)]))
+                s.index()
+                snapshot = s.export_snapshot()
+                wire_geometry = dict(expected, plane_kind=int(plane), plane=P.ravel().tolist(), _pad=0)
+                self.assertEqual(snapshot['geometry'], wire_geometry)
+                self.assertEqual(snapshot['calibration']['kind'], 'oxford' if oxford else 'legacy')
+                from zebsdsolve._native import PlaneResult
+                report = s._plane_result(PlaneResult())
+                self.assertEqual('sample_tilt_deg' in report['said'], not oxford)
+                if oxford:
+                    self.assertEqual(snapshot['calibration']['status'], 'supported')
+
+    def test_native_simulation_and_npz_reload_preserve_crystal_convention(self):
+        with Solver() as s:
+            s.configure(sim_halfw=8, sim_rank=2, sim_bin_kev=100,
+                        static_background='none', dynamic_background='none',
+                        master_smooth=0, bandwidth=16, refine_iters=1)
+            s.set_crystal(ROOT/'web/app/cif/Ni.cif')
+            result = s.simulate_master()
+            self.assertEqual(result['failed'], 0)
+            s.add_simulated_phase('native Ni')
+            direct = s.master(0)
+            path = self.out/'native-ni.npz'
+            s.save_simulation(path)
+            s.add_phase(path)
+            self.assertTrue(np.allclose(direct, s.master(1), atol=1e-6))
+            s.set_patterns(np.arange(32*40, dtype=np.float32).reshape(1,1,32,40))
+            s.index()
+            phases = s.export_snapshot()['phases']
+            for p in phases:
+                self.assertEqual(p['master_source'], 'zebsdsolve')
+                self.assertEqual(p['master_crystal_convention'], 'X||a,Z||c*')
+            self.assertEqual(phases[1]['master_source_format_version'], 3)
+
     def test_mask_auto_switch_and_override(self):
         edax=self.out/'edax.h5'
         with h5py.File(edax,'w') as f:

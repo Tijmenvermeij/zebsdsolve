@@ -59,6 +59,12 @@ def _provenance(f, s, **extra):
         **{key: s[key] for key in ('oxford_frame', 'calibration') if key in s},
     }))
     n = s['scan']['rows']*s['scan']['cols']
+    if 'pattern_centres' in s:
+        pcs = np.asarray(s['pattern_centres'], dtype=np.float64)
+        if pcs.size != n*3 or not np.isfinite(pcs).all():
+            raise ValueError('Native pattern_centres must contain three finite values per map cell')
+        centres = g.create_dataset('PatternCentres', data=pcs.reshape(n, 3))
+        centres.attrs['Convention'] = 'Bruker: x from left / width; y from top / height; z / height'
     selected = g.create_group('Selected')
     for key, data in s['results'].items():
         width = 4 if key == 'quaternions' else 3 if key == 'euler' else 1

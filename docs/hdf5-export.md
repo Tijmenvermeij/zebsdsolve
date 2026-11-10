@@ -166,3 +166,15 @@ The ebsdsim v3 convention was verified against pinned revision
 and [NPZ writer](https://github.com/ZacharyVarley/ebsdsim/blob/52afdeba84792b2a962f39d582aa0cea6182a341/ebsdsim/io/save.py).
 CIF setting transforms recorded as P/p have already been accounted for upstream;
 they are not applied again to the stored directions or exported orientations.
+
+
+## Upstream 0.2 source-plane integration
+
+Ordinary Oxford acquisition geometry retains its calibrated detector basis and
+unknown detector pixel size as zero. Saved settings and batch replay preserve
+the complete source-plane geometry, including all 12 coefficients, for supported
+non-Oxford exports. An Oxford acquisition with an active fitted source plane is
+explicitly refused by H5OINA export until its per-cell Oxford calibration writer
+and native MTEX orientation round trip are validated. EMSphInx-style H5 remains
+available. No extra 90-degree rotation or fitted alignment is introduced by the
+merge; the existing native export conversion remains responsible for frames.

@@ -155,7 +155,7 @@ try {
     // suite; pause it here to isolate unintended pattern/contrast traffic.
     ze.pauseIndexPreparation();await ze._queue;
     const before = ze.stats();await new Promise(r=>setTimeout(r,250));const idle=ze.stats();
-    return {calls:previewCalls,initialBytes:before.fileBytes,idleBytes:idle.fileBytes,live:document.getElementById('pat-live').checked,stage:document.querySelector('#pat-stage [aria-pressed=true]').dataset.stage};
+    return {calls:previewCalls,initialBytes:before.fileBytes,idleBytes:idle.fileBytes,live:document.getElementById('pat-live').checked,stage:document.getElementById('pat-stage').value};
   `);
   console.error("preview: P6 stored quality loaded",JSON.stringify(first));
   assert.equal(first.calls.contrast,0);assert.equal(first.idleBytes,0);

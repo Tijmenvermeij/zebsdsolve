@@ -19,7 +19,9 @@
 //! centre stays where it is on the detector).
 //!
 //! All of this is the engine's state rather than an option: the scan file fills what it knows,
-//! the caller may set any of it, and the fits (pcfit.zig, posefit.zig) refine pc and rot.
+//! the caller may set any of it, the vote (pcfit.zig) refines pc, and the plane fit
+//! (planefit.zig) replaces the scan's steps by the plane of source points (and, following it,
+//! sets rot).
 const std = @import("std");
 const rot = @import("rot.zig");
 
@@ -39,6 +41,21 @@ pub const Geometry = extern struct {
     px_um: f64 = 0,
     step_x_um: f64 = 1,
     step_y_um: f64 = 1,
+    /// Where the beam stood for each map cell, when a plane of source points has been fitted
+    /// (plane.zig; plane.Kind: 0 none, 1 affine, 2 projective). The scan's steps and the
+    /// pixel size then say nothing of it: the plane does, and `pc` is the plane at the map's
+    /// middle. With none, the beam's positions are the scan's steps (scanOffset).
+    plane_kind: u32 = 0,
+    _pad: u32 = 0,
+    /// P, 4 × 3 row-major: P · (column, row, 1) = w · (PCx, PCy, PCz, 1) (Winkelmann et al.
+    /// 2020; kikuchipy's fit_pc)
+    plane: [12]f64 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 },
+
+    /// Keep the reference PC consistent with the active plane at the map's centre.
+    pub fn adoptPlaneReference(self: *Geometry, rows: u32, cols: u32) void {
+        if (self.plane_kind == 0 or rows == 0 or cols == 0) return;
+        self.pc = @import("plane.zig").at(self.plane, 0.5 * @as(f64, @floatFromInt(rows - 1)), 0.5 * @as(f64, @floatFromInt(cols - 1)));
+    }
 
     /// The nominal attitude R0: detector tilted by `detector_tilt` facing a sample tilted by
     /// `sample_tilt` (the Bruker construction, as kikuchipy and EMsoft use it).
@@ -55,7 +72,26 @@ pub const Geometry = extern struct {
 
     /// t in pixels of a pattern of rows × cols pixels (the stored size over the reduction).
     pub fn translation(self: *const Geometry, rows: f64, cols: f64) rot.Vec3 {
-        return rot.matVec(self.rotation(), .{ 0.5 - self.pc[1] * rows, 0.5 - self.pc[0] * cols, self.pc[2] * rows });
+        return self.translationFor(self.pc, rows, cols);
+    }
+
+    /// The detector's position as seen from a source whose place, in pattern-centre
+    /// coordinates, is `pc`.
+    pub fn translationFor(self: *const Geometry, pc: [3]f64, rows: f64, cols: f64) rot.Vec3 {
+        return rot.matVec(self.rotation(), .{ 0.5 - pc[1] * rows, 0.5 - pc[0] * cols, pc[2] * rows });
+    }
+
+    /// The detector's position as map cell (row, col) sees it: by the plane of source points
+    /// when there is one, else the reference cell's less the beam's travel by the scan's steps.
+    pub fn positionFor(self: *const Geometry, row: f64, col: f64, ref_row: f64, ref_col: f64, x_sign: i32, y_sign: i32, bin: f64, rows: f64, cols: f64) rot.Vec3 {
+        return self.positionForRotation(self.rotation(), row, col, ref_row, ref_col, x_sign, y_sign, bin, rows, cols);
+    }
+
+    /// Per-cell position using the caller's effective calibrated detector rotation.
+    pub fn positionForRotation(self: *const Geometry, R: rot.Mat3, row: f64, col: f64, ref_row: f64, ref_col: f64, x_sign: i32, y_sign: i32, bin: f64, rows: f64, cols: f64) rot.Vec3 {
+        const pc = if (self.plane_kind != 0) @import("plane.zig").at(self.plane, row, col) else self.pc;
+        const t = rot.matVec(R, .{ 0.5 - pc[1] * rows, 0.5 - pc[0] * cols, pc[2] * rows });
+        return if (self.plane_kind != 0) t else rot.sub(t, self.scanOffset(row, col, ref_row, ref_col, x_sign, y_sign, bin));
     }
 
     /// The pattern centre a pose (R, t in pixels) implies.

@@ -49,6 +49,8 @@ fn snapshotImpl(e: *engine.Engine, requested: ?rot.Quat, is_oxford: bool) ![]u8 
     defer e.gpa.free(crystal);
     @memset(crystal, rot.quat_identity);
     if (is_oxford) {
+        // The acquisition writer's fitted-plane PC/frame mapping has not been validated.
+        if (geometry.plane_kind != 0) return error.OxfordPlaneExportNotValidated;
         if (transform == null or context.calibration.metadata != null) {
             try context.calibration.requireSupported();
             if (geometry.px_um != 0) return error.OxfordScanTranslationNotValidated;
@@ -81,7 +83,10 @@ fn snapshotImpl(e: *engine.Engine, requested: ?rot.Quat, is_oxford: bool) ![]u8 
     try w.writeAll("{\"schema_version\":1,\"version\":");
     try value(w, engine.version);
     try w.writeAll(",\"scan\":");
-    try value(w, .{ .rows = info.rows, .cols = info.cols, .pat_h = info.pat_h, .pat_w = info.pat_w, .format = switch (e.source) { .file => |s| s.formatName(), else => "memory" } });
+    try value(w, .{ .rows = info.rows, .cols = info.cols, .pat_h = info.pat_h, .pat_w = info.pat_w, .format = switch (e.source) {
+        .file => |s| s.formatName(),
+        else => "memory",
+    } });
     try w.writeAll(",\"geometry\":");
     try value(w, geometry);
     try w.writeAll(",\"calibration\":{\"kind\":");
@@ -125,9 +130,7 @@ fn snapshotImpl(e: *engine.Engine, requested: ?rot.Quat, is_oxford: bool) ![]u8 
     }
     try w.writeAll(",\"pattern_centres\":[");
     for (0..e.res.phase.len) |i| {
-        const offset = geometry.scanOffset(@floatFromInt(i / info.cols), @floatFromInt(i % info.cols),
-            0.5 * @as(f64, @floatFromInt(info.rows - 1)), 0.5 * @as(f64, @floatFromInt(info.cols - 1)), context.settings.scan_x_sign, context.settings.scan_y_sign, 1);
-        const t = rot.sub(context.calibration.translation(&geometry, @floatFromInt(info.pat_h), @floatFromInt(info.pat_w)), offset);
+        const t = geometry.positionForRotation(context.calibration.rotation(&geometry), @floatFromInt(i / info.cols), @floatFromInt(i % info.cols), 0.5 * @as(f64, @floatFromInt(info.rows - 1)), 0.5 * @as(f64, @floatFromInt(info.cols - 1)), context.settings.scan_x_sign, context.settings.scan_y_sign, 1, @floatFromInt(info.pat_h), @floatFromInt(info.pat_w));
         const pc = engine.Geometry.pcOf(context.calibration.rotation(&geometry), t, @floatFromInt(info.pat_h), @floatFromInt(info.pat_w));
         for (pc, 0..) |x, k| {
             if (i != 0 or k != 0) try w.writeByte(',');

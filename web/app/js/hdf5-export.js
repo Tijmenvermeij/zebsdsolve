@@ -66,6 +66,12 @@ function provenance(f, s, frame) {
   put(g, "GeometryJSON", JSON.stringify(s.geometry));
   put(g, "ProvenanceJSON", JSON.stringify({ schema_version: 1, version: s.version, source_format: s.scan.format, units: { euler: "radians", lattice: "angstrom, degrees", map: "micrometres" }, ...(frame ? { oxford_frame: frame } : {}), ...(s.calibration ? { calibration: s.calibration } : {}) }));
   put(g, "PhasesJSON", JSON.stringify(s.phases));
+  if (s.pattern_centres) {
+    const n = s.scan.rows * s.scan.cols;
+    if (s.pattern_centres.length !== n * 3 || !s.pattern_centres.every(Number.isFinite)) throw new Error("Incomplete native pattern centres.");
+    put(g, "PatternCentres", new Float64Array(s.pattern_centres), [n, 3]).create_attribute("Convention", "Bruker: x from left / width; y from top / height; z / height");
+  }
+
   const selected = g.create_group("Selected"), n = s.scan.rows * s.scan.cols;
   for (const [key, width] of [["quaternions", 4], ["euler", 3], ["phase", 1], ["ncc", 1], ["nmi", 1], ["z", 1], ["sweep", 1]]) {
     if (s.results[key]?.length !== n * width) throw new Error(`Incomplete selected ${key} snapshot.`);
