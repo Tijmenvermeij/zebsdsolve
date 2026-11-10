@@ -113,7 +113,7 @@ pub const Settings = struct {
     // ── pattern filters (applied in this order) ──
     /// The static background, subtracted: the average of patterns spread over the whole map
     /// (`average`), or the one the file stores (`file`).
-    static_background: Static = .average,
+    static_background: Static = .none,
     /// How many patterns the average is taken over, on a lattice over the map (all of them
     /// when the map has fewer).
     static_patterns: u32 = 1024,
@@ -156,14 +156,14 @@ pub const Settings = struct {
     /// on the sphere takes part. The orientation grid has the next power of two ≥ 2L − 1
     /// points per turn (64 for L ≤ 32, 128 for L ≤ 64, 256 for L ≤ 128), and the cost follows
     /// its cube.
-    bandwidth: u32 = 64,
+    bandwidth: u32 = 88,
 
     // ── pattern-centre fit ──
     /// Bandwidth of the correlation in the pattern-centre vote (and for the pose fit's starting
     /// orientations). The patterns' surfaces sharpen with it: on the nickel scan the vote lands
     /// within 0.003 of the pattern centre at 64, within 0.002 at 96 at seven times the cost,
     /// and 0.02 to 0.04 off at 32.
-    fit_bandwidth: u32 = 64,
+    fit_bandwidth: u32 = 88,
     /// Patterns on a fit_grid × fit_grid lattice over the region of interest.
     fit_grid: u32 = 5,
     /// Candidates per axis and the search's half-widths (fractions of the pattern, Bruker

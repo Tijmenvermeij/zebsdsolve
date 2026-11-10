@@ -70,7 +70,7 @@ try {
   await evaluate(`
     for(let i=0;i<600 && !window.ze;i++) await new Promise(r=>setTimeout(r,100));
     if(!window.ze) throw new Error('Application did not initialize WebGPU');
-    window.previewCalls = {contrast:0,stored:[],maps:[],open:[],patterns:[]};
+    window.previewCalls = {contrast:0,stored:[],maps:[],open:[],patterns:[],patternStarts:[],indexStarts:[]};
     const ze = window.ze, native = ze.x.ze_scan_overview;
     if(typeof native !== 'function') throw new Error('Served WASM lacks ze_scan_overview');
     ze.x.ze_scan_overview = async (...args) => {
@@ -79,10 +79,17 @@ try {
     };
     for (const [name,records] of [['ze_open_scan',previewCalls.open],['ze_pattern',previewCalls.patterns]]) {
       const original=ze.x[name];ze.x[name]=async(...args)=>{
+        if(name==='ze_pattern') previewCalls.patternStarts.push({legend:document.getElementById('map-legend').textContent});
         const before=ze.state.io.bytes,value=await original(...args);
         records.push({bytes:ze.state.io.bytes-before,...(name==='ze_pattern'?{stage:args[2]}:{})});return value;
       };
     }
+    const indexCells = ze.indexCells.bind(ze);
+    ze.indexCells = async (...args) => {
+      const record={legend:document.getElementById('map-legend').textContent,bandwidth:args[1]?.bandwidth,completed:false};
+      previewCalls.indexStarts.push(record);
+      const result=await indexCells(...args);record.completed=true;record.records=result.length/8;return result;
+    };
     const stored = ze.storedOverview.bind(ze), contrast = ze.patternStats.bind(ze);
     ze.storedOverview = async (...args) => {
       const result = await stored(...args);
@@ -98,16 +105,51 @@ try {
     };
     window.waitPreview = async (predicate) => {for(let i=0;i<300 && !predicate();i++) await new Promise(r=>setTimeout(r,50));if(!predicate())throw new Error('Preview condition timed out');};
   `);
-  async function openSource() {
+  const pickers = await evaluate(`
+    const calls=[],fallback=[];
+    const saved=window.showOpenFilePicker;
+    for(const kind of ['scan','phase']) document.getElementById('file-'+kind).click=()=>fallback.push(kind);
+    window.showOpenFilePicker=async options=>{calls.push(options);throw new DOMException('cancelled','AbortError');};
+    const before=document.getElementById('status').textContent;
+    for(const id of ['btn-open','btn-phase','btn-open']) {document.getElementById(id).click();await new Promise(r=>setTimeout(r,0));}
+    const unchanged=document.getElementById('status').textContent===before;
+    window.showOpenFilePicker=undefined;
+    document.getElementById('btn-open').click();document.getElementById('btn-phase').click();
+    window.showOpenFilePicker=async()=>{throw new DOMException('blocked','SecurityError');};
+    document.getElementById('btn-open').click();await new Promise(r=>setTimeout(r,0));
+    window.showOpenFilePicker=saved;
+    return {calls,fallback,unchanged,background:ze.settings.static_background};
+  `);
+  assert.deepEqual(pickers.calls.map(c=>c.id),['zebsdsolve-scan','zebsdsolve-master','zebsdsolve-scan']);
+  assert.ok(pickers.calls.every(c=>c.multiple),'Both pickers retain multi-file selection');
+  assert.equal(pickers.calls[0].types,undefined,'Scan picker remains unrestricted for acquisition side files and projects');
+  assert.deepEqual(pickers.calls[1].types[0].accept['application/octet-stream'],['.npz','.h5','.hdf5']);
+  assert.deepEqual(pickers.fallback,['scan','phase','scan']);assert.ok(pickers.unchanged,'Cancellation leaves status unchanged');
+  assert.equal(pickers.background,'none','Default preprocessing must not average the scan');
+  async function openSource(usePicker = false) {
     const { root: documentRoot } = await send("DOM.getDocument", {}, sessionId);
     const { nodeId } = await send("DOM.querySelector", { nodeId:documentRoot.nodeId,selector:'#file-scan'},sessionId);
     await send('DOM.setFileInputFiles',{nodeId,files:[acquisition]},sessionId);
-    await evaluate(`document.getElementById('file-scan').dispatchEvent(new Event('change'));`);
+    await evaluate(usePicker ? `
+      const files=[...document.getElementById('file-scan').files];
+      window.showOpenFilePicker=async options=>{window.sourcePicker=options;return files.map(file=>({getFile:async()=>file}));};
+      document.getElementById('btn-open').click();
+    ` : `document.getElementById('file-scan').dispatchEvent(new Event('change'));`);
   }
-  await openSource();
+  await evaluate(`window.holdStored=true;`);
+  await openSource(true);
+  const held = await evaluate(`
+    await waitPreview(()=>!!window.releaseStored && document.getElementById('app').dataset.busy==='0');
+    // busy's completion redraw and explicit cell selection must both wait.
+    document.getElementById('pat-live').dispatchEvent(new Event('change'));
+    await new Promise(r=>setTimeout(r,100));
+    const result={patterns:previewCalls.patternStarts.length,indexes:previewCalls.indexStarts.length,live:document.getElementById('pat-live').checked};
+    releaseStored();return result;
+  `);
+  assert.deepEqual(held,{patterns:0,indexes:0,live:true},'No preview or on-spot work may precede stored overview delivery');
   console.error("preview: P6 opening, awaiting stored quality");
   const first = await evaluate(`
-    await waitPreview(()=>document.getElementById('map-legend').textContent==='Band contrast');
+    await waitPreview(()=>document.getElementById('map-legend').textContent==='Band contrast' && !document.getElementById('btn-overview').disabled && previewCalls.patterns.length>0);
     await ze._queue;
     const before = ze.stats();await new Promise(r=>setTimeout(r,250));const idle=ze.stats();
     return {calls:previewCalls,initialBytes:before.fileBytes,idleBytes:idle.fileBytes,live:document.getElementById('pat-live').checked,stage:document.querySelector('#pat-stage [aria-pressed=true]').dataset.stage};
@@ -117,6 +159,7 @@ try {
   assert.ok(first.initialBytes<16*1024*1024,`Opening exceeded bounded metadata traffic: ${first.initialBytes}`);
   assert.ok(first.calls.patterns.length<=2 && first.calls.patterns.every(p=>p.stage===0), "Opening may display the selected stored pattern only");
   assert.equal(first.live,true);assert.equal(first.stage,'stored');
+  assert.ok(first.calls.patternStarts.every(p=>p.legend==='Band contrast'),'The stored overview must be drawn before the first pattern request');
   const controls = await evaluate(`
     const select=document.getElementById('overview-source'), button=document.getElementById('btn-overview');
     const visible=el=>{const r=el.getBoundingClientRect();return !el.hidden && r.width>0 && r.height>0 && r.left>=0 && r.right<=innerWidth && r.top>=0 && r.bottom<=document.getElementById('map-well').getBoundingClientRect().top;};
@@ -126,6 +169,43 @@ try {
   assert.equal(first.calls.maps[0].kind,1);assert.equal(first.calls.maps[0].length,415*293);
   assert.equal(first.calls.stored[0].query,true);assert.equal(first.calls.stored[0].bytes,0);
   assert.ok(first.calls.stored[1].bytes>0 && first.calls.stored[1].bytes<=415*293*4+65536);
+  // A real master added through the retained input path must still trigger the
+  // default on-spot preview. Use the app's bandwidth control to bound the search.
+  await evaluate(`
+    const control=[...document.querySelectorAll('.field')].find(el=>el.querySelector('span')?.textContent==='bandwidth L').querySelector('input');
+    control.value='32';control.dispatchEvent(new Event('change'));
+    await ze._queue;
+    window.phaseIndexBefore=previewCalls.indexStarts.length;
+  `);
+  const { root: phaseDocument } = await send('DOM.getDocument',{},sessionId);
+  const { nodeId: phaseInput } = await send('DOM.querySelector',{nodeId:phaseDocument.nodeId,selector:'#file-phase'},sessionId);
+  await send('DOM.setFileInputFiles',{nodeId:phaseInput,files:[resolve(root,'testdata/nickel/Ni_master_20kV.npz')]},sessionId);
+  await evaluate(`document.getElementById('file-phase').dispatchEvent(new Event('change'));`);
+  const onSpot = await evaluate(`
+    await waitPreview(()=>previewCalls.indexStarts.length>phaseIndexBefore);
+    await ze._queue;
+    await waitPreview(()=>document.getElementById('pat-sim-cap').textContent.includes('found now'));
+    return {live:document.getElementById('pat-live').checked,phaseCount:ze.phases.length,index:previewCalls.indexStarts[phaseIndexBefore]};
+  `);
+  assert.equal(onSpot.live,true);assert.equal(onSpot.phaseCount,1);
+  assert.equal(onSpot.index.legend,'Band contrast');assert.equal(onSpot.index.bandwidth,32);
+  assert.equal(onSpot.index.completed,true);assert.equal(onSpot.index.records,1);
+  // An explicitly selected average is calculated on first use and retained for
+  // a different filtered cell, rather than reread for every preview.
+  const average = await evaluate(`
+    const logs=[];const off=ze.onEvent(ev=>{if(ev.kind==='log' && ev.text.startsWith('static background: the average'))logs.push(ev.text);});
+    const saved=ze.settings;
+    try {
+      ze.configure({static_background:'average',static_patterns:16});
+      const first=await ze.pattern(0,'filtered'), afterFirst=logs.length;
+      const second=await ze.pattern(1,'filtered');
+      return {afterFirst,afterSecond:logs.length,sameShape:first.length===second.length,finite:first.every(Number.isFinite)&&second.every(Number.isFinite),logs};
+    } finally {off();ze.configure({static_background:'none',static_patterns:saved.static_patterns});}
+  `);
+  assert.equal(average.afterFirst,1,'The first filtered preview prepares the selected average');
+  assert.equal(average.afterSecond,1,'The next filtered cell reuses the average');
+  assert.ok(average.sameShape && average.finite);
+  console.error('preview: real master on-spot and cached explicit average passed',JSON.stringify({onSpot,average}));
   // Delay a real contrast result, then replace the source. Its callback must not
   // paint the new map or schedule another batch against the new acquisition.
   console.error("preview: checking explicit contrast and source replacement");
@@ -150,7 +230,7 @@ try {
   await openSource();
   console.error("preview: checking late stored result and Stop");
   const stale = await evaluate(`
-    await waitPreview(()=>!!window.releaseStored);
+    await waitPreview(()=>!!window.releaseStored && document.getElementById('app').dataset.busy==='0');
     document.getElementById('btn-example').click();
     await waitPreview(()=>ze.scan.rows===55 && document.getElementById('app').dataset.busy==='0' && !document.getElementById('btn-overview').disabled);
     releaseStored();await new Promise(r=>setTimeout(r,300));
@@ -162,7 +242,7 @@ try {
   `);
   assert.ok(stale.neutral);assert.equal(stale.after,stale.before);assert.equal(stale.button,'Calculate pattern contrast');
   assert.equal(stale.live,false,'An explicit on-spot opt-out persists across scan changes');
-  console.log(JSON.stringify({first,cancelled,stale}));
+  console.log(JSON.stringify({first,onSpot,average,cancelled,stale}));
   console.log('Stored overview browser checks passed: bounded scalar IO, zero automatic contrast, neutral fallback, explicit calculation, source switching, stop and stale callback guards.');
 } finally {
   clearTimeout(wallTimeout);ws?.close();chrome?.kill();server.closeAllConnections();await new Promise(resolve=>server.close(resolve));
