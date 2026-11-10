@@ -121,7 +121,7 @@ try {
       ${outputPath ? `const downloadURL = URL.createObjectURL(new Blob([bytes],{type:'application/x-hdf5'}));
       const link = document.createElement('a'); link.href = downloadURL; link.download = ${JSON.stringify(basename(outputPath))}; document.body.append(link); link.click(); link.remove();` : ''}
       return {pixel:cell,rows:ox.scan.rows,cols:ox.scan.cols,sourceBytes:source.size,outputBytes:bytes.length,geometry:originalGeometry,frame,calibration:ox.calibration,raw:{quaternion:raw.results.quaternions.slice(cell*4,cell*4+4),euler:raw.results.euler.slice(cell*3,cell*3+3)},oxford:{quaternion:ox.results.quaternions.slice(cell*4,cell*4+4),euler:expected,savedEuler:saved,phase:data.get('Phase').value[cell]},quality:{ncc:ox.results.ncc[cell],nmi:ox.results.nmi[cell],z:ox.results.z[cell]}};
-    } finally { output?.close(); ze.x.ze_destroy(ze.e); }
+    } finally { output?.close(); await ze.dispose(); }
   `);
   assert.ok(result.outputBytes < result.sourceBytes);
   if (outputPath) {

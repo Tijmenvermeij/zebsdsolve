@@ -32,6 +32,26 @@ const frame = { engine_to_cs1: [1, 0, 0, 0], provenance: "Independent test fixtu
 // Indexed-but-unaccepted results belong in both ANG and HDF5.
 const unaccepted = structuredClone(s); unaccepted.results.sweep[0] = -1;
 read(await exportH5(unaccepted), (f) => assert.equal(f.get('Scan 1/EBSD/Data/Phase').value[0], s.results.phase[0]));
+const missingMetrics = structuredClone(s);
+missingMetrics.results.sweep[0] = -1;
+missingMetrics.results.ncc[0] = null; missingMetrics.results.nmi[0] = -10; missingMetrics.results.z[0] = null;
+missingMetrics.candidates.ncc[4] = null; missingMetrics.candidates.nmi[4] = null; missingMetrics.candidates.z[4] = null;
+read(await exportH5(missingMetrics), (f) => {
+  assert.equal(f.get("Scan 1/EBSD/Data/Phase").value[0], 0);
+  assert.equal(f.get("Scan 1/EBSD/Data/Sweep").value[0], -1);
+  assert.ok(Number.isNaN(f.get("Scan 1/EBSD/Data/CI").value[0]));
+  assert.equal(f.get("Scan 2/EBSD/Data/Phase").value[0], 1);
+  assert.ok(Number.isNaN(f.get("zebsdsolve/Selected/ncc").value[0]));
+  assert.ok(Number.isNaN(f.get("zebsdsolve/Candidates/ncc").value[4]));
+});
+const candidatesOnly = structuredClone(s);
+candidatesOnly.results.phase[0] = -1;
+read(await exportH5(candidatesOnly), (f) => {
+  assert.equal(f.get("Scan 1/EBSD/Data/Phase").value[0], 255);
+  assert.equal(f.get("Scan 2/EBSD/Data/Phase").value[0], 0);
+  assert.equal(f.get("Scan 3/EBSD/Data/Phase").value[0], 1);
+  assert.deepEqual(Array.from(f.get("zebsdsolve/Selected/quaternions").value.slice(0,4)), [0,0,0,0]);
+});
 assert.throws(() => oxfordFrame({ engine_to_cs1: [1, 0, 0, 0] }), /provenance/);
 assert.throws(() => oxfordFrame({ engine_to_cs1: [2, 0, 0, 0], provenance: "bad" }), /unit/);
 let didRead = false;
@@ -72,14 +92,13 @@ f.create_hard_link("/1/UnknownVendorData", "VendorHardLink"); f.close();
 const sourceBytes = h.FS.readFile("/source.h5oina").slice(); h.FS.unlink("/source.h5oina"); const source = new Blob([sourceBytes]);
 const ox = await exportOxford(s, source, frame);
 read(ox, (f) => {
-  assert.deepEqual(Array.from(f.get("1/EBSD/Data/Phase").value), [1, 0, 2, 1]);
+  assert.deepEqual(Array.from(f.get("1/EBSD/Data/Phase").value), [1, 0, 2, 0]);
   assert.equal(f.get("1/EBSD/Header/Phases/2/Space Group").value[0], 225);
   assert.deepEqual(f.get("1/EBSD/Header/Phases/2/Reference").value, ["zebsdsolve master pattern"]);
-  assert.deepEqual(Array.from(f.get("zebsdsolve/OriginalIndexing/Euler").value), new Array(n * 3).fill(.8));
-  assert.equal(f.get("zebsdsolve/OriginalIndexing/Euler").attrs.Unit.value, "rad");
-  assert.equal(f.get("1/EBSD/Data/Euler").value[9], .8);
-  assert.equal(f.get("1/EBSD/Data/Phase").value[3], 1);
-  assert.deepEqual(Array.from(f.get("1/EBSD/Data/Bands").value), [0, 0, 0, 7]);
+  assert.equal(f.get("zebsdsolve/OriginalIndexing"), null);
+  assert.equal(f.get("1/EBSD/Data/Euler").value[9], 0);
+  assert.equal(f.get("1/EBSD/Data/Phase").value[3], 0);
+  assert.deepEqual(Array.from(f.get("1/EBSD/Data/Bands").value), [0, 0, 0, 0]);
   assert.ok(Number.isNaN(f.get("1/EBSD/Data/Mean Angular Deviation").value[0]));
   assert.equal(f.get("1/UnknownVendorData").attrs.VendorUnit.value, "opaque");
   assert.equal(f.get("1").attrs.Acquisition.value, "unknown vendor metadata");
@@ -97,9 +116,15 @@ read(ox, (f) => {
   assert.deepEqual(f.get_external_link("/VendorExternalLink"), { filename: "external.h5", obj_path: "/vendor/data" });
   assert.deepEqual(Array.from(f.get("VendorHardLink").value), [5, 6]);
   assert.equal(f.get("1/EBSD/Data/Pattern Center X").value[0], .4);
-  assert.equal(f.get("1/EBSD/Data/Pattern Center X").value[3], .2);
+  assert.ok(Number.isNaN(f.get("1/EBSD/Data/Pattern Center X").value[3]));
   assert.ok(Math.abs(f.get("1/EBSD/Data/Pattern Center Y").value[0] - .4) < 1e-12);
   assert.ok(Number.isNaN(f.get("1/EBSD/Data/Pattern Center Y").value[3]));
+});
+read(await exportOxford(missingMetrics, source, frame), (f) => {
+  assert.equal(f.get("1/EBSD/Data/Phase").value[0], 1);
+  assert.equal(f.get("zebsdsolve/SWEEP").value[0], -1);
+  assert.ok(Number.isNaN(f.get("zebsdsolve/NCC").value[0]));
+  assert.deepEqual(Array.from(f.get("zebsdsolve/ReplacedMask").value), [1,1,1,1]);
 });
 assert.deepEqual(new Uint8Array(await source.arrayBuffer()), sourceBytes);
 await assert.rejects(() => exportOxford(s, source, { ...frame, phase_id_map: [1, 1] }), /unique/);
@@ -108,6 +133,9 @@ await assert.rejects(() => exportOxford({ ...s, geometry: { ...s.geometry, step_
 h.FS.writeFile("/processing.h5oina", sourceBytes);
 const dp = new h.File("/processing.h5oina", "a"), processing = dp.get("1").create_group("Data Processing");
 put(processing, "OriginalFit", new Float32Array([.1]));
+// Processing may alias the live acquisition Data group. Its canonical fields
+// must survive processing omission and receive solver results.
+processing.create_hard_link("/1/EBSD/Data", "SharedData");
 dp.create_soft_link("/1/Data Processing/OriginalFit", "ProcessingSoftLink");
 dp.create_soft_link("/2/Data Processing/OriginalFit", "AliasedProcessingSoftLink");
 processing.create_soft_link("../EBSD/Data/Euler", "BrokenParentLink");
@@ -117,17 +145,15 @@ processing.create_soft_link("Data/Euler", "RelativeEulerLink");
 processing.create_soft_link("OriginalFit", "RelativeLink"); dp.create_hard_link("/1", "2"); dp.close();
 const dpSource = new Blob([h.FS.readFile("/processing.h5oina").slice()]); h.FS.unlink("/processing.h5oina");
 read(await exportOxford(s, dpSource, frame), (f) => {
+  assert.deepEqual(Array.from(f.get("1/EBSD/Data/Phase").value), [1,0,2,0]);
+  assert.deepEqual(Array.from(f.get("1/EBSD/Data/X").value), [0,1,0,1]);
   assert.equal(f.get("1/Data Processing"), null);
   assert.equal(f.get("2/Data Processing"), null);
   assert.deepEqual(f.get("1").create_reference().ref_data, f.get("2").create_reference().ref_data);
-  assert.equal(f.get("zebsdsolve/OriginalDataProcessing/OriginalFit").value[0], Math.fround(.1));
-  assert.equal(f.get_link("/ProcessingSoftLink"), "/zebsdsolve/OriginalDataProcessing/OriginalFit");
-  assert.equal(f.get_link("/AliasedProcessingSoftLink"), "/zebsdsolve/OriginalDataProcessing/OriginalFit");
-  assert.equal(f.get_link("/zebsdsolve/OriginalDataProcessing/BrokenParentLink"), "/zebsdsolve/OriginalDataProcessing/../EBSD/Data/Euler");
-  assert.equal(f.get_link("/zebsdsolve/OriginalDataProcessing/AcquisitionPhaseLink"), "/1/EBSD/Data/Phase");
-  assert.equal(f.get_link("/zebsdsolve/OriginalDataProcessing/RelativeEulerLink"), "/zebsdsolve/OriginalDataProcessing/Data/Euler");
-  assert.deepEqual(f.get("AliasedProcessingSoftLink").create_reference().ref_data, f.get("zebsdsolve/OriginalDataProcessing/OriginalFit").create_reference().ref_data);
-  assert.equal(f.get_link("/zebsdsolve/OriginalDataProcessing/RelativeLink"), "/zebsdsolve/OriginalDataProcessing/OriginalFit");
+  assert.equal(f.get("zebsdsolve/OriginalDataProcessing"), null);
+  assert.equal(f.get("ProcessingSoftLink"), null);
+  assert.equal(f.get("AliasedProcessingSoftLink"), null);
+
 });
 h.FS.writeFile("/references.h5oina", sourceBytes);
 const references = new h.File("/references.h5oina", "a");
@@ -159,4 +185,4 @@ for (const location of ["zebsdsolve", "EBSD", "Data Processing", "soft-zebsdsolv
   } finally { h.FS.open = fsOpen; }
 }
 h.FS.unlink("/external.h5");
-console.log("HDF5 browser export checks passed: EMS selected/alternative phases, Oxford phase append, original values/attributes/links, ROI, pattern centres, pattern omission and aliases, static background, 64-bit/fixed-string types, processing archival, frame/phase/memory/reference/structural-link guards.");
+console.log("HDF5 browser export checks passed: EMS selected/alternative phases, Oxford phase append, current solutions/metadata attributes/links, ROI, pattern centres, pattern omission and aliases, static background, 64-bit/fixed-string types, processing omission, frame/phase/memory/reference/structural-link guards.");

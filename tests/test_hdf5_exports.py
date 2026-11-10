@@ -3,6 +3,7 @@
 Run with h5py and native pyMTEX installed, against a rebuilt native library.
 """
 from pathlib import Path
+from copy import deepcopy
 import hashlib
 import json
 import os
@@ -17,6 +18,7 @@ from mtex import loadEBSD, rotation, zvector, degree
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT/'python'))
 from zebsdsolve import Solver, Error
+from zebsdsolve.hdf5_export import write_emsphinx, write_oxford
 
 class Exports(unittest.TestCase):
     @classmethod
@@ -105,6 +107,7 @@ class Exports(unittest.TestCase):
             f['Unknown/Soft link']=h5py.SoftLink('/Unknown/Values')
             f['Unknown/External link']=h5py.ExternalLink('other.h5','/Unknown')
             f.copy(g['Data/Euler'],f.create_group('1/Data Processing/Data'),name='Euler')
+            f['1/Data Processing/SharedData']=d
             f['1/Data Processing/SourcePhase']=h5py.SoftLink('/1/EBSD/Data/Phase')
             f['1/Data Processing/RelativeEuler']=h5py.SoftLink('Data/Euler')
             f['Unknown/Old processed Euler']=h5py.SoftLink('/1/Data Processing/Data/Euler')
@@ -268,10 +271,9 @@ class Exports(unittest.TestCase):
         self.assertLess(float(np.max(e.rotations[valid].angle(expected))/degree),.002)
         with h5py.File(target) as f,h5py.File(self.baseline) as original:
             self.assertNotIn('1/Data Processing',f)
-            self.assertIn('zebsdsolve/OriginalDataProcessing/Data/Euler',f)
-            self.assertEqual(f['zebsdsolve/OriginalDataProcessing/SourcePhase'].id,f['1/EBSD/Data/Phase'].id)
-            self.assertEqual(f['zebsdsolve/OriginalDataProcessing/RelativeEuler'].id,f['zebsdsolve/OriginalDataProcessing/Data/Euler'].id)
-            self.assertEqual(f['Unknown/Old processed Euler'].id,f['zebsdsolve/OriginalDataProcessing/Data/Euler'].id)
+            self.assertNotIn('zebsdsolve/OriginalDataProcessing',f)
+            self.assertNotIn('zebsdsolve/OriginalIndexing',f)
+            self.assertNotIn('Unknown/Old processed Euler',f)
             for key in ['1/EBSD/Header/Specimen Orientation Euler','1/EBSD/Header/Detector Orientation Euler','Unknown/Values','1/EBSD/Header/Processed Static Background']:
                 self.assertTrue(np.array_equal(f[key][()],original[key][()]))
                 self.assertEqual(dict(f[key].attrs),dict(original[key].attrs))
@@ -283,11 +285,54 @@ class Exports(unittest.TestCase):
             self.assertLess(target.stat().st_size,self.baseline.stat().st_size+100000)
             self.assertIn('2',f['1/EBSD/Header/Phases'])
             for key in ['Euler','Phase','Mean Angular Deviation','Bands']:
-                self.assertTrue(np.array_equal(f['zebsdsolve/OriginalIndexing/'+key][()],original['1/EBSD/Data/'+key][()]))
-                self.assertTrue(np.array_equal(f['1/EBSD/Data/'+key][()][~valid],original['1/EBSD/Data/'+key][()][~valid]))
+                empty = f['1/EBSD/Data/'+key][()][~valid]
+                self.assertTrue(np.isnan(empty).all() if key == 'Mean Angular Deviation' else np.all(empty == 0))
             self.assertTrue(np.isnan(f['1/EBSD/Data/Mean Angular Deviation'][()][valid]).all())
             pc=np.asarray(self.snapshot['pattern_centres']).reshape(6,3)
             self.assertTrue(np.allclose(f['1/EBSD/Data/Pattern Center X'][()][valid],pc[valid,0]))
+
+    def test_computed_solutions_survive_missing_quality_and_unaccepted_sweep(self):
+        s = deepcopy(self.snapshot)
+        cell = 1
+        phase = int(s['results']['phase'][cell]); other = 1-phase
+        s['results']['sweep'][cell] = -1
+        s['results']['ncc'][cell] = None
+        s['results']['nmi'][cell] = -10
+        s['results']['z'][cell] = None
+        for key in ('ncc', 'nmi', 'z'): s['candidates'][key][other*6+cell] = None
+        h5 = self.out/'missing-quality.h5'
+        write_emsphinx(h5, s)
+        with h5py.File(h5) as f:
+            self.assertEqual(f['Scan 1/EBSD/Data/Phase'][cell], phase)
+            self.assertEqual(f['Scan 1/EBSD/Data/Sweep'][cell], -1)
+            self.assertTrue(np.isnan(f['Scan 1/EBSD/Data/CI'][cell]))
+            self.assertEqual(f['Scan 2/EBSD/Data/Phase'][cell], other)
+            self.assertTrue(np.isnan(f['zebsdsolve/Selected/ncc'][cell]))
+            self.assertTrue(np.isnan(f['zebsdsolve/Candidates/ncc'][other,cell]))
+        oxford = self.out/'missing-quality.h5oina'
+        write_oxford(oxford, self.baseline, s, [1,0,0,0], 'Serialization-only identity fixture')
+        with h5py.File(oxford) as f:
+            self.assertGreater(f['1/EBSD/Data/Phase'][cell], 0)
+            self.assertTrue(np.isnan(f['zebsdsolve/NCC'][cell]))
+            self.assertEqual(f['zebsdsolve/SWEEP'][cell], -1)
+            self.assertNotIn('zebsdsolve/OriginalIndexing', f)
+            self.assertTrue(np.all(f['1/EBSD/Data/Phase'][()][[0,2,3,5]] == 0))
+            self.assertTrue(np.all(f['1/EBSD/Data/Euler'][()][[0,2,3,5]] == 0))
+
+    def test_all_attempted_candidates_export_without_selected_phase(self):
+        s = deepcopy(self.snapshot)
+        s['results']['phase'][1] = -1
+        target = self.out/'candidates-without-selected.h5'
+        write_emsphinx(target, s)
+        with h5py.File(target) as f:
+            self.assertEqual(f['Scan 1/EBSD/Data/Phase'][1], 255)
+            self.assertEqual(set([int(f['Scan 2/EBSD/Data/Phase'][1]), int(f['Scan 3/EBSD/Data/Phase'][1])]), {0,1})
+            self.assertTrue(np.all(f['zebsdsolve/Selected/quaternions'][1] == 0))
+        # The same rule applies to a sole retained phase candidate.
+        s['phases'] = s['phases'][:1]
+        s['candidates'] = {key: 1 if key == 'phase_count' else value[:6*(4 if key == 'quaternions' else 3 if key == 'euler' else 1)] for key,value in s['candidates'].items()}
+        write_emsphinx(target, s)
+        with h5py.File(target) as f: self.assertEqual(f['Scan 2/EBSD/Data/Phase'][1], 0)
 
     def test_unresolved_frame_and_source_overwrite_fail_before_write(self):
         target=self.out/'blocked.h5oina'
@@ -309,7 +354,7 @@ class Exports(unittest.TestCase):
             self.assertIn('7',f['1/EBSD/Header/Phases'])
             self.assertIn('8',f['1/EBSD/Header/Phases'])
             valid=np.asarray(self.snapshot['results']['phase'])>=0
-            self.assertTrue(np.all(f['1/EBSD/Data/Phase'][()][~valid]==7))
+            self.assertTrue(np.all(f['1/EBSD/Data/Phase'][()][~valid]==0))
 
     def test_metadata_reference_rejected_without_output(self):
         import shutil
@@ -345,7 +390,8 @@ class Exports(unittest.TestCase):
         with h5py.File(target) as f:
             self.assertNotIn('1/Data Processing',f)
             self.assertNotIn('2/Data Processing',f)
-            self.assertEqual(f['Unknown/Processing through alias'].id,f['zebsdsolve/OriginalDataProcessing/Data/Euler'].id)
+            self.assertNotIn('Unknown/Processing through alias',f)
+            self.assertNotIn('zebsdsolve/OriginalDataProcessing',f)
 
     def test_large_origin_reordered_pixels_rejected(self):
         import shutil

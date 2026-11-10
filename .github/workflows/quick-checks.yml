@@ -1,0 +1,32 @@
+name: quick checks
+
+# Explicitly requested, bounded Linux checks; never starts on push or PR.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  quick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Host unit tests
+        run: zig build test
+      - name: Browser module and site
+        run: |
+          zig build wasm
+          node scripts/build_web.mjs
+      - name: Export and scheduling regressions
+        run: |
+          node web/tests/export-hdf5.mjs
+          node web/tests/chunk-index-scheduler.mjs
+          node web/tests/gpu-loss.mjs

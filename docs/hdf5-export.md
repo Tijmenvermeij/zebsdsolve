@@ -15,10 +15,12 @@ The browser's `.h5` button and Python `solver.export("results.h5")` write:
   phase candidates. The root `Manufacturer=EMSphInx` identifies the compatible
   layout; the producer is zebsdsolve.
 
-Export does not run another search. Unprocessed pixels use the format's
-unindexed marker. Indexed results remain exported even if the acceptance
-threshold was not met. An incomplete or cancelled run retains explicit
-unprocessed markers.
+Export does not run another search. All computed solver solutions remain
+exported, including low-scoring or unconverged matches and results whose
+acceptance sweep is −1. No quality threshold is applied; users can filter
+after export. Missing quality metrics are empty values, without discarding
+the orientation. Pixels without a computed solution use the format's
+unindexed marker. Incomplete or cancelled runs preserve the full raster.
 
 Compatibility here targets the native MTEX EMSphInx importer and the scan-group
 layout. It does not reproduce every native EMSphInx metadata field or guarantee
@@ -34,12 +36,6 @@ do not infer a general TKD conversion from this scalar header alone. The native
 EMSphInx comparison and current calibrated three-point check were approximately
 consistent after source-derived frame conversion, without fitted alignment.
 
-Known Python limitation: if a pixel has no selected phase but retains phase
-candidates, the secondary scan groups can omit one candidate. The full
-`zebsdsolve/Candidates` data are retained. The browser's rank selection does
-not have this truncation. Resolving this difference is part of export parity
-work before batch execution.
-
 Settings and calibration are captured during indexing. Changing controls
 after indexing does not relabel the old results. If a later ROI retains
 results from an incompatible indexing context, export requires reindexing
@@ -52,8 +48,10 @@ Oxford export creates a new file with the original acquisition's metadata,
 images, map datasets and phase definitions. Diffraction patterns are omitted
 by default, including hard/soft aliases to their datasets. Static backgrounds
 are retained. The original file is never changed.
-Only indexed pixels are replaced; other pixels retain the baseline results.
-Original indexing values are backed up under `zebsdsolve/OriginalIndexing`.
+All map rows are replaced from solver results. Pixels without a computed
+solver solution have phase 0 and empty orientations; no original acquisition
+solutions are used as fallback. Original indexing and Data Processing maps
+are omitted, including aliases, rather than archived as additional solutions.
 New master phases receive new phase IDs. Updated pixels get the fitted pattern
 centres; old indexing-specific band counts/MAD are cleared rather than reused
 as solver quality measurements. Solver NCC/NMI are stored under `zebsdsolve`.
@@ -118,13 +116,13 @@ before an output is delivered. The original source is never overwritten.
 The browser reads the original file in pieces in a worker and copies metadata
 into a fresh output; omitted patterns do not impose a source-size limit.
 Retained output data still needs browser memory. Python uses native HDF5
-copies. Existing Data Processing maps are preserved under
-`zebsdsolve/OriginalDataProcessing` so readers select the new EBSD results.
+copies. Existing Data Processing maps and their aliases are omitted so readers
+select only computed solver results.
 Unsupported HDF5 references fail explicitly; Python supports more metadata
 datatypes than the browser writer.
 
 Validation uses native MTEX/pyMTEX importers and rotations, without a runtime
-MTEX dependency. It checks candidate conversion, phase IDs, retained pixels,
+MTEX dependency. It checks candidate conversion, phase IDs, empty uncomputed pixels,
 pattern omission, original metadata and source integrity. Sparse Oxford phase
 IDs and some partial multiphase maps also need raw file-ID checks because the
 installed pyMTEX 1.0.0 importer has phase-numbering limitations.

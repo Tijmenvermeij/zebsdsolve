@@ -69,7 +69,6 @@ export function copyOxfordMetadata(source, destination, h) {
   }
   if (scans.size !== 1) throw new Error("Oxford browser export requires one unambiguous EBSD acquisition scan; use Python export for this file.");
   const scan = [...scans.values()][0], processing = `/${scan}/Data Processing`;
-  const relocate = (path) => path === processing || path.startsWith(`${processing}/`) ? `/zebsdsolve/OriginalDataProcessing${path.slice(processing.length)}` : path;
   if (localHardObject(localHardObject(source, scan), "Data Processing") && localHardObject(source, "zebsdsolve/OriginalDataProcessing")) throw new Error("Oxford source already contains archived Data Processing metadata.");
   const rootID = identity(source), objects = new Map([[rootID, source]]), links = [], edges = new Map(), omitted = new Set(), omittedPaths = new Set();
   function inventory(g, path) {
@@ -102,6 +101,11 @@ export function copyOxfordMetadata(source, destination, h) {
       }
     }
   }
+  // Visit acquisition data at its canonical path before processing aliases.
+  // Otherwise a shared Data group can be inventoried only below an omitted map.
+  const acquisition = localHardObject(source, `${scan}/EBSD/Data`);
+  objects.set(identity(acquisition), acquisition);
+  inventory(acquisition, `/${scan}/EBSD/Data`);
   inventory(source, "/");
   // Resolve symbolic links from the inventory. get_type() in this runtime can
   // misclassify broken links with missing parents, and following external links
@@ -119,14 +123,26 @@ export function copyOxfordMetadata(source, destination, h) {
     return id;
   }
   for (const link of links) if (link.kind === "soft") link.id = resolve(link.path);
+  // Omit historical processing solutions and aliases to their private objects.
+  // Shared acquisition datasets remain and receive current solver values below.
+  const protectedIDs = new Set(), acquisitionData = resolve(`/${scan}/EBSD/Data`);
+  protectedIDs.add(acquisitionData);
+  for (const edge of edges.get(acquisitionData)?.values() || []) if (edge.kind === "hard") protectedIDs.add(edge.id);
+  function omitTree(id) {
+    if (!id || omitted.has(id) || protectedIDs.has(id)) return;
+    omitted.add(id);
+    for (const edge of edges.get(id)?.values() || []) if (edge.kind === "hard") omitTree(edge.id);
+  }
+  omitTree(resolve(processing));
+  for (const link of links) if (link.path === processing || link.path.startsWith(`${processing}/`)) omittedPaths.add(link.path);
   // A named pattern soft link must also exclude its underlying hard-linked object.
-  for (const link of links) if (omittedPaths.has(link.path) && link.id && objects.get(link.id) instanceof h.Dataset) omitted.add(link.id);
+  for (const link of links) if (omittedPaths.has(link.path) && link.id && objects.get(link.id) instanceof h.Dataset && !protectedIDs.has(link.id)) omitted.add(link.id);
   for (const link of links) if (link.id && omitted.has(link.id)) omittedPaths.add(link.path);
   function skip(link) {
     if (omittedPaths.has(link.path) || (link.id && omitted.has(link.id))) return true;
     if (link.kind !== "soft") return false;
     const target = absolute(link.target, parent(link.path));
-    return omittedPaths.has(target) || PATTERNS.has(basename(target));
+    return target === processing || target.startsWith(`${processing}/`) || omittedPaths.has(target) || PATTERNS.has(basename(target));
   }
   // Check all retained types before reading any dataset values or writing output.
   for (const [id, object] of objects) {
@@ -134,20 +150,11 @@ export function copyOxfordMetadata(source, destination, h) {
     if (object instanceof h.Dataset) supported(object, object.path, h);
     for (const [name, attr] of Object.entries(object.attrs)) supported(attr, `${object.path}@${name}`, h);
   }
-  // Record archived paths by identity, so a soft target reached through a hard
-  // alias of the acquisition still follows the archived processing object.
-  const archived = new Map();
-  function archive(id, path) {
-    if (!id || archived.has(id) || omitted.has(id)) return;
-    archived.set(id, path);
-    for (const [name, edge] of edges.get(id) || []) if (edge.kind === "hard") archive(edge.id, join(path, name));
-  }
-  archive(resolve(processing), "/zebsdsolve/OriginalDataProcessing");
   attributes(source, destination, h);
   const copied = new Map([[identity(source), "/"]]);
   for (const link of links) {
     if (link.kind !== "hard" || skip(link)) continue;
-    const path = relocate(link.path), g = ensureGroup(destination, parent(path), h), name = basename(path);
+    const path = link.path, g = ensureGroup(destination, parent(path), h), name = basename(path);
     if (copied.has(link.id)) {
       if (path !== copied.get(link.id) && g.create_hard_link(copied.get(link.id), name) < 0) throw new Error(`Cannot preserve Oxford hard link ${link.path}.`);
       continue;
@@ -161,16 +168,10 @@ export function copyOxfordMetadata(source, destination, h) {
   }
   for (const link of links) {
     if (link.kind === "hard" || skip(link)) continue;
-    const path = relocate(link.path), g = ensureGroup(destination, parent(path), h), name = basename(path);
+    const path = link.path, g = ensureGroup(destination, parent(path), h), name = basename(path);
     let status;
     if (link.kind === "external") status = g.create_external_link(link.object.filename, link.object.obj_path, name);
-    else {
-      // Rebase relative targets only when either endpoint moved during archival.
-      const target = absolute(link.target, parent(link.path)), relocated = relocate(target);
-      const archivedTarget = archived.get(link.id);
-      const destinationTarget = archivedTarget === path ? copied.get(link.id) : archivedTarget;
-      status = g.create_soft_link(destinationTarget || (relocated !== target || path !== link.path ? relocated : link.target), name);
-    }
+    else status = g.create_soft_link(link.target, name);
     if (status < 0) throw new Error(`Cannot preserve Oxford ${link.kind} link ${link.path}.`);
   }
 }

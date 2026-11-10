@@ -24,6 +24,27 @@ def _temporary(path):
 def _string(group, name, value):
     return group.create_dataset(name, data=str(value), dtype=_h5py().string_dtype('utf-8'))
 
+def _current_snapshot(s):
+    """Keep computed solutions independently of acceptance or ancillary quality scores."""
+    n = s['scan']['rows'] * s['scan']['cols']
+    def arrays(values, count):
+        return {k: np.asarray(v, dtype=float).reshape((count, n, 4 if k == 'quaternions' else 3) if k in ('quaternions', 'euler') else (count, n)).copy()
+                for k, v in values.items() if k != 'phase_count'}
+    def finite(a):
+        valid = np.ones(a['sweep'].shape, dtype=bool)
+        for k in ('quaternions', 'euler'): valid &= np.isfinite(a[k]).all(axis=-1)
+        valid &= np.any(a['quaternions'] != 0, axis=-1)
+        return valid
+    r = arrays(s['results'], 1)
+    valid = finite(r) & np.isfinite(r['phase']) & (r['phase'] == np.floor(r['phase'])) & (r['phase'] >= 0) & (r['phase'] < len(s['phases']))
+    for k, v in r.items(): v[~valid] = -1 if k in ('phase', 'sweep') else 0
+    count = s['candidates']['phase_count']
+    c = arrays(s['candidates'], count)
+    candidate_valid = finite(c) & (c['sweep'] >= 0)
+    for k, v in c.items(): v[~candidate_valid] = -1 if k == 'sweep' else 0
+    return {**s, 'results': {k: v.reshape(-1).tolist() for k, v in r.items()},
+            'candidates': {'phase_count': count, **{k: v.reshape(-1).tolist() for k, v in c.items()}}}
+
 def _provenance(f, s, **extra):
     g = f.create_group('zebsdsolve')
     _string(g, 'Producer', 'zebsdsolve')
@@ -31,7 +52,7 @@ def _provenance(f, s, **extra):
     _string(g, 'SettingsJSON', json.dumps(s['settings']))
     _string(g, 'GeometryJSON', json.dumps(s['geometry']))
     _string(g, 'PhasesJSON', json.dumps(s['phases']))
-    _string(g, 'CandidateScope', 'Best stored candidate per phase; no within-phase secondary peaks')
+    _string(g, 'CandidateScope', 'Best computed candidate per phase; independent of acceptance; no within-phase secondary peaks')
     _string(g, 'ProvenanceJSON', json.dumps({
         'schema_version': 1, 'version': s['version'], 'source_format': s['scan']['format'],
         'units': {'euler': 'radians', 'map': 'micrometres', 'lattice': 'angstrom, degrees'},
@@ -63,15 +84,17 @@ def _maps(s):
     yield r
     c = s['candidates']
     count = c['phase_count']
-    if count < 2:
+    if count == 0:
         return
     values = np.asarray(c[s['settings']['phase_by']], dtype=float).reshape(count, n)
+    values = np.where(np.isfinite(values), values, -np.inf)
     valid = np.asarray(c['sweep']).reshape(count, n) >= 0
     valid &= np.arange(count)[:, None] != r['phase'][None, :]
-    order = np.argsort(-np.where(valid, values, -np.inf), axis=0, kind='stable')
+    # Presence outranks score, so missing quality never hides an orientation.
+    order = np.lexsort((np.broadcast_to(np.arange(count)[:, None], (count, n)), -values, ~valid), axis=0)
     arrays = {k: np.asarray(v).reshape((count, n, 3 if k == 'euler' else 4) if k in ('euler', 'quaternions') else (count, n))
               for k, v in c.items() if k != 'phase_count'}
-    for rank in range(count - 1):
+    for rank in range(int(valid.sum(axis=0).max(initial=0))):
         phase = order[rank]
         exists = valid[phase, np.arange(n)]
         out = {k: v[phase, np.arange(n)].copy() for k, v in arrays.items()}
@@ -83,6 +106,7 @@ def _maps(s):
 
 def write_emsphinx(path, s):
     h5py = _h5py()
+    s = _current_snapshot(s)
     if len(s['phases']) > 255:
         raise ValueError('EMSphInx phase IDs support at most 255 phases')
     rows, cols = s['scan']['rows'], s['scan']['cols']
@@ -157,16 +181,9 @@ def _matches(group, phase, allow_laue=False):
 
 PATTERN_DATASETS = {'Processed Patterns', 'Unprocessed Patterns', 'Raw Patterns'}
 
-def _copy_without_patterns(source, target, relocations=None):
+def _copy_without_patterns(source, target, omit_roots=()):
     """Native HDF5 copies retain metadata; diffraction payloads are never read."""
     h5py = _h5py()
-    relocations = relocations or {}
-    def mapped(path):
-        path = '/'+ '/'.join(p for p in path.split('/') if p and p != '.')
-        for old, new in relocations.items():
-            if path == old or path.startswith(old+'/'):
-                return new+path[len(old):]
-        return path
     def identity(obj):
         return h5py.h5o.get_info(obj.id).addr
     def references(dtype):
@@ -179,7 +196,7 @@ def _copy_without_patterns(source, target, relocations=None):
     omitted_ids, omitted, checked = set(), [], set()
     def preflight(g):
         key = identity(g)
-        if key in checked: return
+        if key in checked or key in omitted_ids: return
         checked.add(key)
         for name in g.attrs:
             if references(g.attrs.get_id(name).dtype):
@@ -218,19 +235,26 @@ def _copy_without_patterns(source, target, relocations=None):
                 return local_target(posixpath.join(target_path, *parts[i+1:]), seen)
             obj = obj[name]
         return obj
-    preflight(source)
-    relocated_ids = {}
-    def relocated_objects(obj,path):
+    # Drop old processing solutions and every alias to their private objects.
+    # Objects also present in the acquisition data remain and are overwritten below.
+    protected = set()
+    for path in omit_roots:
+        data = local_target(path.rsplit('/', 1)[0]+'/EBSD/Data')
+        if isinstance(data, h5py.Group):
+            protected.add(identity(data))
+            for key in data:
+                if isinstance(data.get(key, getlink=True), h5py.HardLink): protected.add(identity(data[key]))
+    def omit_tree(obj):
         key = identity(obj)
-        if key in relocated_ids: return
-        relocated_ids[key] = mapped(path)
-        if isinstance(obj,h5py.Group):
-            for name in obj:
-                if isinstance(obj.get(name,getlink=True),h5py.HardLink):
-                    relocated_objects(obj[name],posixpath.join(path,name))
-    for old in relocations:
-        obj = local_target(old)
-        if obj is not None: relocated_objects(obj,old)
+        if key in omitted_ids or key in protected: return
+        omitted_ids.add(key)
+        if isinstance(obj, h5py.Group):
+            for key in obj:
+                if isinstance(obj.get(key, getlink=True), h5py.HardLink): omit_tree(obj[key])
+    for path in omit_roots:
+        obj = local_target(path)
+        if obj is not None: omit_tree(obj)
+    preflight(source)
     copied = {identity(source): target.name}
     def copy_attrs(a,b):
         for name in a.attrs:
@@ -239,6 +263,8 @@ def _copy_without_patterns(source, target, relocations=None):
     def copy_group(a,b):
         copy_attrs(a,b)
         for name in a:
+            path = posixpath.join(a.name, name)
+            if any(path == root or path.startswith(root+'/') for root in omit_roots): continue
             link = a.get(name, getlink=True)
             if isinstance(link, h5py.ExternalLink):
                 if name in PATTERN_DATASETS: continue
@@ -247,16 +273,10 @@ def _copy_without_patterns(source, target, relocations=None):
             if isinstance(link, h5py.SoftLink):
                 path = link.path if link.path.startswith('/') else posixpath.join(a.name,link.path)
                 obj = local_target(path)
+                if any(path == root or path.startswith(root+'/') for root in omit_roots): continue
                 if obj is not None and identity(obj) in omitted_ids:
                     omitted.append(posixpath.join(a.name,name)); continue
-                # Archived Data Processing links must retain their original targets
-                # after the group moves, including relative links out of that group.
-                if obj is not None and identity(obj) in relocated_ids:
-                    b[name] = h5py.SoftLink(relocated_ids[identity(obj)])
-                elif mapped(a.name) != a.name or mapped(path) != path:
-                    b[name] = h5py.SoftLink(mapped(path))
-                else:
-                    b[name] = link
+                b[name] = link
                 continue
             obj = a[name]; key = identity(obj)
             if key in omitted_ids:
@@ -312,6 +332,7 @@ def _oxford_group(f, s):
 
 def write_oxford(path, reference, s, engine_to_cs1, frame_provenance, phase_id_map=None):
     h5py = _h5py()
+    s = _current_snapshot(s)
     q = np.asarray(engine_to_cs1, dtype=float)
     if q.shape != (4,) or not np.isfinite(q).all() or abs(float(q@q)-1)>1e-6 or not str(frame_provenance).strip():
         raise ValueError('OxfordFrameUnresolved: native unit engine-to-CS1 rotation and provenance required')
@@ -348,14 +369,10 @@ def write_oxford(path, reference, s, engine_to_cs1, frame_provenance, phase_id_m
     try:
         with h5py.File(reference, 'r') as source, h5py.File(temporary, 'w') as output:
             processing = name.rsplit('/',1)[0]+'/Data Processing'
-            relocations = {processing:'/zebsdsolve/OriginalDataProcessing'} if processing in source else {}
-            omitted_patterns = _copy_without_patterns(source, output, relocations)
+            omitted_patterns = _copy_without_patterns(source, output, (processing,))
         with h5py.File(temporary, 'r+') as f:
-            root = _provenance(f, s, Frame='Oxford CS1', EngineToCS1=q.tolist(), FrameProvenance=frame_provenance, PhaseIDMap=mapping,
+            root = _provenance(f, s, Frame='Oxford CS1', EngineToCS1=q.tolist(), FrameProvenance=frame_provenance,
                                PatternData='Omitted; metadata and map results only', OmittedPatternPaths=omitted_patterns)
-            old_processing = name.rsplit('/', 1)[0]+'/Data Processing'
-            if old_processing in f:
-                f.move(old_processing, root.name+'/OriginalDataProcessing')
             calibration = s.get('calibration', {})
             header = f[name+'/Header']
             for key, field, count in [('Detector Orientation Euler', 'effective_detector_euler_radians', 3),
@@ -382,34 +399,31 @@ def write_oxford(path, reference, s, engine_to_cs1, frame_provenance, phase_id_m
                 g.create_dataset('Laue Group', data=[phase['laue']])
                 g.create_dataset('Lattice Dimensions', data=[phase['lattice'][:3]]).attrs['Unit'] = 'angstrom'
                 g.create_dataset('Lattice Angles', data=[np.deg2rad(phase['lattice'][3:])]).attrs['Unit'] = 'rad'
-            old = root.create_group('OriginalIndexing')
             r = s['results']; valid = np.asarray(r['phase']) >= 0
-            root.create_dataset('UpdatedPixelMask', data=valid.astype('u1'))
-            # Keep source datasets/attributes exactly; only indexed rows change in place.
-            for key in ['Euler', 'Phase', 'Mean Angular Deviation', 'Bands', 'Error']:
-                if key in data:
-                    f.copy(data[key], old, name=key)
-                    values = data[key][()]
-                    if key == 'Euler': values[valid] = np.asarray(r['euler']).reshape(-1, 3)[valid]
-                    elif key == 'Phase': values[valid] = np.asarray(mapping)[np.asarray(r['phase'])[valid]]
-                    else: values[valid] = np.nan if values.dtype.kind == 'f' else 0
-                    data[key][...] = values
+            root.create_dataset('IndexedMask', data=valid.astype('u1'))
+            root.create_dataset('ReplacedMask', data=np.ones(len(valid), dtype='u1'))
+            root.create_dataset('PhaseIDMap', data=np.asarray(mapping, dtype='u4'))
+            # Keep the full raster but clear all original indexing values.
+            metrics = ['Mean Angular Deviation', 'MAD', 'Mean Angular Error', 'Error', 'Bands', 'Band Count', 'Number of Bands', 'Bands Detected', 'Bands Indexed', 'Confidence Index', 'Fit', 'Pattern Fit']
+            for key in ['Euler', 'Phase', *metrics]:
+                if key not in data: continue
+                values = data[key][()]
+                if values.shape[0] != len(valid): raise ValueError('Oxford indexing layout differs from indexed pixels: '+key)
+                values[...] = np.nan if values.dtype.kind == 'f' and key not in ('Euler', 'Phase') else 0
+                if key == 'Euler': values[valid] = np.asarray(r['euler']).reshape(-1, 3)[valid]
+                elif key == 'Phase': values[valid] = np.asarray(mapping)[np.asarray(r['phase'], dtype=int)[valid]]
+                data[key][...] = values
             pc = np.asarray(s['pattern_centres']).reshape(-1, 3)
             ratio = s['scan']['pat_h']/s['scan']['pat_w']
             for key, values in [('Pattern Center X', pc[:, 0]), ('Pattern Center Y', (1-pc[:, 1])*ratio), ('Detector Distance', pc[:, 2]*ratio)]:
+                out = np.full(len(valid), np.nan)
+                out[valid] = values[valid]
                 if key in data:
-                    f.copy(data[key], old, name=key)
-                    original = data[key][()]
-                    if original.shape != valid.shape:
-                        raise ValueError('Oxford calibration layout differs from indexed pixels')
-                    original[valid] = values[valid]
-                    data[key][...] = original
-                else:
-                    out = np.full(len(valid), np.nan)
-                    out[valid] = values[valid]
-                    data.create_dataset(key, data=out).attrs['Unit'] = 'fraction'
-            for key, source in [('NCC', 'ncc'), ('NMI', 'nmi'), ('Z', 'z')]:
-                root.create_dataset(key, data=r[source])
+                    if data[key].shape != valid.shape: raise ValueError('Oxford calibration layout differs from indexed pixels')
+                    data[key][...] = out
+                else: data.create_dataset(key, data=out).attrs['Unit'] = 'fraction'
+            for key in ('ncc', 'nmi', 'z', 'sweep'):
+                root.create_dataset(key.upper(), data=np.where(valid, r[key], np.nan))
         os.replace(temporary, path)
     finally:
         if os.path.exists(temporary): os.unlink(temporary)
