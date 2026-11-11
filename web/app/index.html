@@ -163,8 +163,9 @@
         </section>
         <section class="panel" data-tab="batch" role="tabpanel" aria-labelledby="tab-batch" hidden>
           <div class="row"><button type="button" class="primary act" id="btn-batch-current">Add current scan</button></div>
-          <button type="button" class="act" id="btn-batch-folder">Output folder…</button>
-          <output id="batch-folder"></output>
+          <label class="check batch-download-option" title="One ZIP per scan, using your browser's download location. The browser may ask to allow multiple downloads."><input type="checkbox" id="batch-downloads"> Save to Downloads</label>
+          <button type="button" class="act" id="btn-batch-setup">Set up output folders…</button>
+          <button type="button" class="act" id="btn-batch-folder">Set all output folders…</button>
           <div class="row"><button type="button" class="primary act" id="btn-batch-run">Run batch</button><button type="button" id="btn-batch-stop" disabled>Stop</button></div>
           <progress id="batch-progress" max="1" value="0" aria-label="Batch indexing progress" hidden></progress>
           <p class="readout" id="batch-readout"></p>
@@ -243,7 +244,7 @@
         <div class="batch-heading"><h2>Batch queue</h2><span id="batch-count"></span></div>
         <p id="batch-empty">No queued scans</p>
         <div class="batch-table-wrap"><table class="batch-table" id="batch-table" hidden>
-          <thead><tr><th scope="col">Output name</th><th scope="col">Scan</th><th scope="col">Phases</th><th scope="col">BW</th><th scope="col">ROI</th><th scope="col">Status</th><th scope="col">Actions</th></tr></thead>
+          <thead><tr><th scope="col">Output name</th><th scope="col">Folder</th><th scope="col">Scan</th><th scope="col">Phases</th><th scope="col">BW</th><th scope="col">ROI</th><th scope="col">Status</th><th scope="col">Actions</th></tr></thead>
           <tbody id="batch-jobs"></tbody>
         </table></div>
       </section>

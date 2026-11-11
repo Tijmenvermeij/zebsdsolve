@@ -1,0 +1,31 @@
+import assert from 'node:assert/strict';
+import { listScanFolder, defaultANG, selectedHandles } from '../app/js/scan-folder.js';
+import { filesFromHandles, fileHandleFor, SourceFolders } from '../app/js/source-folders.js';
+
+let reads = 0;
+const file = name => ({ kind: 'file', name, async getFile() { reads++; return { name, size: 12, lastModified: 3 }; } });
+const entries = ['scan10.up1', 'scan2.UP2', 'scan2.ang', 'other.ang', 'master.h5', 'data.h5oina', 'archive.npz', 'Nordif.dat', 'SETTING.TXT'].map(file);
+entries.push({kind:'directory',name:'nested.h5'});
+const dir = { name:'folder', async *values() { yield* entries; }, async getFileHandle(name) { const entry = entries.find(item => item.kind === 'file' && item.name === name); if (!entry) throw Object.assign(new Error(), {name:'NotFoundError'}); return entry; } };
+const listing = await listScanFolder(dir);
+assert.equal(reads, 0);
+assert.deepEqual(listing.scans.map(entry => entry.name), ['data.h5oina', 'Nordif.dat', 'scan2.UP2', 'scan10.up1']);
+assert.equal(defaultANG(listing.scans[2], listing.angs).name, 'scan2.ang');
+assert.equal(defaultANG(listing.scans[3], listing.angs), null);
+assert.equal(defaultANG(listing.scans[3], [listing.angs[0]]), listing.angs[0]);
+assert.equal(defaultANG(listing.scans[3], [file('scan10.ANG'), file('SCAN10.ang')]), null);
+assert.deepEqual(selectedHandles(listing.scans[1], null, listing.setting).map(entry => entry.name), ['Nordif.dat', 'SETTING.TXT']);
+for (const name of ['Pattern.dat', 'arbitrary.dat']) assert.deepEqual(selectedHandles(file(name), null, listing.setting).map(entry => entry.name), [name, 'SETTING.TXT']);
+assert.deepEqual(selectedHandles(listing.scans[2], listing.angs[1], listing.setting), [listing.scans[2], listing.angs[1]]);
+const chosen = selectedHandles(listing.scans[2], defaultANG(listing.scans[2], listing.angs), listing.setting);
+const files = await filesFromHandles(chosen);
+assert.equal(reads, 2);
+assert.equal(fileHandleFor(files[0]), chosen[0]);
+assert.equal(fileHandleFor(files[1]), chosen[1]);
+const folders = new SourceFolders();
+await folders.accept(dir, files[0], true);
+assert.equal(await folders.find(files[0]), dir);
+console.log('scan folder tests passed');
+
+const vendorScan = await listScanFolder({async *values(){yield file('master-region.h5oina');}});
+assert.equal(vendorScan.scans[0].name, 'master-region.h5oina');

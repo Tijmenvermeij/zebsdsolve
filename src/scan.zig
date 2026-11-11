@@ -72,6 +72,8 @@ pub const Info = struct {
     /// fractions of the pattern's width and height; z in fractions of its height): the mean of
     /// its values where it stores one per map cell
     pc: [3]f64 = @splat(std.math.nan(f64)),
+    /// Scalar adapter provenance or why optional ANG PC metadata was not applied.
+    pc_note: []const u8 = "",
 };
 
 pub const Scan = struct {
@@ -92,6 +94,8 @@ pub const Scan = struct {
     /// Discovery reads metadata only; values are fetched on request.
     overview_addr: ?u64 = null,
     overview_kind: OverviewKind = .none,
+    /// ANG IQ in verified UP pixel order; no pattern pixels are read to display it.
+    overview_values: []f32 = &.{},
     why: []const u8 = "",
 
     /// Advance only the pattern dataset's chunk lookup, without reading patterns.
@@ -117,9 +121,13 @@ pub const Scan = struct {
     }
 
     pub fn readStoredOverview(self: *Scan, out: []f32) !void {
-        const address = self.overview_addr orelse return error.NoStoredOverview;
         const n: usize = @intCast(self.count());
         if (out.len != n) return error.BadLength;
+        if (self.overview_values.len != 0) {
+            @memcpy(out, self.overview_values);
+            return;
+        }
+        const address = self.overview_addr orelse return error.NoStoredOverview;
         const values = try self.gpa.alloc(f64, n);
         defer self.gpa.free(values);
         if ((try self.h5.?.numbers(address, values)) != n) return error.InvalidStoredOverview;
@@ -196,15 +204,20 @@ pub const Scan = struct {
             self.ds.deinit(gpa);
             gpa.free(self.offsets);
             gpa.free(self.background);
+            gpa.free(self.overview_values);
         }
         const f = &self.files[0];
         var head: [8]u8 = @splat(0);
-        try f.read(0, head[0..@intCast(@min(8, f.size))]);
         const ext = extension(paths[0]);
+        const sniff_len: usize = @intCast(@min(8, f.size));
+        if (eqlIgnoreCase(ext, "up1") or eqlIgnoreCase(ext, "up2")) {
+            // Raw UP metadata must not prefetch a cache block of pattern payload.
+            try f.readv(&.{.{ .offset = 0, .len = sniff_len }}, head[0..sniff_len]);
+        } else try f.read(0, head[0..sniff_len]);
         if (std.mem.eql(u8, &head, "\x89HDF\r\n\x1a\n")) {
             try self.openHdf5(hints);
         } else if (eqlIgnoreCase(ext, "up1") or eqlIgnoreCase(ext, "up2")) {
-            try self.openUp(eqlIgnoreCase(ext, "up2"), hints);
+            try self.openUp(eqlIgnoreCase(ext, "up2"), paths, hints);
         } else if (eqlIgnoreCase(ext, "ebsp")) {
             try self.openEbsp(hints);
         } else if (eqlIgnoreCase(ext, "dat")) {
@@ -222,6 +235,7 @@ pub const Scan = struct {
         self.ds.deinit(gpa);
         gpa.free(self.offsets);
         gpa.free(self.background);
+        gpa.free(self.overview_values);
         for (self.files) |*f| f.close();
         gpa.free(self.files);
         gpa.destroy(self);
@@ -574,32 +588,81 @@ pub const Scan = struct {
 
     // ── EDAX .up1 / .up2 ──
 
-    fn openUp(self: *Scan, is16: bool, hints: Hints) !void {
+    fn openUp(self: *Scan, is16: bool, paths: []const []const u8, hints: Hints) !void {
+        var sidecar: ?usize = null;
+        for (paths[1..], 1..) |path, k| {
+            if (eqlIgnoreCase(extension(path), "ang")) {
+                if (sidecar != null) return error.DuplicateANGSidecar;
+                sidecar = k;
+            }
+        }
         const f = &self.files[0];
         if (f.size < 16) return error.BadScanFile;
-        const version = try f.int(u32, 0);
-        const w = try f.int(u32, 4);
-        const hgt = try f.int(u32, 8);
-        const off = try f.int(u32, 12);
-        if (w == 0 or hgt == 0 or off < 16 or off > f.size) return error.BadScanFile;
+        var header: [42]u8 = @splat(0);
+        try f.readv(&.{.{ .offset = 0, .len = 16 }}, header[0..16]);
+        const version = std.mem.readInt(u32, header[0..4], .little);
+        const w = std.mem.readInt(u32, header[4..8], .little);
+        const hgt = std.mem.readInt(u32, header[8..12], .little);
+        const off = std.mem.readInt(u32, header[12..16], .little);
+        if ((version != 1 and version < 3) or w == 0 or hgt == 0 or off < 16 or off > f.size) return error.BadScanFile;
         const info = &self.info;
         self.format = .edax_up;
         info.pat_w = w;
         info.pat_h = hgt;
         info.pixel = if (is16) .u16 else .u8;
         self.data_offset = off;
-        const pb = self.patternBytes();
+        const pb = std.math.mul(u64, @as(u64, w) * hgt, self.bytesPerPx()) catch return error.BadScanFile;
+        if ((f.size - off) % pb != 0) return error.UPIncompletePattern;
         const n = (f.size - off) / pb;
-        if (version >= 3 and off >= 41) {
-            const nx = try f.int(u32, 16);
-            const ny = try f.int(u32, 20);
-            if (@as(u64, nx) * ny == n) {
-                info.cols = nx;
-                info.rows = ny;
-                info.step_x_um = @bitCast(try f.int(u64, 25));
-                info.step_y_um = @bitCast(try f.int(u64, 33));
-            }
+        if (n == 0 or n > std.math.maxInt(u32)) return error.ScanShapeMismatch;
+        var nx: u32 = 0;
+        var ny: u32 = 0;
+        var dx: f64 = std.math.nan(f64);
+        var dy = dx;
+        var hex: u8 = 0;
+        var extra: u8 = 0;
+        if (version >= 3) {
+            if (off < 42) return error.BadScanFile;
+            try f.readv(&.{.{ .offset = 16, .len = 26 }}, header[16..42]);
+            // UP v3+ uses an unaligned, packed header (extraPatterns is a flag).
+            extra = header[16];
+            nx = std.mem.readInt(u32, header[17..21], .little);
+            ny = std.mem.readInt(u32, header[21..25], .little);
+            hex = header[25];
+            dx = @bitCast(std.mem.readInt(u64, header[26..34], .little));
+            dy = @bitCast(std.mem.readInt(u64, header[34..42], .little));
         }
+        if (sidecar) |k| {
+            if (hex != 0) return error.UnsupportedUPHexGrid;
+            if (version >= 3) {
+                if (@as(u64, nx) * ny != n or nx == 0 or ny == 0) return if (extra != 0) error.AmbiguousUPExtraPatterns else error.UPPatternCountMismatch;
+                if (!validStep(dx) or !validStep(dy)) return error.InvalidUPStep;
+            }
+            const ang = try @import("ang.zig").load(self.gpa, &self.files[k], n, w, hgt);
+            errdefer self.gpa.free(ang.iq);
+            if (version >= 3 and (nx != ang.cols or ny != ang.rows)) return error.ScanShapeMismatch;
+            if (version >= 3 and (!sameStep(dx, ang.step_x_um) or !sameStep(dy, ang.step_y_um))) return error.UPANGStepMismatch;
+            if ((hints.rows != 0 and hints.rows != ang.rows) or (hints.cols != 0 and hints.cols != ang.cols)) return error.ScanShapeMismatch;
+            info.rows = ang.rows;
+            info.cols = ang.cols;
+            info.step_x_um = ang.step_x_um;
+            info.step_y_um = ang.step_y_um;
+            if (ang.pc) |pc| info.pc = pc;
+            info.pc_note = ang.pc_note;
+            self.overview_values = ang.iq;
+            self.overview_kind = .image_quality;
+            return;
+        }
+        // Preserve standalone UP/manual-shape behavior. A valid rectangular v3+
+        // header supplies the map; an ambiguous extra/hex stream stays a raw strip.
+        if (version >= 3 and hex == 0 and nx != 0 and ny != 0 and @as(u64, nx) * ny == n) {
+            if (!validStep(dx) or !validStep(dy)) return error.InvalidUPStep;
+            info.cols = nx;
+            info.rows = ny;
+            info.step_x_um = dx;
+            info.step_y_um = dy;
+        } else if (version >= 3 and hex == 0 and extra == 0 and hints.rows == 0 and hints.cols == 0) return error.UPPatternCountMismatch;
+        if ((hints.rows == 0) != (hints.cols == 0)) return error.ScanShapeMismatch;
         if (hints.rows != 0 and hints.cols != 0) {
             info.rows = hints.rows;
             info.cols = hints.cols;
@@ -755,6 +818,13 @@ pub const Scan = struct {
     }
 };
 
+fn validStep(x: f64) bool {
+    return std.math.isFinite(x) and x > 0;
+}
+fn sameStep(a: f64, b: f64) bool {
+    return @abs(a - b) <= @max(@max(a, b) * 1e-6, @min(5e-6, @min(a, b) * 0.01));
+}
+
 fn splitX(val: []const u8) ?[2]u32 {
     const x = std.mem.indexOfScalar(u8, val, 'x') orelse return null;
     const a = std.fmt.parseInt(u32, std.mem.trim(u8, val[0..x], " "), 10) catch return null;
@@ -810,4 +880,49 @@ test "detector mask defaults follow the acquisition format" {
     inline for (std.meta.tags(Format)) |format| {
         try std.testing.expectEqual(format != .h5_oxford, format.defaultMask());
     }
+}
+
+test "UP ANG scalar maps clean up on success, parse errors and allocation failures" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var raw: [42 + 6 * 80]u8 = @splat(0);
+    std.mem.writeInt(u32, raw[0..4], 3, .little);
+    std.mem.writeInt(u32, raw[4..8], 10, .little);
+    std.mem.writeInt(u32, raw[8..12], 8, .little);
+    std.mem.writeInt(u32, raw[12..16], 42, .little);
+    std.mem.writeInt(u32, raw[17..21], 3, .little);
+    std.mem.writeInt(u32, raw[21..25], 2, .little);
+    std.mem.writeInt(u64, raw[26..34], @bitCast(@as(f64, 0.025)), .little);
+    std.mem.writeInt(u64, raw[34..42], @bitCast(@as(f64, 0.05)), .little);
+    const header = "# GRID: SqrGrid\n# XSTEP: .025\n# YSTEP: .05\n# NCOLS_ODD: 3\n# NCOLS_EVEN: 3\n# NROWS: 2\n";
+    const records = "0 0 0 0 0 1 0 0\n0 0 0 .025 0 2 0 0\n0 0 0 .05 0 3 0 0\n0 0 0 0 .05 4 0 0\n0 0 0 .025 .05 5 0 0\n0 0 0 .05 .05 6 0 0\n";
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "scan.up1", .data = &raw });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "scan.ang", .data = header ++ records });
+    const up = try tmp.dir.realPathFileAlloc(std.testing.io, "scan.up1", gpa);
+    defer gpa.free(up);
+    const ang = try tmp.dir.realPathFileAlloc(std.testing.io, "scan.ang", gpa);
+    defer gpa.free(ang);
+    const paths: []const []const u8 = &.{ up, ang };
+    {
+        const s = try Scan.open(gpa, paths, .{});
+        defer s.close();
+        try std.testing.expectEqual(@as(u64, 50), s.files[0].bytes_read);
+        var values: [6]f32 = undefined;
+        try s.readStoredOverview(&values);
+        try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4, 5, 6 }, &values);
+        try std.testing.expectEqual(@as(u64, 50), s.files[0].bytes_read);
+    }
+    const allocation_case = struct {
+        fn run(allocator: Allocator, names: []const []const u8) !void {
+            const s = try Scan.open(allocator, names, .{});
+            s.close();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(gpa, allocation_case.run, .{paths});
+    // Failure after IQ allocation and registration, before ownership is transferred.
+    try std.testing.expectError(error.ScanShapeMismatch, Scan.open(gpa, paths, .{ .rows = 1, .cols = 6 }));
+    try std.testing.expectError(error.DuplicateANGSidecar, Scan.open(gpa, &.{ up, ang, ang }, .{}));
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "scan.ang", .data = header ++ "0 0 0 0 0 1 0 0\n0 0 0 .05 0 3 0 0\n" });
+    try std.testing.expectError(error.ANGCoordinatesNotRowMajor, Scan.open(gpa, paths, .{}));
 }

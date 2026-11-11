@@ -1,13 +1,20 @@
+import { isOxfordH5 } from "./oxford-export-policy.js";
 // Uses native engine snapshots and map pixels; no orientation or frame calculations.
 import { exportH5, exportOxford } from "./hdf5-export.js";
-const descriptor = (file) => ({ name: file.name, size: file.size, lastModified: file.lastModified });
-async function png(rgba, scan) {
-  const canvas = document.createElement("canvas"); canvas.width = scan.cols; canvas.height = scan.rows;
-  canvas.getContext("2d").putImageData(new ImageData(rgba, scan.cols, scan.rows), 0, 0);
-  return new Promise((resolve, reject) => canvas.toBlob((blob) => blob ? resolve(blob) : reject(new Error("PNG map encoding failed.")), "image/png"));
+// putImageData copies the native RGBA raster at scan resolution without filtering.
+async function mapPNG(engine, kind) {
+  const { rows, cols } = engine.scan;
+  const pixels = engine.map(kind);
+  if (!Number.isSafeInteger(rows) || rows <= 0 || !Number.isSafeInteger(cols) || cols <= 0 || pixels.length !== rows * cols * 4) throw new Error("Invalid native map dimensions.");
+  const canvas = typeof OffscreenCanvas === "function" ? new OffscreenCanvas(cols, rows) : Object.assign(document.createElement("canvas"), { width: cols, height: rows });
+  const context = canvas.getContext("2d");
+  if (!context) throw new Error("PNG map canvas is unavailable.");
+  context.putImageData(new ImageData(new Uint8ClampedArray(pixels), cols, rows), 0, 0);
+  if (canvas.convertToBlob) return canvas.convertToBlob({ type: "image/png" });
+  return new Promise((resolve, reject) => canvas.toBlob(blob => blob ? resolve(blob) : reject(new Error("PNG map encoding failed.")), "image/png"));
 }
 export async function* batchArtifacts(engine, job, completed = new Set()) {
-  const prefix = job.outputStem, oxford = /Oxford h5oina/i.test(job.scanInfo.format);
+  const prefix = job.outputStem, oxford = isOxfordH5(job.scanInfo.format);
   let name = prefix + ".h5";
   if (!completed.has(name)) {
     const snapshot = engine.exportSnapshot();
@@ -19,15 +26,8 @@ export async function* batchArtifacts(engine, job, completed = new Set()) {
     if (oxford) { const snapshot = engine.exportOxfordSnapshot(); yield { name, data: await exportOxford(snapshot, job.sourceFiles[0], snapshot.oxford_frame) }; }
     else yield { name, data: engine.exportText("ang") };
   }
-  name = prefix + "_settings.json";
-  if (!completed.has(name)) yield { name, data: JSON.stringify({ zebsdsolve: engine.version, scan: job.sourceFiles[0].name,
-    geometry_convention: oxford ? "oxford-calibrated-v1" : "generic-v1", geometry: job.geometry, settings: job.settings,
-    source_files: job.sourceFiles.map(descriptor), master_files: job.masterFiles.map(descriptor), phases: job.phases,
-    opening_hints: job.openHints, acquisition_geometry: job.openGeometry, scan_info: job.scanInfo,
-    map_source: "native engine map: IPF-Z and detector NCC; same frame and colors as the GUI",
-  }, null, 2) };
   for (const [kind, suffix] of [["ipf_z", "_IPF-Z.png"], ["ncc", "_NCC.png"]]) {
     name = prefix + suffix;
-    if (!completed.has(name)) yield { name, data: await png(engine.map(kind), job.scanInfo) };
+    if (!completed.has(name)) yield { name, data: await mapPNG(engine, kind) };
   }
 }

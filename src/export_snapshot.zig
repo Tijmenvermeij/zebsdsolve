@@ -49,11 +49,9 @@ fn snapshotImpl(e: *engine.Engine, requested: ?rot.Quat, is_oxford: bool) ![]u8 
     defer e.gpa.free(crystal);
     @memset(crystal, rot.quat_identity);
     if (is_oxford) {
-        // The acquisition writer's fitted-plane PC/frame mapping has not been validated.
-        if (geometry.plane_kind != 0) return error.OxfordPlaneExportNotValidated;
         if (transform == null or context.calibration.metadata != null) {
             try context.calibration.requireSupported();
-            if (geometry.px_um != 0) return error.OxfordScanTranslationNotValidated;
+            if (geometry.plane_kind == 0 and geometry.px_um != 0) return error.OxfordScanTranslationNotValidated;
         }
         for (geometry.pc) |x| if (!std.math.isFinite(x)) return error.InvalidOxfordGeometry;
         for (geometry.rot) |x| if (!std.math.isFinite(x)) return error.InvalidOxfordGeometry;
@@ -121,7 +119,12 @@ fn snapshotImpl(e: *engine.Engine, requested: ?rot.Quat, is_oxford: bool) ![]u8 
         try value(w, requested == null);
         try w.writeAll(",\"phase_generation\":");
         try value(w, context.phase_generation);
-        try w.writeAll(",\"phase_crystal_to_master\":[");
+        const preserve_source_pc = geometry.plane_kind != 0;
+        try w.writeAll(",\"preserve_source_pattern_centres\":");
+        try value(w, preserve_source_pc);
+        try w.writeAll(",\"warnings\":[");
+        if (preserve_source_pc) try value(w, "Orientations were indexed with a fitted source plane. Standard Oxford pattern-centre fields retain acquisition values. Fitted values are stored in /zebsdsolve/PatternCentres.");
+        try w.writeAll("],\"phase_crystal_to_master\":[");
         for (crystal, 0..) |c, i| {
             if (i != 0) try w.writeByte(',');
             try numbers(w, c);

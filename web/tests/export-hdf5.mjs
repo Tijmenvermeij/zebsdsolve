@@ -184,5 +184,25 @@ for (const location of ["zebsdsolve", "EBSD", "Data Processing", "soft-zebsdsolv
     assert.equal(externalOpens, 0, `${location} must not open its external target`);
   } finally { h.FS.open = fsOpen; }
 }
+// Active planes preserve every source PC field, including unindexed pixels.
+for (const plane_kind of [1, 2]) {
+  const fitted = structuredClone(s); fitted.geometry.plane_kind = plane_kind;
+  const warnings = [], originalWarn = console.warn;
+  console.warn = (message) => warnings.push(message);
+  let output;
+  try { output = await exportOxford(fitted, source, frame); }
+  finally { console.warn = originalWarn; }
+  assert.equal(warnings.length, 1);
+  read(output, (f) => {
+    assert.deepEqual(Array.from(f.get("1/EBSD/Data/Pattern Center X").value), [.2,.2,.2,.2]);
+    assert.equal(f.get("1/EBSD/Data/Pattern Center X").dtype, "<d");
+    assert.equal(f.get("1/EBSD/Data/Pattern Center Y"), null);
+    assert.equal(f.get("1/EBSD/Data/Detector Distance"), null);
+    assert.deepEqual(Array.from(f.get("zebsdsolve/PatternCentres").value), fitted.pattern_centres);
+    const policy = JSON.parse(f.get("zebsdsolve/ProvenanceJSON").value).oxford_frame;
+    assert.equal(policy.preserve_source_pattern_centres, true);
+    assert.deepEqual(policy.warnings, warnings);
+  });
+}
 h.FS.unlink("/external.h5");
 console.log("HDF5 browser export checks passed: EMS selected/alternative phases, Oxford phase append, current solutions/metadata attributes/links, ROI, pattern centres, pattern omission and aliases, static background, 64-bit/fixed-string types, processing omission, frame/phase/memory/reference/structural-link guards.");

@@ -77,6 +77,13 @@ try {
     document.getElementById('btn-example').click();
     await waitBatch(()=>document.getElementById('app').dataset.busy==='0' && ze.phases.length===1 && ze.scan.rows===55);
     await ze._queue;
+    window.editOutputName=async(row,value)=>{
+      [...row.querySelectorAll('button')].find(button=>button.textContent==='Output…').click();
+      await waitBatch(()=>document.querySelector('#batch-output-dialog')?.open);
+      document.getElementById('batch-output-name').value=value;
+      document.getElementById('batch-output-save').click();
+      await waitBatch(()=>!document.getElementById('batch-output-dialog'));
+    };
     window.expected=[];window.fixtureBaseGeo=ze.geometry;
     window.fixtureSource=ze.state.files.find(file=>file?.name==='patterns_v2.h5');
     window.addConfigured=async(settings,geometry=null)=>{
@@ -84,8 +91,9 @@ try {
       ze.configure(settings);if(geometry)ze.setGeometry(geometry);
       document.getElementById('btn-batch-current').click();
       await waitBatch(()=>document.querySelectorAll('#batch-jobs tr').length===expected.length+1);
-      const row=[...document.querySelectorAll('#batch-jobs tr')].at(-1),input=row.querySelector('input');
-      input.value='Ni_test';input.dispatchEvent(new Event('change'));
+      const row=[...document.querySelectorAll('#batch-jobs tr')].at(-1);
+      require(row.querySelector('.batch-output-name').textContent.includes('_ZEBSDsolve_BW'+settings.bandwidth),'Default name lacks bandwidth');
+      await editOutputName(row,'Ni_test');
       await ze.index();
       expected.push({snapshot:ze.exportSnapshot(),ang:new TextDecoder().decode(ze.exportText('ang')),ipf:Array.from(ze.map('ipf_z')),ncc:Array.from(ze.map('ncc')),settings:ze.settings,geometry:ze.geometry});
     };
@@ -99,7 +107,7 @@ try {
     const access={name:testOutput.name,getDirectoryHandle:testOutput.getDirectoryHandle.bind(testOutput),getFileHandle:testOutput.getFileHandle.bind(testOutput),queryPermission:async()=> 'granted',requestPermission:async()=> 'granted'};
     window.showDirectoryPicker=async()=>access;
     document.getElementById('btn-batch-folder').click();
-    await waitBatch(()=>document.getElementById('batch-folder').textContent===testOutput.name);
+    await waitBatch(()=>[...document.querySelectorAll('#batch-jobs tr')].every(row=>row.children[1].textContent===testOutput.name));
     document.getElementById('btn-batch-run').click();
     await waitBatch(()=>document.querySelectorAll('#batch-jobs tr[data-status=complete]').length===2 && document.getElementById('app').dataset.busy==='0');
     require(JSON.stringify(ze.settings)===JSON.stringify(beforeBatch.settings),'Interactive settings changed');
@@ -109,11 +117,17 @@ try {
   console.error('batch: two jobs indexed, interactive state retained');
   const first = await evaluate(`
     const h=await import('/web/app/js/vendor/h5wasm/hdf5_hl.js');await h.ready;
-    const manifest=JSON.parse(await (await (await testOutput.getFileHandle('batch.json')).getFile()).text());
-    require(manifest.jobs.length===2 && manifest.jobs.every(j=>j.status==='complete'),'Manifest completion');
-    require(manifest.jobs[0].directory==='Ni_test' && manifest.jobs[1].directory==='Ni_test_02','Collision suffix');
+    const configs=[];
+    for(const prefix of ['Ni_test','Ni_test_02']){
+      const dir=await testOutput.getDirectoryHandle(prefix);
+      const config=JSON.parse(await(await(await dir.getFileHandle(prefix+'.json')).getFile()).text());
+      require(config.batch.status==='complete' && config.batch.outputs.length===5,'Journal completion');configs.push(config);
+    }
+    require(configs[0].batch.directory==='Ni_test' && configs[1].batch.directory==='Ni_test_02','Collision suffix');
     for(let k=0;k<2;k++){
-      const job=manifest.jobs[k],dir=await testOutput.getDirectoryHandle(job.directory),prefix=job.outputStem;
+      const job=configs[k].batch,dir=await testOutput.getDirectoryHandle(job.directory),prefix=job.outputStem;
+      const entries=[];for await(const name of dir.keys())entries.push(name);
+      require(entries.sort().join(',')===[prefix+'.ang',prefix+'.h5',prefix+'_IPF-Z.png',prefix+'_NCC.png',prefix+'.json'].sort().join(','),'Expected exactly five same-stem files');
       const read=async name=>(await (await dir.getFileHandle(name)).getFile());
       const bytes=new Uint8Array(await (await read(prefix+'.h5')).arrayBuffer());
       h.FS.writeFile('/batch-result.h5',bytes);const file=new h.File('/batch-result.h5','r');
@@ -126,16 +140,20 @@ try {
         require(pixels.every((v,i)=>v===expected[k].ipf[i]),'Native IPF map changed');
         require(file.get('zebsdsolve/Maps/NCC').shape.join(',')==='55,75','Quality raster shape');
       }finally{file.close();h.FS.unlink('/batch-result.h5');}
+      for (const [suffix, reference] of [['_IPF-Z.png',expected[k].ipf],['_NCC.png',expected[k].ncc]]) {
+        const bitmap=await createImageBitmap(await read(prefix+suffix));
+        require(bitmap.width===75 && bitmap.height===55,'PNG scan dimensions changed');
+        const canvas=new OffscreenCanvas(75,55),context=canvas.getContext('2d');context.drawImage(bitmap,0,0);bitmap.close();
+        const pixels=context.getImageData(0,0,75,55).data;
+        require(pixels.length===reference.length && pixels.every((v,i)=>v===reference[i]),'PNG differs from native '+suffix);
+      }
       require(await (await read(prefix+'.ang')).text()===expected[k].ang,'ANG differs from individual run');
-      const config=JSON.parse(await (await read(prefix+'_settings.json')).text());
+      const config=JSON.parse(await (await read(prefix+'.json')).text());
       require(config.settings.bandwidth===expected[k].settings.bandwidth,'Frozen bandwidth');
       require(JSON.stringify(config.geometry)===JSON.stringify(expected[k].geometry),'Frozen geometry');
-      for(const [suffix,pixels] of [['_IPF-Z.png',expected[k].ipf],['_NCC.png',expected[k].ncc]]){
-        const bitmap=await createImageBitmap(await read(prefix+suffix));const canvas=document.createElement('canvas');canvas.width=bitmap.width;canvas.height=bitmap.height;const ctx=canvas.getContext('2d');ctx.drawImage(bitmap,0,0);const png=ctx.getImageData(0,0,canvas.width,canvas.height).data;
-        require(png.every((v,i)=>v===pixels[i]),'PNG differs from native map');bitmap.close();
-      }
+
     }
-    return {jobs:manifest.jobs.map(j=>({status:j.status,folder:j.directory,bandwidth:j.settings.bandwidth,outputs:j.outputs.length})),interactiveUnchanged:true};
+    return {jobs:configs.map(c=>({status:c.batch.status,folder:c.batch.directory,bandwidth:c.settings.bandwidth,outputs:c.batch.outputs.length})),interactiveUnchanged:true};
   `);
 
   const loading = await evaluate(`
@@ -149,25 +167,32 @@ try {
     require(JSON.stringify(ze.geometry.pc)===JSON.stringify(fixtureBaseGeo.pc),'As-opened geometry became fitted geometry');
     document.getElementById('btn-batch-clear').click();await pause(100);
     document.getElementById('btn-batch-current').click();await waitBatch(()=>document.querySelectorAll('#batch-jobs tr').length===1);
-    let permissionCalls=0;const granted=async()=> 'granted';
-    window.showDirectoryPicker=async()=>({name:testOutput.name,getDirectoryHandle:testOutput.getDirectoryHandle.bind(testOutput),getFileHandle:testOutput.getFileHandle.bind(testOutput),queryPermission:granted,requestPermission:async()=>{permissionCalls++;return 'denied';}});
+    let permissionCalls=0;const granted=async()=> 'granted',prompt=async()=> 'prompt';
+    const access=requestPermission=>({name:testOutput.name,getDirectoryHandle:testOutput.getDirectoryHandle.bind(testOutput),getFileHandle:testOutput.getFileHandle.bind(testOutput),queryPermission:prompt,requestPermission});
+    window.showDirectoryPicker=async()=>access(async()=>{permissionCalls++;return 'denied';});
     document.getElementById('btn-batch-folder').click();await pause(100);
-    document.getElementById('btn-batch-run').click();
-    await waitBatch(()=>document.getElementById('status').textContent.includes('not granted') && document.getElementById('app').dataset.busy==='0');
+    document.getElementById('btn-batch-run').click();await waitBatch(()=>document.querySelector('#batch-folder-dialog')?.open);
+    require(document.getElementById('btn-batch-clear').disabled,'Clear allowed during folder preparation');
+    document.getElementById('btn-batch-clear').dispatchEvent(new Event('click'));
+    require(document.querySelectorAll('#batch-jobs tr').length===1,'Clear discarded pending queue');
+    document.querySelector('#batch-folder-dialog .primary').click();
+    await waitBatch(()=>document.querySelector('#batch-folder-dialog .folder-error')?.textContent.includes('not granted'));
     require(document.querySelector('#batch-jobs tr').dataset.status==='queued','Permission rejection indexed a job');
     require(permissionCalls===1,'Unexpected permission requests');
-    window.showDirectoryPicker=async()=>({name:testOutput.name,getDirectoryHandle:testOutput.getDirectoryHandle.bind(testOutput),getFileHandle:testOutput.getFileHandle.bind(testOutput),queryPermission:granted,requestPermission:()=>{permissionCalls++;return new Promise(r=>window.resolvePermission=r);}});
+    [...document.querySelectorAll('#batch-folder-dialog button')].find(button=>button.textContent==='Cancel').click();
+    await waitBatch(()=>document.getElementById('app').dataset.batchRunning==='0');
+    window.showDirectoryPicker=async()=>access(()=>{permissionCalls++;return new Promise(resolve=>window.resolvePermission=resolve);});
     document.getElementById('btn-batch-folder').click();await pause(100);
-    document.getElementById('btn-batch-run').click();await waitBatch(()=>!!window.resolvePermission);
+    document.getElementById('btn-batch-run').click();await waitBatch(()=>document.querySelector('#batch-folder-dialog')?.open);
+    document.querySelector('#batch-folder-dialog .primary').click();await waitBatch(()=>!!window.resolvePermission);
     document.getElementById('btn-batch-run').dispatchEvent(new Event('click'));
-    document.getElementById('btn-stop').click();resolvePermission('granted');
-    await waitBatch(()=>document.getElementById('app').dataset.busy==='0');
+    [...document.querySelectorAll('#batch-folder-dialog button')].find(button=>button.textContent==='Cancel').click();
+    resolvePermission('granted');await waitBatch(()=>document.getElementById('app').dataset.batchRunning==='0');
     require(permissionCalls===2,'Duplicate launch entered permission path');
-    require(document.querySelector('#batch-jobs tr').dataset.status==='queued','Stop during preparation started indexing');
-    require([...document.querySelectorAll('#tabs button')].every(b=>!b.disabled),'Tabs stayed locked');
+    require(document.querySelector('#batch-jobs tr').dataset.status==='queued','Cancelled preparation started indexing');
+    require([...document.querySelectorAll('#tabs button')].every(button=>!button.disabled),'Tabs stayed locked');
     document.getElementById('btn-batch-clear').click();await pause(100);
     window.showDirectoryPicker=async()=>({name:testOutput.name,getDirectoryHandle:testOutput.getDirectoryHandle.bind(testOutput),getFileHandle:testOutput.getFileHandle.bind(testOutput),queryPermission:granted,requestPermission:granted});
-    document.getElementById('btn-batch-folder').click();await pause(100);
     return {geometryBaseline:true,denialVisible:true,launchSerialized:true,stopBeforeIndex:true};
   `);
   console.error('batch: job load and launch guards passed');
@@ -202,8 +227,12 @@ try {
   await evaluate(`
     require(ze.scan.rows===415 && ze.phases.length===1,'P6 acquisition fixture failed');
     ze.configure({bandwidth:16,fit_bandwidth:16,refine_iters:1,roi_x:165,roi_y:284,roi_w:1,roi_h:1,static_background:'none',dynamic_background:'subtract'});
+    const originalPC=ze.geometry.pc;
+    ze.setGeometry({planeKind:1,plane:[1e-7,0,originalPC[0],0,1e-7,originalPC[1],0,0,originalPC[2],0,0,1]});
     document.getElementById('btn-batch-current').click();await waitBatch(()=>document.querySelectorAll('#batch-jobs tr').length===1);
-    const name=document.querySelector('#batch-jobs input');name.value='Ti_P6_test';name.dispatchEvent(new Event('change'));
+    require(document.querySelector('.batch-warning')?.textContent.includes('Oxford PCs retained'),'Plane warning not visible');
+    await editOutputName(document.querySelector('#batch-jobs tr'),'Ti_P6_test');
+    document.getElementById('btn-batch-folder').click();await waitBatch(()=>document.querySelector('#batch-jobs tr').children[1].textContent===testOutput.name);
     await ze.index();window.expectedOxford=ze.exportOxfordSnapshot();window.expectedP6=ze.exportSnapshot();
     document.getElementById('btn-batch-run').click();await waitBatch(()=>document.querySelector('#batch-jobs tr').dataset.status==='complete' && document.getElementById('app').dataset.busy==='0');
   `);
@@ -217,13 +246,16 @@ try {
       require(!data.get('Processed Patterns')&&!data.get('Unprocessed Patterns'),'Oxford patterns must be absent');
       const euler=data.get('Euler').value;
       for(let j=0;j<3;j++)require(Math.abs(euler[cell*3+j]-expectedOxford.results.euler[cell*3+j])<1e-6,'Oxford frame differs from individual run');
+      const sourcePCs=[['Pattern Center X',[0.480416476726532,0.48041751980781555,0.4804185628890991]],['Pattern Center Y',[1.2126353979110718,1.2126353979110718,1.2126353979110718]],['Detector Distance',[0.5900739431381226,0.5900739431381226,0.5900739431381226]]];
+      for(const [field,values] of sourcePCs) for(let j=0;j<3;j++)require(data.get(field).value[j]===values[j],'Original Oxford PC changed: '+field);
       const provenance=JSON.parse(out.get('zebsdsolve/ProvenanceJSON').value);
+      require(provenance.oxford_frame.preserve_source_pattern_centres===true,'Plane preservation policy missing');
       const frame={...provenance.oxford_frame},reference={...expectedOxford.oxford_frame};delete frame.phase_generation;delete reference.phase_generation;
       require(JSON.stringify(frame)===JSON.stringify(reference),'Oxford frame provenance changed');
       const tilt=header.get('Tilt Angle').value[0];require(Math.abs(tilt-expectedOxford.calibration.effective_tilt_radians)<1e-6,'Oxford tilt changed');
       const ids=out.get('zebsdsolve/PhaseIDMap').value;require(data.get('Phase').value[cell]===ids[expectedOxford.results.phase[cell]],'Oxford phase mapping wrong');
     }finally{out.close();h.FS.unlink('/p6-result.h5oina');}
-    require((await(await(await testOutput.getFileHandle('batch.json')).getFile()).text()).includes('Ni_test_02'),'Earlier manifest overwritten');
+    require(JSON.parse(await(await(await(await testOutput.getDirectoryHandle('Ni_test_02')).getFileHandle('Ni_test_02.json')).getFile()).text()).batch.status==='complete','Earlier job journal overwritten');
     return {status:'complete',outputBytes:file.size,patternsOmitted:true,frameMatchesIndividual:true};
   `.replace('acquisitionSize',String((await import('node:fs')).statSync(acquisition).size)));
   console.error('batch: original P6 Oxford output validated');
@@ -234,17 +266,17 @@ try {
     const proxy={name:dir.name,queryPermission:async()=> 'granted',getDirectoryHandle:dir.getDirectoryHandle.bind(dir),getFileHandle:dir.getFileHandle.bind(dir)};
     const getDir=proxy.getDirectoryHandle;
     proxy.getDirectoryHandle=async(...args)=>{const sub=await getDir(...args);return {name:sub.name,getDirectoryHandle:sub.getDirectoryHandle.bind(sub),getFileHandle:async(...a)=>{
-      const actual=await sub.getFileHandle(...a);if(a[0]!=='result.txt')return actual;
+      const actual=await sub.getFileHandle(...a);if(!a[0].endsWith('.h5'))return actual;
       const handle={native:actual,name:actual.name,getFile:actual.getFile.bind(actual),isSameEntry:other=>actual.isSameEntry(other.native||other),createWritable:async()=>{
         const stream=await actual.createWritable();return {write:async data=>{await stream.write(data);if(fail){fail=false;throw Error('Injected native write failure');}},close:stream.close.bind(stream),abort:stream.abort.bind(stream)};
       }};handles.set('output',actual);return handle;
     }};};
     const info={rows:1,cols:1,patH:1,patW:1,dtype:'uint8',format:'fixture'};
-    const queue=new BatchQueue({createEngine:async()=>({scan:info,device:{destroy(){}},configure(){},openScan:async()=>info,setGeometry(){},clearPhases(){},addPhase:async()=>{},indexBegin:async()=>{indexes++;},get indexStatus(){return {total:1,done:0};},indexStep:async()=>({left:0,total:1,done:1,sweep:0,sweeps:1}),dispose:async()=>{}}),artifacts:async function*(){yield{name:'result.txt',data:'own result'};}});
+    const queue=new BatchQueue({createEngine:async()=>({exportResultCheckpoint(){return new Uint8Array([1]);},scan:info,device:{destroy(){}},configure(){},openScan:async()=>info,setGeometry(){},clearPhases(){},addPhase:async()=>{},indexBegin:async()=>{indexes++;},get indexStatus(){return {total:1,done:0};},indexStep:async()=>({left:0,total:1,done:1,sweep:0,sweeps:1}),dispose:async()=>{}}),artifacts:async function*(engine,job){yield{name:job.outputStem+'.h5',data:'own result'};yield{name:job.outputStem+'.ang',data:'own angles'};for(const suffix of ['_IPF-Z.png','_NCC.png'])yield{name:job.outputStem+suffix,data:'pixels'};}});
     queue.setDirectory(proxy);queue.add({sourceFiles:[new File(['x'],'scan.h5')],masterFiles:[new File(['x'],'master.npz')],settings:{batch:1},geometry:{},scanInfo:info});
     await queue.run();require(queue.jobs[0].status==='export-pending','Expected native write failure');
     const folder=await dir.getDirectoryHandle(queue.jobs[0].folderName),original=handles.get('output');
-    await folder.removeEntry('result.txt');const foreign=await folder.getFileHandle('result.txt',{create:true});const writer=await foreign.createWritable();await writer.write('foreign content');await writer.close();
+    const outputName=queue.jobs[0].outputStem+'.h5';await folder.removeEntry(outputName);const foreign=await folder.getFileHandle(outputName,{create:true});const writer=await foreign.createWritable();await writer.write('foreign content');await writer.close();
     const sameLocator=await original.isSameEntry(foreign);
     await queue.run();
     require(queue.jobs[0].status==='export-pending' && indexes===1,'Native retry must not reindex');

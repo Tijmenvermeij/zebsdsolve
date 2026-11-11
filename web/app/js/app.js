@@ -5,12 +5,15 @@ import { GEOMETRY, buildFields, groupOf } from "./fields.js";
 import { drawGray, drawSigned, drawHeat, fit, svg, download, quantiles } from "./draw.js";
 import { createVotes } from "./votes.js";
 import { exportH5, exportOxford } from "./hdf5-export.js";
-import { BatchQueue } from "./batch.js";
+import { BatchQueue, defaultOutputStem } from "./batch.js";
 import { batchArtifacts } from "./batch-artifacts.js";
+import { isOxfordH5, oxfordExportWarnings } from "./oxford-export-policy.js";
 import { createPlaneView } from "./planeview.js";
 import { MasterView, PROJECTIONS } from "./masterview.js";
 import { CellView } from "./cellview.js";
 import { drawEnergy } from "./energy.js";
+import { filesFromHandles, rememberFileHandle, fileHandleFor, sourceFolders, chooseScanFolder } from "./source-folders.js";
+import { pairUPScan, chooseANG, validateUPProjectSources } from "./up-scan-files.js";
 
 const $ = (id) => document.getElementById(id);
 const app = $("app");
@@ -424,29 +427,21 @@ const backgroundSettings = () => {
   return { static_background, dynamic_background };
 };
 
-async function openScan(files, projectSettings = null, projectHints = null) {
-  if (!gpuAvailable() || st.busy) return;
+async function openScan(files, projectSettings = null, projectHints = null, expectedSources = null) {
+  if (!gpuAvailable() || st.busy || st.batchRunning || st.scanPicking) return;
+  st.scanPicking = true;
+  try { files = await pairUPScan(files, chooseANG, expectedSources); }
+  catch (error) { status(String(error.message || error), true); log(String(error.message || error), true); return false; }
+  finally { st.scanPicking = false; }
+  if (!files || !gpuAvailable() || st.busy) return false;
   files = sortScanFiles(files);
   if (!files.length) return;
-  invalidateOverview();
-  ++st.showRun;
   let opened = false;
   await busy(`opening ${files[0].name}…`, async () => {
-    const previousBackground = backgroundSettings();
-    let originalHints;
-    try {
-      if (st.exampleBackground) st.ze.configure(st.exampleBackground);
-      if (projectSettings) st.ze.configure(projectSettings);
-      if (projectHints) st.ze.configure(projectHints);
-      originalHints = openHints();
-      await st.ze.openScan(files);
-      if (projectSettings) st.ze.configure(projectSettings);
-    } catch (e) {
-      st.ze.configure(previousBackground);
-      if (projectSettings) afterSettings(Object.keys(projectSettings));
-      else { st.settings = st.ze.settings; fields.show(st.settings); }
-      throw e;
-    }
+    const settings = { ...(st.exampleBackground || {}), roi_x: 0, roi_y: 0, roi_w: 0, roi_h: 0, ...(projectSettings || {}) };
+    const originalHints = Object.fromEntries(Object.entries(openHints()).map(([key, value]) =>
+      [key, projectHints?.[key] ?? settings[key] ?? value]));
+    await st.ze.openScan(files, { settings, hints: projectHints || {} });
     st.exampleBackground = null;
     opened = true;
     st.scanName = files[0].name;
@@ -463,6 +458,8 @@ async function openScan(files, projectSettings = null, projectHints = null) {
 function afterOpen() {
   invalidateOverview();
   ++st.showRun;
+  st.roiDrag = null;
+  st.roiTool = false;
   st.sourceFile = null;
   st.sourceFiles = [];
   st.sourceOpenHints = null;
@@ -1778,12 +1775,11 @@ function updateEnabled() {
   for (const b of $("map-kind").children) if (RESULT_KINDS.includes(b.dataset.kind)) b.disabled = !st.results;
   $("btn-json").disabled = !st.scan;
   $("btn-roi-full").disabled = !st.scan || !!st.gpuLost;
-  const oxford = !!st.sourceFile && /Oxford/i.test(st.scan?.format || "");
+  const oxford = !!st.sourceFile && isOxfordH5(st.scan?.format);
   const oxfordReason = !oxford ? "Open the original Oxford H5OINA scan."
-    : JSON.parse(st.resultsGeo || "null")?.planeKind ? "Oxford export of a fitted source plane has not been validated; EMSphInx H5 export remains available."
     : !st.results ? "Index the scan first." : "";
   $("btn-h5oina").disabled = !!oxfordReason;
-  $("btn-h5oina").title = oxfordReason;
+  $("btn-h5oina").title = oxfordReason || (JSON.parse(st.resultsGeo || "null")?.planeKind ? "Fitted-plane export retains the original Oxford PC fields." : "");
   renderBatch();
   done("data", ready);
   done("patterns", ready);
@@ -1797,7 +1793,7 @@ function isMaster(f) {
  *  side files, master patterns. The project's settings go in before the scan opens (they may
  *  say how to read it) and its geometry after (over what the scan's file gives). */
 async function takeFiles(files) {
-  if (!gpuAvailable() || st.busy) return;
+  if (!gpuAvailable() || st.busy || st.batchRunning) return;
   const cifs = files.filter((f) => /\.cif$/i.test(f.name));
   if (cifs.length) {
     loadCif(await cifs[0].text(), cifs[0].name);
@@ -1818,6 +1814,10 @@ async function takeFiles(files) {
       status(`${projects[0].name}: not a zebsdsolve project (${e.message || e})`, true);
       return;
     }
+    if (!scans.length) {
+      try { validateUPProjectSources(project.source_files, st.sourceFiles); }
+      catch (error) { status(String(error.message || error), true); log(String(error.message || error), true); return; }
+    }
     if (project.settings) {
       const have = st.ze.settings;
       const gone = Object.keys(project.settings).filter((k) => !(k in have));
@@ -1829,7 +1829,7 @@ async function takeFiles(files) {
       }
     }
   }
-  if (scans.length && !await openScan(scans, project?.settings, project?.opening_hints)) return;
+  if (scans.length && !await openScan(scans, project?.settings, project?.opening_hints, project?.source_files)) return;
   if (masters.length) await addPhases(masters);
   if (project) {
     if (project.geometry && /Oxford h5oina/i.test(st.scan?.format || "") && project.geometry_convention !== "oxford-calibrated-v1") {
@@ -1906,7 +1906,7 @@ async function loadExample() {
     const [scan, master] = await Promise.all([get("patterns_v2.h5"), get("Ni_master_20kV.npz")]);
     const previousBackground = st.exampleBackground || backgroundSettings();
     const originalHints = openHints();
-    await st.ze.openScan([scan]);
+    await st.ze.openScan([scan], { settings: { roi_x: 0, roi_y: 0, roi_w: 0, roi_h: 0 } });
     st.scanName = scan.name;
     st.ze.clearPhases();
     await st.ze.addPhase(master);
@@ -1922,11 +1922,12 @@ async function loadExample() {
 }
 
 function projectJson() {
-  return JSON.stringify({ zebsdsolve: st.ze.version, scan: st.scanName, geometry_convention: /Oxford h5oina/i.test(st.scan?.format || "") ? "oxford-calibrated-v1" : "generic-v1", geometry: st.ze.geometry, settings: st.ze.settings, opening_hints: st.sourceOpenHints, phases: st.ze.phases.map((p) => p.name) }, null, 2);
+  return JSON.stringify({ zebsdsolve: st.ze.version, scan: st.scanName, source_files: st.sourceFiles.map(file => ({ name: file.name, size: file.size, lastModified: file.lastModified })), geometry_convention: /Oxford h5oina/i.test(st.scan?.format || "") ? "oxford-calibrated-v1" : "generic-v1", geometry: st.ze.geometry, settings: st.ze.settings, opening_hints: st.sourceOpenHints, phases: st.ze.phases.map((p) => p.name) }, null, 2);
 }
 
 /** Keep independent browser directory memories for scans and master patterns. */
 async function pickFiles(kind) {
+  if (st.busy || st.batchRunning || st.scanPicking) return;
   const input = $(kind === "scan" ? "file-scan" : "file-phase");
   if (typeof window.showOpenFilePicker !== "function") { input.click(); return; }
   try {
@@ -1935,7 +1936,7 @@ async function pickFiles(kind) {
       multiple: true,
       ...(kind === "phase" ? { types: [{ description: "Master patterns", accept: { "application/octet-stream": [".npz", ".h5", ".hdf5"] } }] } : {}),
     });
-    const files = await Promise.all(handles.map((handle) => handle.getFile()));
+    const files = await filesFromHandles(handles);
     if (files.length) await (kind === "scan" ? takeFiles(files) : addPhases(files));
   } catch (e) {
     if (e.name === "AbortError") return;
@@ -2114,10 +2115,17 @@ function updateWiring() {
   $("btn-ang").addEventListener("click", () => download(st.scanName.replace(/\.[^.]+$/, "") + ".ang", st.ze.exportText("ang"), "text/plain"));
   $("btn-ctf").addEventListener("click", () => download(st.scanName.replace(/\.[^.]+$/, "") + ".ctf", st.ze.exportText("ctf"), "text/plain"));
   $("btn-h5").addEventListener("click", () => busy("exporting HDF5…", async () => download(st.scanName.replace(/\.[^.]+$/, "") + ".h5", await exportH5(st.ze.exportSnapshot()), "application/x-hdf5")));
-  $("btn-h5oina").addEventListener("click", () => busy("exporting Oxford HDF5…", async () => {
-    const snapshot = st.ze.exportOxfordSnapshot();
-    download(st.scanName.replace(/\.[^.]+$/, "") + ".h5oina", await exportOxford(snapshot, st.sourceFile, snapshot.oxford_frame), "application/x-hdf5");
-  }));
+  $("btn-h5oina").addEventListener("click", async () => {
+    let warnings = [], saved = false;
+    await busy("exporting Oxford HDF5…", async () => {
+      const snapshot = st.ze.exportOxfordSnapshot();
+      warnings = oxfordExportWarnings(snapshot);
+      for (const warning of warnings) log(`Warning: ${warning}`);
+      download(st.scanName.replace(/\.[^.]+$/, "") + ".h5oina", await exportOxford(snapshot, st.sourceFile, snapshot.oxford_frame), "application/x-hdf5");
+      saved = true;
+    });
+    if (saved && warnings.length) status(`H5OINA exported. Warning: ${warnings.join(" ")}`);
+  });
   $("btn-overview").addEventListener("click", () => {
     if (st.overviewCalculating) { invalidateOverview(); updateOverviewControls(); }
     else if (st.scan && !st.overviewLoading) runOverview();
@@ -2307,34 +2315,57 @@ function updateWiring() {
   window.addEventListener("dragenter", (e) => { if (e.dataTransfer?.types.includes("Files")) { depth++; $("dropveil").hidden = false; e.preventDefault(); } });
   window.addEventListener("dragleave", () => { depth = Math.max(0, depth - 1); if (!depth) $("dropveil").hidden = true; });
   window.addEventListener("dragover", (e) => e.preventDefault());
-  window.addEventListener("drop", (e) => { e.preventDefault(); depth = 0; $("dropveil").hidden = true; if (e.dataTransfer?.files.length) takeFiles([...e.dataTransfer.files]); });
+  window.addEventListener("drop", (e) => {
+    e.preventDefault(); depth = 0; $("dropveil").hidden = true;
+    const files = [...(e.dataTransfer?.files || [])];
+    const handles = [...(e.dataTransfer?.items || [])].filter(item => item.kind === "file").map(item => {
+      const itemFile = item.getAsFile();
+      const matches = files.filter(file => file === itemFile || itemFile && file.name === itemFile.name && file.size === itemFile.size && file.lastModified === itemFile.lastModified);
+      let handle;
+      try { handle = item.getAsFileSystemHandle?.(); } catch { return Promise.resolve(); }
+      return handle && matches.length === 1 ? Promise.resolve(handle).then(value => rememberFileHandle(matches[0], value)).catch(() => {}) : Promise.resolve();
+    });
+    Promise.all(handles).then(() => takeFiles(files));
+  });
 }
 
 // ── batch queue ──
 const batch = new BatchQueue({
   createEngine: () => Zebsdsolve.create({ wasm: new URL("../zebsdsolve/zebsdsolve.wasm", import.meta.url), warm: false }),
   artifacts: batchArtifacts,
+  onDownloadReady: job => startBatchDownload(job),
   onChange: () => renderBatch(),
 });
 
+function startBatchDownload(job) {
+  if (!job.archive?.url) return;
+  const link = document.createElement("a"); link.href = job.archive.url; link.download = job.archive.name;
+  document.body.append(link);
+  try { link.click(); } finally { link.remove(); }
+}
+
 function renderBatch() {
-  const ready = !!st.ze && !!st.sourceFiles.length && st.phaseFiles.some((p) => p.on) && !st.gpuLost && !st.busy;
+  const ready = !!st.ze && !!st.sourceFiles.length && st.phaseFiles.some((p) => p.on) && !st.gpuLost && !st.busy && !st.batchRunning && !st.scanPicking;
   for (const id of ["btn-batch-add", "btn-batch-current"]) {
     $(id).disabled = !ready;
     $(id).textContent = st.batchEditing ? "Update batch job" : id === "btn-batch-add" ? "Add to batch" : "Add current scan";
   }
   const waiting = batch.jobs.some((job) => ["queued", "export-pending"].includes(job.status));
-  $("btn-batch-run").disabled = st.busy || !batch.directory || !waiting;
+  $("btn-batch-run").disabled = st.busy || st.batchRunning || st.scanPicking || !waiting;
   $("btn-batch-stop").disabled = !batch.running;
-  $("btn-batch-clear").disabled = st.busy || !batch.jobs.length;
-  $("btn-batch-folder").disabled = st.busy || batch.jobs.some((job) => !!job.folderName);
-  $("batch-folder").textContent = batch.directory?.name || "";
+  $("btn-batch-clear").disabled = st.busy || st.batchRunning || st.scanPicking || !batch.jobs.length;
+  $("batch-downloads").checked = batch.downloadsEnabled;
+  $("batch-downloads").disabled = st.busy || st.batchRunning || st.scanPicking || batch.jobs.some(job => job.folderName && job.status !== "complete");
+  $("btn-batch-setup").disabled = batch.downloadsEnabled || st.busy || st.batchRunning || st.scanPicking || !batch.jobs.some(job => ["queued", "export-pending"].includes(job.status) && batch.modeFor(job) !== "downloads");
+  $("btn-batch-folder").disabled = batch.downloadsEnabled || st.busy || st.batchRunning || st.scanPicking || !batch.jobs.some(job => job.status === "queued" && !job.folderName);
   $("batch-editing").textContent = st.batchEditing ? `Editing ${batch.jobs.find((job) => job.id === st.batchEditing)?.outputStem || "job"}` : "";
   $("btn-batch-new").hidden = !st.batchEditing;
+  $("btn-batch-new").disabled = st.busy || st.batchRunning || st.scanPicking;
   $("batch-empty").hidden = batch.jobs.length > 0;
   $("batch-table").hidden = batch.jobs.length === 0;
   const completed = batch.jobs.filter((job) => job.status === "complete").length;
-  $("batch-count").textContent = batch.jobs.length ? `${completed} / ${batch.jobs.length} complete` : "";
+  const outcome = batch.jobs.some(job => batch.modeFor(job) === "downloads") ? "processed" : "complete";
+  $("batch-count").textContent = batch.jobs.length ? `${completed} / ${batch.jobs.length} ${outcome}` : "";
   const active = batch.jobs.find((job) => ["indexing", "exporting"].includes(job.status));
   const bar = $("batch-progress"); bar.hidden = !batch.running;
   if (active?.progress && active.status === "indexing") {
@@ -2344,41 +2375,59 @@ function renderBatch() {
   } else if (active) {
     bar.removeAttribute("value");
     $("batch-readout").textContent = `${active.sourceFiles[0].name}\n${active.status === "exporting" ? "Saving outputs…" : "Preparing indexing…"}`;
-  } else $("batch-readout").textContent = batch.error || (batch.jobs.length ? `${completed} of ${batch.jobs.length} jobs complete` : "");
+  } else $("batch-readout").textContent = batch.error || (batch.jobs.length ? `${completed} of ${batch.jobs.length} jobs ${outcome}` : "");
   const labels = { queued: "Queued", indexing: "Indexing", exporting: "Saving", complete: "Complete", cancelled: "Stopped", failed: "Failed", "export-pending": "Export failed" };
-  $("batch-jobs").replaceChildren(...batch.jobs.map((job) => {
+  const table = $("batch-jobs");
+  const previousRows = new Map([...table.children].map(row => [row.dataset.job, row]));
+  const rows = batch.jobs.map((job) => {
+    const previous = previousRows.get(job.id);
+    if (job.status === "complete" && job.archive?.url && previous?.dataset.downloadUrl === job.archive.url) {
+      for (const button of previous.querySelectorAll("button")) button.disabled = st.busy || st.batchRunning || st.scanPicking || button.dataset.unavailable === "true";
+      return previous;
+    }
     const row = document.createElement("tr"); row.dataset.status = job.status; row.dataset.job = job.id;
     const cell = (text, className) => { const td = document.createElement("td"); td.textContent = text; if (className) td.className = className; row.append(td); return td; };
-    const name = document.createElement("input"); name.type = "text"; name.value = job.outputStem; name.setAttribute("aria-label", `Output name for ${job.sourceFiles[0].name}`);
-    name.disabled = batch.running || !!job.folderName;
-    name.addEventListener("change", () => { try { batch.rename(job.id, name.value); } catch (e) { status(e.message, true); } });
-    cell("").append(name);
+    cell(job.outputStem, "batch-output-name");
+    const downloads = batch.modeFor(job) === "downloads";
+    cell(downloads ? "Downloads" : batch.directoryFor(job)?.name || "Default output folder", "batch-source");
     cell(job.sourceFiles[0].name, "batch-source");
     cell(job.phases.map((phase) => phase.name).join(", "));
     cell(String(job.settings.bandwidth));
     const s = job.settings, scan = job.scanInfo;
     cell(`${Math.min(s.roi_w || scan.cols, Math.max(0, scan.cols - s.roi_x))} × ${Math.min(s.roi_h || scan.rows, Math.max(0, scan.rows - s.roi_y))}\n@ ${s.roi_x}, ${s.roi_y}`);
-    const state = cell(labels[job.status] || job.status, "batch-status");
+    const state = cell(downloads && job.status === "complete" ? "Download ready" : labels[job.status] || job.status, "batch-status");
+    if (job.warnings?.length) { const warning = document.createElement("div"); warning.className = "batch-warning"; warning.textContent = "Original Oxford PCs retained"; warning.title = job.warnings.join(" "); state.append(warning); }
     if (job.error) { const error = document.createElement("div"); error.className = "batch-error"; error.textContent = job.error; state.append(error); }
     const actions = cell("", "batch-actions");
-    const button = (text, fn, disabled = false) => { const b = document.createElement("button"); b.type = "button"; b.className = "mini"; b.textContent = text; b.disabled = st.busy || disabled; b.addEventListener("click", fn); actions.append(b); };
+    const button = (text, fn, disabled = false) => { const b = document.createElement("button"); b.type = "button"; b.className = "mini"; b.textContent = text; b.dataset.unavailable = String(!!disabled); b.disabled = st.busy || st.batchRunning || st.scanPicking || disabled; b.addEventListener("click", () => { if (!st.busy && !st.batchRunning && !st.scanPicking) fn(); }); actions.append(b); };
+    if (job.archive?.url) {
+      row.dataset.downloadUrl = job.archive.url;
+      const link = document.createElement("a"); link.className = "mini batch-download"; link.textContent = "Download ZIP"; link.href = job.archive.url; link.download = job.archive.name;
+      link.setAttribute("aria-label", `Download ZIP for ${job.sourceFiles[0].name}`); actions.append(link);
+    }
+    button("Output…", () => configureBatchOutput(job), job.status !== "queued" || !!job.folderName);
     button("Load", () => loadBatchJob(job), job.status === "export-pending");
     if (["failed", "cancelled", "export-pending"].includes(job.status)) button(job.status === "export-pending" ? "Retry export" : "Retry", async () => {
       try { batch.retry(job.id); if (job.status === "export-pending") await runBatch(); } catch (e) { status(e.message, true); }
     });
     if (job.status !== "export-pending") button("Remove", () => { try { batch.remove(job.id); if (st.batchEditing === job.id) { st.batchEditing = null; renderBatch(); } } catch (e) { status(e.message, true); } });
     return row;
-  }));
+  });
+  for (const row of [...table.children]) if (!rows.includes(row)) row.remove();
+  rows.forEach((row, index) => { if (table.children[index] !== row) table.insertBefore(row, table.children[index] || null); });
 }
 
 async function addBatchJob() {
-  if (!gpuAvailable() || st.busy || !st.sourceFiles.length || !st.phaseFiles.some((p) => p.on)) return;
+  if (!gpuAvailable() || st.busy || st.batchRunning || st.scanPicking || !st.sourceFiles.length || !st.phaseFiles.some((p) => p.on)) return;
   const files = st.sourceFiles;
   try {
     await st.ze._queue;
-    if (files !== st.sourceFiles || st.busy) return;
+    if (files !== st.sourceFiles || st.busy || st.batchRunning || st.scanPicking) return;
     const spec = { sourceFiles: files, masterFiles: st.phaseFiles.filter((p) => p.on).map((p) => p.file), settings: st.ze.settings, geometry: st.ze.geometry,
       openHints: st.sourceOpenHints, openGeometry: st.geoOpened, scanInfo: st.scan, phases: st.ze.phases, version: st.ze.version };
+    const editing = batch.jobs.find(job => job.id === st.batchEditing);
+    spec.directory = editing ? batch.directoryFor(editing) : await sourceFolders.find(files[0]).catch(() => null);
+    if (files !== st.sourceFiles || st.busy || st.batchRunning || st.scanPicking) return;
     if (st.batchEditing) { batch.replace(st.batchEditing, spec); st.batchEditing = null; }
     else batch.add(spec);
     selectTab("batch"); renderBatch();
@@ -2386,12 +2435,10 @@ async function addBatchJob() {
 }
 
 async function loadBatchJob(job) {
-  if (st.busy || !gpuAvailable()) return;
-  invalidateOverview(); ++st.showRun;
+  if (st.busy || st.batchRunning || st.scanPicking || !gpuAvailable()) return;
   await busy("loading batch job…", async () => {
     await st.ze._queue;
-    st.ze.configure(job.openHints);
-    await st.ze.openScan(job.sourceFiles);
+    await st.ze.openScan(job.sourceFiles, { hints: job.openHints });
     const acquired = structuredClone(job.openGeometry || st.ze.geometry);
     // From this point native state is the new acquisition, even if a master fails.
     st.exampleBackground = null; st.scanName = job.sourceFiles[0].name;
@@ -2401,58 +2448,173 @@ async function loadBatchJob(job) {
     try {
       st.ze.configure(job.settings); st.ze.setGeometry(job.geometry);
       st.settings = st.ze.settings; fields.show(st.settings); showGeometry();
-      showResolution(); showStage(); showSweeps(); showAngle();
+      showResolution(); showStage(); showSweeps(); showAngle(); showRoi();
       for (const file of job.masterFiles) { await st.ze.addPhase(file); st.phaseFiles.push({ file, on: true, info: null }); }
       st.batchEditing = job.status === "queued" && !job.folderName ? job.id : null;
       selectTab("index");
     } finally { phasesChanged(); updateEnabled(); }
+    if (job.status === "complete") {
+      if (!job.resultCheckpoint) throw new Error("Completed batch results are no longer retained.");
+      const bytes = new Uint8Array(await job.resultCheckpoint.arrayBuffer());
+      // Phase synchronization clears interactive result views, so restore afterwards.
+      // Native validation checks settings, geometry, source calibration and masters.
+      await st.ze._queue;
+      st.ze.restoreResultCheckpoint(bytes);
+      st.results = st.ze.results();
+      st.resultsGeo = JSON.stringify(st.ze.geometry);
+      st.chance = job.resultChance ? { ...job.resultChance } : null;
+      showSweeps();
+      const cell = st.results.phase.findIndex(phase => phase >= 0);
+      st.cell = cell >= 0 ? cell : Math.min(st.scan.rows * st.scan.cols - 1,
+        st.settings.roi_y * st.scan.cols + st.settings.roi_x);
+      const indexed = st.results.phase.reduce((n, phase) => n + (phase >= 0), 0);
+      $("index-readout").textContent = `${indexed.toLocaleString()} indexed patterns · restored`;
+      done("index");
+      setMapKind("ipf_z");
+      drawMapOverlay();
+      selectDock("z");
+      updateEnabled();
+    }
   });
   renderBatch();
 }
 
+async function configureBatchOutput(job) {
+  if (st.busy || st.batchRunning || st.scanPicking || job.status !== "queued" || job.folderName) return;
+  const downloads = batch.modeFor(job) === "downloads";
+  let directory = downloads ? job.directory : batch.directoryFor(job) || await sourceFolders.find(job.sourceFiles[0]).catch(() => null);
+  if (st.busy || st.batchRunning || st.scanPicking || !batch.jobs.includes(job) || job.status !== "queued" || job.folderName) return;
+  const dialog = document.createElement("dialog"); dialog.className = "scan-info-dialog batch-output-dialog"; dialog.id = "batch-output-dialog";
+  const title = document.createElement("h3"); title.id = "batch-output-title"; title.textContent = `Output for ${job.sourceFiles[0].name}`;
+  dialog.setAttribute("aria-labelledby", title.id);
+  const fields = document.createElement("div"); fields.className = "fields";
+  const field = (text, control) => { const label = document.createElement("label"); label.className = "field wide"; const caption = document.createElement("span"); caption.textContent = text; label.append(caption, control); fields.append(label); };
+  const folder = document.createElement("button"); folder.type = "button"; folder.id = "batch-output-parent"; folder.textContent = downloads ? "Downloads" : directory?.name || "Choose scan folder…"; folder.disabled = downloads;
+  const name = document.createElement("input"); name.type = "text"; name.id = "batch-output-name"; name.value = job.outputStem; name.maxLength = 160;
+  field("Parent folder", folder); field("Folder and file name", name);
+  const errorText = document.createElement("p"); errorText.className = "folder-error"; errorText.setAttribute("role", "alert"); errorText.hidden = true;
+  const actions = document.createElement("div"); actions.className = "row";
+  const cancel = document.createElement("button"); cancel.type = "button"; cancel.textContent = "Cancel";
+  const save = document.createElement("button"); save.type = "button"; save.className = "primary"; save.id = "batch-output-save"; save.textContent = "Save";
+  actions.append(save, cancel); dialog.append(title, fields, errorText, actions); document.body.append(dialog);
+  let closed = false, saving = false;
+  const close = () => { if (closed) return; closed = true; dialog.close(); dialog.remove(); };
+  cancel.onclick = close; dialog.oncancel = event => { event.preventDefault(); close(); };
+  let selecting = false;
+  folder.onclick = async () => {
+    if (selecting || downloads) return; selecting = true; folder.disabled = true; save.disabled = true;
+    try {
+      if (!window.showDirectoryPicker) throw new Error("Folder saving requires Chrome or Edge.");
+      const startIn = directory || fileHandleFor(job.sourceFiles[0]);
+      directory = await window.showDirectoryPicker({id:"zebsdsolve-scan-output",mode:"readwrite",...(startIn ? {startIn} : {})});
+      folder.textContent = directory.name;
+    } catch (error) { if (error.name !== "AbortError") { errorText.textContent = error.message || String(error); errorText.hidden = false; } }
+    finally { selecting = false; folder.disabled = false; save.disabled = false; }
+  };
+  save.onclick = async () => {
+    if (selecting || saving || closed) return; saving = true; save.disabled = true;
+    try {
+      if (st.busy || st.batchRunning || st.scanPicking || job.status !== "queued" || job.folderName) throw new Error("This job's output is already reserved.");
+      if (!downloads && directory) await sourceFolders.accept(directory, job.sourceFiles[0]);
+      if (closed) return;
+      if (st.busy || st.batchRunning || st.scanPicking || !batch.jobs.includes(job) || job.status !== "queued" || job.folderName) throw new Error("This job's output is already reserved.");
+      const value = name.value.trim() || defaultOutputStem(job.sourceFiles[0], job.settings.bandwidth);
+      if (value !== job.outputStem) batch.rename(job.id, value);
+      if (!downloads) batch.setJobDirectory(job.id, directory);
+      close();
+    } catch (error) { if (!closed) { errorText.textContent = error.message || String(error); errorText.hidden = false; save.disabled = false; } }
+    finally { saving = false; }
+  };
+  dialog.showModal(); name.focus();
+}
+
 async function chooseBatchFolder() {
-  if (st.busy) return;
+  if (st.busy || st.batchRunning || st.scanPicking || batch.downloadsEnabled) return;
   if (!window.showDirectoryPicker) { status("Automatic batch saving requires Edge or Chrome with folder access.", true); return; }
-  try { batch.setDirectory(await window.showDirectoryPicker({ id: "zebsdsolve-batch-output", mode: "readwrite" })); }
-  catch (e) { if (e.name !== "AbortError") status(String(e.message || e), true); }
+  try {
+    const directory = await window.showDirectoryPicker({ id: "zebsdsolve-batch-output", mode: "readwrite" });
+    if (st.busy || st.batchRunning || st.scanPicking || batch.downloadsEnabled) return;
+    await sourceFolders.add(directory);
+    if (st.busy || st.batchRunning || st.scanPicking || batch.downloadsEnabled) return;
+    for (const job of batch.jobs.filter(job => job.status === "queued" && !job.folderName)) batch.setJobDirectory(job.id, directory);
+  } catch (error) { if (error.name !== "AbortError") status(String(error.message || error), true); }
+}
+
+async function prepareBatchFolders() {
+  const pending = batch.jobs.filter(job => ["queued", "export-pending"].includes(job.status));
+  // Save retained results first. A later run can prepare unrelated queued folders.
+  const retained = pending.find(job => job.status === "export-pending");
+  for (const job of retained ? [retained] : pending) {
+    if (batch.modeFor(job) === "downloads") continue;
+    let directory = batch.directoryFor(job);
+    if (!directory) {
+      directory = await sourceFolders.find(job.sourceFiles[0]).catch(() => null);
+      if (!directory) directory = await chooseScanFolder(job.sourceFiles[0]);
+      if (!directory) return false;
+      batch.setJobDirectory(job.id, directory);
+    }
+    if (await directory.queryPermission({mode:"readwrite"}) !== "granted") {
+      if (!await chooseScanFolder(job.sourceFiles[0], {current:directory, permissionOnly:true})) return false;
+    }
+  }
+  return true;
+}
+
+async function setupBatchFolders() {
+  if (st.busy || st.batchRunning || st.scanPicking || batch.downloadsEnabled) return;
+  st.scanPicking = true; renderBatch();
+  try {
+    if (!await prepareBatchFolders()) status("Output folder setup cancelled");
+  } catch (error) { status(String(error.message || error), true); }
+  finally { st.scanPicking = false; renderBatch(); }
 }
 
 async function runBatch() {
-  if (st.busy || st.batchRunning) return;
+  if (st.busy || st.batchRunning || st.scanPicking) return;
   selectTab("batch");
   // Take ownership before any permission or engine await.
   st.batchRunning = true; app.dataset.batchRunning = "1";
   for (const b of $("tabs").children) if (b.dataset.tab !== "batch") b.disabled = true;
-  let launchError = null;
+  let launchError = null, launched = false;
+  renderBatch();
   try {
+    if (!await prepareBatchFolders()) { status("Batch not started"); return; }
+    launched = true;
     await busy("batch indexing…", async () => {
       try {
-        if (batch.directory?.requestPermission && await batch.directory.requestPermission({ mode: "readwrite" }) !== "granted") throw new Error("Write access to the output folder was not granted.");
         invalidateOverview(); ++st.showRun; ++st.masterRun; st.ze.pauseIndexPreparation();
         await st.ze._queue;
         if (!st.stop) await batch.run();
       } catch (e) { launchError = e; throw e; }
     });
-  } finally {
+  } catch (error) { launchError = error; }
+  finally {
     st.batchRunning = false; app.dataset.batchRunning = "0";
     for (const b of $("tabs").children) b.disabled = false;
     renderBatch();
     if (launchError) status(String(launchError.message || launchError), true);
+    else if (!launched) status("Batch not started");
     else if (batch.error) status(batch.error, true);
     else if (st.stop) status("Batch stopped");
-    else if (batch.jobs.length) status(`${batch.jobs.filter((job) => job.status === "complete").length} of ${batch.jobs.length} batch jobs complete`);
+    else if (batch.jobs.length) status(`${batch.jobs.filter((job) => job.status === "complete").length} of ${batch.jobs.length} batch jobs ${batch.jobs.some(job => batch.modeFor(job) === "downloads") ? "processed" : "complete"}`);
   }
 }
 
 function wireBatch() {
+  $("batch-downloads").addEventListener("change", event => {
+    try { batch.setDownloads(event.target.checked); }
+    catch (error) { event.target.checked = batch.downloadsEnabled; status(String(error.message || error), true); }
+    renderBatch();
+  });
   $("btn-batch-add").addEventListener("click", addBatchJob);
   $("btn-batch-current").addEventListener("click", addBatchJob);
+  $("btn-batch-setup").addEventListener("click", setupBatchFolders);
   $("btn-batch-folder").addEventListener("click", chooseBatchFolder);
   $("btn-batch-run").addEventListener("click", runBatch);
   $("btn-batch-stop").addEventListener("click", () => batch.stop());
-  $("btn-batch-new").addEventListener("click", () => { st.batchEditing = null; renderBatch(); });
+  $("btn-batch-new").addEventListener("click", () => { if (st.busy || st.batchRunning || st.scanPicking) return; st.batchEditing = null; renderBatch(); });
   $("btn-batch-clear").addEventListener("click", async () => {
-    if (st.busy) return;
+    if (st.busy || st.batchRunning || st.scanPicking) return;
     if (batch.jobs.some((job) => job.status === "export-pending") && !window.confirm("Discard unsaved batch results?")) return;
     try { await batch.clear(); st.batchEditing = null; renderBatch(); } catch (e) { status(e.message, true); }
   });

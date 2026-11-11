@@ -403,7 +403,7 @@ function ioImports(state) {
 const SYNC_EXPORTS = new Set(["ze_alloc", "ze_free", "ze_version", "ze_create", "ze_destroy", "ze_adapter", "ze_error",
   "ze_has_acquisition_calibration", "ze_configure", "ze_settings", "ze_events", "ze_cancel", "ze_close_scan", "ze_scan_info", "ze_scan_format", "ze_scan_overview_kind", "ze_chunk_index_status",
   "ze_get_geometry", "ze_set_geometry", "ze_clear_phases", "ze_phase_count", "ze_phase_info", "ze_pattern_shape", "ze_nlpar_view",
-  "ze_pc_scores", "ze_fit_patterns", "ze_results", "ze_map", "ze_ipf_key", "ze_export", "ze_export_snapshot", "ze_export_oxford_snapshot", "ze_bunge", "ze_reduce", "ze_disorientation", "ze_shader",
+  "ze_pc_scores", "ze_fit_patterns", "ze_results", "ze_map", "ze_ipf_key", "ze_export", "ze_export_snapshot", "ze_export_oxford_snapshot", "ze_result_checkpoint", "ze_restore_result_checkpoint", "ze_result_chance", "ze_bunge", "ze_reduce", "ze_disorientation", "ze_shader",
   "ze_index_status", "ze_tune_begin", "ze_tune_report", "ze_pixel_angle", "ze_lattice", "ze_sweep", "ze_pc_level_count", "ze_pc_level", "ze_pc_level_ballots",
   "ze_gpu_counts", "ze_profile", "ze_profile_report", "ze_compile_wgsl", "ze_plane_points",
   "ze_sim_read_cif", "ze_sim_set_crystal", "ze_sim_edit_crystal", "ze_sim_crystal", "ze_sim_sheets", "ze_sim_add_phase", "ze_sim_npz",
@@ -761,13 +761,17 @@ export class Zebsdsolve {
     return `@${this.state.files.length - 1}:${name}`;
   }
 
-  /** Open a scan from Blobs: the pattern file first, then side files (NORDIF's Setting.txt). */
-  openScan(blobs) {
-    this._invalidateIndexPreparation();
+  /** Open pattern and sidecar Blobs. Optional settings/hints commit together with the new scan. */
+  openScan(blobs, options = null) {
     return this._serial(() => this._frame(async (f) => {
       const tokens = [].concat(blobs).map((b) => this.addFile(b));
       const [p, n] = f.str(tokens.join("\n"));
-      this._check(await this.x.ze_open_scan(this.e, p, n), "open");
+      if (options) {
+        const [sp, sn] = f.str(JSON.stringify(options.settings || {}));
+        const [hp, hn] = f.str(JSON.stringify(options.hints || {}));
+        this._check(await this.x.ze_open_scan_configured(this.e, p, n, sp, sn, hp, hn), "open");
+      } else this._check(await this.x.ze_open_scan(this.e, p, n), "open");
+      this._invalidateIndexPreparation();
       return this.scan;
     }));
   }
@@ -1408,6 +1412,36 @@ export class Zebsdsolve {
       const p = f.alloc(n);
       this._check(this.x.ze_export(this.e, k, p, n), "export");
       return new Uint8Array(this.mem, p, n).slice();
+    });
+  }
+
+  /** Lossless internal result state, including every stored phase candidate. */
+  exportResultCheckpoint() {
+    return this._frame((f) => {
+      const n = this._check(this.x.ze_result_checkpoint(this.e, 0, 0), "result checkpoint");
+      const p = f.alloc(n);
+      this._check(this.x.ze_result_checkpoint(this.e, p, n), "result checkpoint");
+      return new Uint8Array(this.mem, p, n).slice();
+    });
+  }
+
+  /** Phase-0 chance already measured during indexing; never recalibrates. */
+  resultChance() {
+    return this._frame((f) => {
+      const p = f.alloc(8);
+      if (!this.x.ze_result_chance(this.e, p)) return null;
+      const values = new Float32Array(this.mem, p, 2);
+      return { median: values[0], spread: values[1] };
+    });
+  }
+
+  /** Restore only after reopening the same retained sources, masters and settings. */
+  restoreResultCheckpoint(bytes) {
+    if (!(bytes instanceof Uint8Array)) throw new TypeError("Expected result checkpoint bytes.");
+    return this._frame((f) => {
+      const p = f.alloc(bytes.byteLength);
+      new Uint8Array(this.mem, p, bytes.byteLength).set(bytes);
+      this._check(this.x.ze_restore_result_checkpoint(this.e, p, bytes.byteLength), "restore result checkpoint");
     });
   }
 

@@ -4,9 +4,11 @@ import json
 import os
 import tempfile
 import posixpath
+import warnings
 import numpy as np
 
 TSL = [0, 1, 2, 22, 4, 42, 3, 32, 6, 62, 23, 43]
+OXFORD_PLANE_PC_WARNING = 'Orientations were indexed with a fitted source plane. Standard Oxford pattern-centre fields retain acquisition values. Fitted values are stored in /zebsdsolve/PatternCentres.'
 
 def _h5py():
     try:
@@ -337,6 +339,15 @@ def _oxford_group(f, s):
     return g.name
 
 def write_oxford(path, reference, s, engine_to_cs1, frame_provenance, phase_id_map=None):
+    frame = s.get('oxford_frame', {})
+    preserve_source_pc = bool(frame.get('preserve_source_pattern_centres', False)) or s.get('geometry', {}).get('plane_kind', 0) > 0
+    if preserve_source_pc:
+        if 'pattern_centres' not in s:
+            raise ValueError('Native fitted-plane snapshot requires pattern_centres')
+        frame = {**frame, 'preserve_source_pattern_centres': True, 'warnings': [OXFORD_PLANE_PC_WARNING]}
+        s = {**s, 'oxford_frame': frame}
+        # A warnings-as-errors policy must stop before any output work or replacement.
+        warnings.warn(OXFORD_PLANE_PC_WARNING, UserWarning, stacklevel=2)
     h5py = _h5py()
     s = _current_snapshot(s)
     q = np.asarray(engine_to_cs1, dtype=float)
@@ -419,15 +430,16 @@ def write_oxford(path, reference, s, engine_to_cs1, frame_provenance, phase_id_m
                 if key == 'Euler': values[valid] = np.asarray(r['euler']).reshape(-1, 3)[valid]
                 elif key == 'Phase': values[valid] = np.asarray(mapping)[np.asarray(r['phase'], dtype=int)[valid]]
                 data[key][...] = values
-            pc = np.asarray(s['pattern_centres']).reshape(-1, 3)
-            ratio = s['scan']['pat_h']/s['scan']['pat_w']
-            for key, values in [('Pattern Center X', pc[:, 0]), ('Pattern Center Y', (1-pc[:, 1])*ratio), ('Detector Distance', pc[:, 2]*ratio)]:
-                out = np.full(len(valid), np.nan)
-                out[valid] = values[valid]
-                if key in data:
-                    if data[key].shape != valid.shape: raise ValueError('Oxford calibration layout differs from indexed pixels')
-                    data[key][...] = out
-                else: data.create_dataset(key, data=out).attrs['Unit'] = 'fraction'
+            if not s.get('oxford_frame', {}).get('preserve_source_pattern_centres', False):
+                pc = np.asarray(s['pattern_centres']).reshape(-1, 3)
+                ratio = s['scan']['pat_h']/s['scan']['pat_w']
+                for key, values in [('Pattern Center X', pc[:, 0]), ('Pattern Center Y', (1-pc[:, 1])*ratio), ('Detector Distance', pc[:, 2]*ratio)]:
+                    out = np.full(len(valid), np.nan)
+                    out[valid] = values[valid]
+                    if key in data:
+                        if data[key].shape != valid.shape: raise ValueError('Oxford calibration layout differs from indexed pixels')
+                        data[key][...] = out
+                    else: data.create_dataset(key, data=out).attrs['Unit'] = 'fraction'
             for key in ('ncc', 'nmi', 'z', 'sweep'):
                 root.create_dataset(key.upper(), data=np.where(valid, r[key], np.nan))
         os.replace(temporary, path)

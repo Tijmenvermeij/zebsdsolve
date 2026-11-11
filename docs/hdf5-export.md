@@ -19,8 +19,12 @@ Batch H5 exports additionally contain `zebsdsolve/Maps/IPFZ_RGBA` and
 `NCC_RGBA` as row-major `[rows, columns, 4]` byte arrays, copied from the native
 GUI maps. `zebsdsolve/Maps/NCC` stores the numeric detector NCC raster, with NaN
 where no solution was computed. The maps use the existing native GUI frame and
-colour settings; this adds no orientation conversion. Separate full-raster PNGs
-use the same native pixels.
+colour settings; this adds no orientation conversion. Batch output comprises
+this H5, the vendor result (H5OINA or ANG), a reopenable project/status JSON,
+and standalone `_IPF-Z.png` and `_NCC.png` images, with the same stem in one
+per-scan directory. The PNGs preserve native map dimensions and pixels.
+**Save to Downloads** packages those five files in one ZIP per scan without an
+external folder-write grant.
 
 Export does not run another search. All computed solver solutions remain
 exported, including low-scoring or unconverged matches and results whose
@@ -172,9 +176,15 @@ they are not applied again to the stored directions or exported orientations.
 
 Ordinary Oxford acquisition geometry retains its calibrated detector basis and
 unknown detector pixel size as zero. Saved settings and batch replay preserve
-the complete source-plane geometry, including all 12 coefficients, for supported
-non-Oxford exports. An Oxford acquisition with an active fitted source plane is
-explicitly refused by H5OINA export until its per-cell Oxford calibration writer
-and native MTEX orientation round trip are validated. EMSphInx-style H5 remains
-available. No extra 90-degree rotation or fitted alignment is introduced by the
-merge; the existing native export conversion remains responsible for frames.
+the complete source-plane geometry, including all 12 coefficients.
+
+H5OINA export after source-plane fitting displays a warning and retains the
+original acquisition's `Pattern Center X`, `Pattern Center Y` and `Detector
+Distance` fields unchanged, including unindexed pixels, attributes and absent
+fields. The fitted per-pixel PCs remain in `/zebsdsolve/PatternCentres`, with the
+full plane in `GeometryJSON` and the preservation policy in `ProvenanceJSON`.
+The warning also appears on batch jobs and in Python exports. It does not block
+export. Orientations and effective detector attitude use the frozen indexing
+context and the existing native Oxford frame conversion; no extra rotation is
+introduced. The standard Oxford PCs therefore describe the acquisition rather
+than the fitted geometry used for these results.

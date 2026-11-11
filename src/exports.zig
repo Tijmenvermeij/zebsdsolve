@@ -66,17 +66,29 @@ export fn ze_cancel(e: *Engine) void {
 // ── scan ──
 
 /// Open a scan: `paths` holds one or more names separated by '\n', the pattern file first.
-export fn ze_open_scan(e: *Engine, paths: [*]const u8, len: usize) i32 {
-    var list: [8][]const u8 = undefined;
+fn scanPaths(paths: []const u8, list: *[8][]const u8) ![]const []const u8 {
     var n: usize = 0;
-    var it = std.mem.tokenizeScalar(u8, paths[0..len], '\n');
+    var it = std.mem.tokenizeScalar(u8, paths, '\n');
     while (it.next()) |p| {
-        if (n == list.len) break;
+        if (n == list.len) return error.TooManyScanFiles;
         list[n] = p;
         n += 1;
     }
-    e.openScan(list[0..n]) catch |err| return failed(e, "open_scan", err);
-    e.geo_given = e.geo;
+    return list[0..n];
+}
+
+export fn ze_open_scan(e: *Engine, paths: [*]const u8, len: usize) i32 {
+    var list: [8][]const u8 = undefined;
+    const names = scanPaths(paths[0..len], &list) catch |err| return failed(e, "open_scan", err);
+    e.openScan(names) catch |err| return failed(e, "open_scan", err);
+    return 0;
+}
+
+/// Atomically open using prospective project settings and file-reading hints.
+export fn ze_open_scan_configured(e: *Engine, paths: [*]const u8, len: usize, settings: [*]const u8, settings_len: usize, hints: [*]const u8, hints_len: usize) i32 {
+    var list: [8][]const u8 = undefined;
+    const names = scanPaths(paths[0..len], &list) catch |err| return failed(e, "open_scan", err);
+    e.openScanConfigured(names, settings[0..settings_len], hints[0..hints_len]) catch |err| return failed(e, "open_scan", err);
     return 0;
 }
 
@@ -113,9 +125,13 @@ export fn ze_prepare_index_step(e: *Engine, max_nodes: u32, max_bytes: u32) i32 
 export fn ze_chunk_index_status(e: *Engine, out: *[6]u64) void {
     out.* = .{ 1, 0, 0, 0, 0, 0 };
     switch (e.source) {
-        .file => |s| if (s.h5 != null) {
-            const ds = &s.ds;
-            out.* = .{ @intFromBool(ds.index_ready), @intFromBool(ds.index_failed), ds.warmed_nodes, ds.frontier.items.len - ds.frontier_at, s.files[0].reads, s.files[0].bytes_read };
+        .file => |s| {
+            out[4] = s.files[0].reads;
+            out[5] = s.files[0].bytes_read;
+            if (s.h5 != null) {
+                const ds = &s.ds;
+                out.* = .{ @intFromBool(ds.index_ready), @intFromBool(ds.index_failed), ds.warmed_nodes, ds.frontier.items.len - ds.frontier_at, s.files[0].reads, s.files[0].bytes_read };
+            }
         },
         else => {},
     }
@@ -757,6 +773,26 @@ export fn ze_export(e: *Engine, kind: u32, buf: ?[*]u8, cap: usize) i64 {
     defer e.gpa.free(text);
     if (buf) |b| if (cap >= text.len) @memcpy(b[0..text.len], text);
     return @intCast(text.len);
+}
+
+/// Internal same-page binary result state, independent of output artifacts.
+export fn ze_result_checkpoint(e: *Engine, buf: ?[*]u8, cap: usize) i64 {
+    const checkpoint = @import("result_checkpoint.zig");
+    const size = checkpoint.byteSize(e) catch |err| return failed(e, "result checkpoint", err);
+    if (buf) |p| checkpoint.write(e, p[0..cap]) catch |err| return failed(e, "result checkpoint", err);
+    return @intCast(size);
+}
+
+/// Already measured phase-0 chance only: never calibrates or touches the GPU.
+export fn ze_result_chance(e: *Engine, out: *[2]f32) u32 {
+    if (e.chance_med.len == 0 or e.chance_spread.len == 0) return 0;
+    out.* = .{ e.chance_med[0], e.chance_spread[0] };
+    return 1;
+}
+
+export fn ze_restore_result_checkpoint(e: *Engine, bytes: [*]const u8, len: usize) i32 {
+    @import("result_checkpoint.zig").restore(e, bytes[0..len]) catch |err| return failed(e, "restore result checkpoint", err);
+    return 0;
 }
 
 /// Shared HDF5 export snapshot; optional active engine→Oxford-CS1 wxyz frame.

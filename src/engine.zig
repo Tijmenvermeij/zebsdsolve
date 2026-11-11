@@ -447,7 +447,7 @@ pub const ExportContext = struct {
     phase_generation: u64,
 };
 
-fn sameExportContext(a: ExportContext, b: ExportContext) bool {
+pub fn sameExportContext(a: ExportContext, b: ExportContext) bool {
     var x = a.settings;
     var y = b.settings;
     inline for (.{ "batch", "tile_mb", "refine_pixels", "wg_fft", "wg_refine" }) |key| {
@@ -481,9 +481,11 @@ pub const Results = struct {
     /// whether the stored match's refinement had settled
     settled: []bool = &.{},
 
-    fn resize(self: *Results, gpa: Allocator, n: usize) !void {
+    pub fn resize(self: *Results, gpa: Allocator, n: usize) !void {
+        const n_quat = std.math.mul(usize, 4, n) catch return error.ScanShapeTooLarge;
+        _ = std.math.mul(usize, n_quat, @sizeOf(f32)) catch return error.ScanShapeTooLarge;
         self.free(gpa);
-        self.quat = try gpa.alloc(f32, 4 * n);
+        self.quat = try gpa.alloc(f32, n_quat);
         self.ncc = try gpa.alloc(f32, n);
         self.nmi = try gpa.alloc(f32, n);
         self.phase = try gpa.alloc(i32, n);
@@ -506,7 +508,7 @@ pub const Results = struct {
         @memset(self.settled, false);
     }
 
-    fn free(self: *Results, gpa: Allocator) void {
+    pub fn free(self: *Results, gpa: Allocator) void {
         gpa.free(self.candidates);
         gpa.free(self.candidate_sweep);
         gpa.free(self.quat);
@@ -519,7 +521,7 @@ pub const Results = struct {
         self.* = .{};
     }
 
-    fn prepareCandidates(self: *Results, gpa: Allocator, phases: usize) !void {
+    pub fn prepareCandidates(self: *Results, gpa: Allocator, phases: usize) !void {
         const count = try std.math.mul(usize, self.phase.len, phases);
         if (self.candidates.len == count and self.candidate_phases == phases) return;
         const records = try gpa.alloc(Record, count);
@@ -818,18 +820,45 @@ pub const Engine = struct {
     /// Open a scan from files (the pattern file first). The geometry takes whatever the file
     /// records; the rest keeps its current value.
     pub fn openScan(self: *Engine, paths: []const []const u8) !void {
-        const s = scan_mod.Scan.open(self.gpa, paths, .{
-            .rows = self.set.map_rows,
-            .cols = self.set.map_cols,
-            .pat_h = self.set.pattern_height,
-            .pat_w = self.set.pattern_width,
-        }) catch |e| {
-            return e;
-        };
+        try self.openScanPrepared(paths, self.set, self.set, self.mask_explicit);
+    }
+
+    /// Project/read patches are prospective until parsing and result allocation succeed.
+    /// Read hints win while opening; the project patch wins in committed settings.
+    pub fn openScanConfigured(self: *Engine, paths: []const []const u8, settings_json: []const u8, hints_json: []const u8) !void {
+        var read_settings = self.set;
+        var explicit = self.mask_explicit;
+        const project_mask = try read_settings.applyTrackingMask(self.gpa, settings_json);
+        explicit = explicit or project_mask;
+        const hints_mask = try read_settings.applyTrackingMask(self.gpa, hints_json);
+        explicit = explicit or hints_mask;
+        var final_settings = read_settings;
+        _ = try final_settings.applyTrackingMask(self.gpa, settings_json);
+        try self.openScanPrepared(paths, read_settings, final_settings, explicit);
+    }
+
+    fn openScanPrepared(self: *Engine, paths: []const []const u8, read_settings: Settings, final_settings: Settings, explicit: bool) !void {
+        const s = try scan_mod.Scan.open(self.gpa, paths, .{
+            .rows = read_settings.map_rows,
+            .cols = read_settings.map_cols,
+            .pat_h = read_settings.pattern_height,
+            .pat_w = read_settings.pattern_width,
+        });
+        errdefer s.close();
+        // Count and quaternion byte sizes must fit wasm32 before any resize arithmetic.
+        const n = std.math.cast(usize, s.count()) orelse return error.ScanShapeTooLarge;
+        var replacement: Results = .{};
+        errdefer replacement.free(self.gpa);
+        try replacement.resize(self.gpa, n);
+        // No fallible operations below: only now may the current scan be replaced.
         self.closeScan();
         self.source = .{ .file = s };
-        try self.adoptInfo(s.info);
+        self.res = replacement;
+        self.set = final_settings;
+        self.mask_explicit = explicit;
         if (!self.mask_explicit) self.set.mask = s.format.defaultMask();
+        self.adoptInfo(s.info, read_settings.detector_width_mm);
+        self.geo_given = self.geo;
         self.events.log("opened {s}: {d} × {d} patterns of {d} × {d}", .{ s.formatName(), s.info.rows, s.info.cols, s.info.pat_h, s.info.pat_w });
     }
 
@@ -851,8 +880,8 @@ pub const Engine = struct {
         if (!(self.geo.px_um > 0)) self.geo.px_um = self.defaultPx();
     }
 
-    fn adoptInfo(self: *Engine, si: scan_mod.Info) !void {
-        try self.res.resize(self.gpa, @as(usize, si.rows) * si.cols);
+    fn adoptInfo(self: *Engine, si: scan_mod.Info, detector_width_mm: f64) void {
+        if (si.pc_note.len != 0) self.events.log("{s}", .{si.pc_note});
         self.calibration = si.calibration;
         const g = &self.geo;
         if (!std.math.isNan(si.pc[0]) and !std.math.isNan(si.pc[1]) and !std.math.isNan(si.pc[2])) {
@@ -861,7 +890,7 @@ pub const Engine = struct {
         }
         if (!std.math.isNan(si.sample_tilt_deg)) g.sample_tilt_deg = si.sample_tilt_deg;
         if (!std.math.isNan(si.detector_tilt_deg)) g.detector_tilt_deg = si.detector_tilt_deg;
-        g.px_um = self.defaultPx();
+        g.px_um = if (std.math.isFinite(si.px_um) and si.px_um > 0) si.px_um else 1000.0 * detector_width_mm / @as(f64, @floatFromInt(@max(si.pat_w, 1)));
         if (!std.math.isNan(si.step_x_um)) g.step_x_um = si.step_x_um;
         if (!std.math.isNan(si.step_y_um)) g.step_y_um = si.step_y_um;
         if (si.calibration.metadata != null) {
@@ -2596,7 +2625,7 @@ pub const Engine = struct {
 
     pub fn storedOverviewCount(self: *const Engine) usize {
         return switch (self.source) {
-            .file => |s| if (s.overview_addr != null) @intCast(s.count()) else 0,
+            .file => |s| if (s.overview_kind != .none) @intCast(s.count()) else 0,
             else => 0,
         };
     }

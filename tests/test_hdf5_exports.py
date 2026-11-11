@@ -9,6 +9,8 @@ import json
 import os
 import sys
 import tempfile
+import shutil
+import warnings
 import unittest
 
 import h5py
@@ -151,6 +153,8 @@ class Exports(unittest.TestCase):
             equivalent = s.export_oxford_snapshot(override)
             self.assertTrue(np.allclose(equivalent['results']['quaternions'], native['results']['quaternions']))
         self.assertEqual(frame['convention_version'], 1)
+        self.assertFalse(frame['preserve_source_pattern_centres'])
+        self.assertEqual(frame['warnings'], [])
         self.assertLess(float(rotation(frame['engine_to_cs1']).angle(b))/degree, .0001)
         for p, angle in enumerate([0,30]):
             c = rotation.id if not angle else rotation.byAxisAngle(zvector, angle*degree)
@@ -445,8 +449,9 @@ class Exports(unittest.TestCase):
             self.assertIn('Bruker', f['zebsdsolve/PatternCentres'].attrs['Convention'])
         expected = np.array([P @ [c,r,1.] for r in range(2) for c in range(3)])[:,:3]
         self.assertTrue(np.allclose(np.asarray(frozen['pattern_centres']).reshape(-1,3), expected, atol=1e-12))
-        with self.assertRaisesRegex(Error, 'OxfordPlaneExportNotValidated'):
-            s.export_oxford_snapshot()
+        oxford = s.export_oxford_snapshot()
+        self.assertTrue(oxford['oxford_frame']['preserve_source_pattern_centres'])
+        self.assertEqual(len(oxford['oxford_frame']['warnings']), 1)
         s.set_geometry(plane_kind='none', pc=[.2,.3,.4])
         self.assertEqual(s.export_snapshot(), frozen)
         s.set_geometry(plane_kind='affine', plane=P)
@@ -456,6 +461,144 @@ class Exports(unittest.TestCase):
         s.open(self.baseline)
         self.assertEqual(s.geometry['plane_kind'], 'none')
         self.assertEqual(s.geometry['px_um'], 0)
+
+    def test_oxford_plane_preserves_acquisition_pc_and_native_frames(self):
+        pc_keys = ['Pattern Center X', 'Pattern Center Y', 'Detector Distance']
+        message = ('Orientations were indexed with a fitted source plane. Standard Oxford '
+                   'pattern-centre fields retain acquisition values. Fitted values are stored '
+                   'in /zebsdsolve/PatternCentres.')
+        source = self.out/'plane-acquisition.h5oina'
+        shutil.copyfile(self.baseline, source)
+        with h5py.File(source, 'r+') as f:
+            data = f['1/EBSD/Data']
+            for k, key in enumerate(pc_keys):
+                del data[key]
+                dtype = '<f8' if k == 1 else '<f4'
+                d = data.create_dataset(key, data=np.array([.11+k*.05, .2, np.nan, .4, .5, .6], dtype=dtype))
+                d.attrs['Unit'] = 'fraction'
+                d.attrs['Acquisition metadata'] = np.array([7, 13], dtype='i2')
+        for kind in ['affine', 'projective']:
+            for frame_mode in ['nominal', 'follow']:
+                with self.subTest(kind=kind, frame=frame_mode):
+                    s = self.oxford_solver(source)
+                    s.configure(plane_frame=frame_mode)
+                    # These are final indexed poses: a retained nominal residual and a
+                    # nonzero follow-equivalent residual. Export adds no plane-dependent
+                    # frame rotation to either one.
+                    residual = [.002,-.003,.001] if frame_mode == 'nominal' else [.015,-.02,.01]
+                    P = np.array([[.001,.002,.4],[.003,.004,.2],[.005,.006,.5],[0,0,1.]])
+                    if kind == 'projective': P[3,:2] = [.001, -.002]
+                    s.set_geometry(rot=residual, plane_kind=kind, plane=P, px_um=350)
+                    s.index()
+                    raw = s.export_snapshot()
+                    native = s.export_oxford_snapshot()
+                    policy = native['oxford_frame']
+                    self.assertTrue(policy['preserve_source_pattern_centres'])
+                    self.assertEqual(policy['warnings'], [message])
+                    b = rotation.byAxisAngle(zvector, 90*degree)
+                    valid = np.asarray(raw['results']['phase']) >= 0
+                    expected = self.expected_oxford(raw, b, valid)
+                    actual = rotation(np.asarray(native['results']['quaternions']).reshape(6,4)[valid]).inv()
+                    self.assertLess(float(np.max(actual.angle(expected)))/degree, .0001)
+                    # The indexed frozen context controls policy and effective calibration,
+                    # including after current controls drop the plane and change the pose.
+                    s.set_geometry(plane_kind='none', rot=[.2,.3,.1], sample_tilt_deg=60, px_um=0)
+                    self.assertEqual(s.export_oxford_snapshot(), native)
+                    target = self.out/f'plane-{kind}-{frame_mode}.h5oina'
+                    with warnings.catch_warnings(record=True) as caught:
+                        warnings.simplefilter('always')
+                        s.export(target)
+                    self.assertEqual([str(w.message) for w in caught], [message])
+                    imported = loadEBSD(str(target), grid=False, eulerCorrection=rotation.id)
+                    self.assertLess(float(np.max(imported.rotations[valid].angle(expected)))/degree, .002)
+                    with h5py.File(target) as f, h5py.File(source) as original:
+                        for key in pc_keys:
+                            a, b0 = f['1/EBSD/Data/'+key], original['1/EBSD/Data/'+key]
+                            self.assertEqual(a.dtype, b0.dtype)
+                            self.assertEqual(a.shape, b0.shape)
+                            self.assertEqual(a[()].tobytes(), b0[()].tobytes())
+                            self.assertEqual(set(a.attrs), set(b0.attrs))
+                            for attr in a.attrs: np.testing.assert_equal(a.attrs[attr], b0.attrs[attr])
+                        self.assertTrue(np.array_equal(f['zebsdsolve/PatternCentres'][()], np.asarray(native['pattern_centres']).reshape(6,3)))
+                        self.assertEqual(json.loads(f['zebsdsolve/ProvenanceJSON'][()])['oxford_frame'], policy)
+                        for key, field in [('Detector Orientation Euler','effective_detector_euler_radians'), ('Tilt Angle','effective_tilt_radians')]:
+                            self.assertTrue(np.allclose(f['1/EBSD/Header/'+key][()].reshape(-1), np.asarray(native['calibration'][field]).reshape(-1)))
+
+    def test_oxford_plane_requires_native_pattern_centres_before_warning(self):
+        for flag in [False, True]:
+            with self.subTest(native_flag=flag):
+                snapshot = deepcopy(self.snapshot)
+                del snapshot['pattern_centres']
+                snapshot['geometry']['plane_kind'] = 0 if flag else 1
+                snapshot['oxford_frame'] = {'preserve_source_pattern_centres': flag}
+                target = self.out/f'missing-plane-pc-{flag}.h5oina'
+                original = b'Existing output must survive an incomplete snapshot'
+                target.write_bytes(original)
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter('always')
+                    with self.assertRaisesRegex(ValueError, 'requires pattern_centres'):
+                        write_oxford(target, self.baseline, snapshot, [1,0,0,0], 'Controlled identity')
+                self.assertEqual(caught, [])
+                self.assertEqual(target.read_bytes(), original)
+                self.assertEqual(list(self.out.glob('.'+target.name+'.*.h5')), [])
+
+    def test_oxford_plane_warning_as_error_keeps_existing_output(self):
+        snapshot = deepcopy(self.snapshot)
+        snapshot['geometry']['plane_kind'] = 1
+        snapshot['oxford_frame'] = {'preserve_source_pattern_centres': True}
+        target = self.out/'warning-error-existing.h5oina'
+        original_bytes = b'Existing output must survive a warning promoted to an error'
+        target.write_bytes(original_bytes)
+        with warnings.catch_warnings():
+            warnings.simplefilter('error', UserWarning)
+            with self.assertRaisesRegex(UserWarning, 'Standard Oxford pattern-centre fields retain acquisition values'):
+                write_oxford(target, self.baseline, snapshot, [1,0,0,0], 'Controlled identity')
+        self.assertEqual(target.read_bytes(), original_bytes)
+        self.assertEqual(list(self.out.glob('.'+target.name+'.*.h5')), [])
+
+    def test_direct_flagless_plane_snapshot_preserves_pc_and_normalizes_policy(self):
+        from zebsdsolve.hdf5_export import OXFORD_PLANE_PC_WARNING
+        for native_flag in [None, False]:
+            with self.subTest(native_flag=native_flag):
+                snapshot = deepcopy(self.snapshot)
+                snapshot['geometry']['plane_kind'] = 1
+                if native_flag is not None:
+                    snapshot['oxford_frame'] = {'preserve_source_pattern_centres': native_flag, 'warnings': []}
+                original = deepcopy(snapshot)
+                target = self.out/f'direct-flagless-plane-{native_flag}.h5oina'
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter('always')
+                    write_oxford(target, self.baseline, snapshot, [1,0,0,0], 'Controlled identity')
+                self.assertEqual([str(w.message) for w in caught], [OXFORD_PLANE_PC_WARNING])
+                self.assertEqual(snapshot, original)
+                with h5py.File(target) as f, h5py.File(self.baseline) as acquisition:
+                    for key in ['Pattern Center X', 'Pattern Center Y', 'Detector Distance']:
+                        a, b = f['1/EBSD/Data/'+key], acquisition['1/EBSD/Data/'+key]
+                        self.assertEqual(a.dtype, b.dtype)
+                        self.assertEqual(a[()].tobytes(), b[()].tobytes())
+                        for attr in b.attrs: np.testing.assert_equal(a.attrs[attr], b.attrs[attr])
+                    policy = json.loads(f['zebsdsolve/ProvenanceJSON'][()])['oxford_frame']
+                    self.assertTrue(policy['preserve_source_pattern_centres'])
+                    self.assertEqual(policy['warnings'], [OXFORD_PLANE_PC_WARNING])
+
+    def test_oxford_plane_keeps_absent_acquisition_pc_fields_absent(self):
+        source = self.out/'plane-no-acquisition-pc.h5oina'
+        shutil.copyfile(self.baseline, source)
+        keys = ['Pattern Center X', 'Pattern Center Y', 'Detector Distance']
+        with h5py.File(source, 'r+') as f:
+            for key in keys: del f['1/EBSD/Data/'+key]
+        s = self.oxford_solver(source)
+        P = np.array([[.001,.002,.4],[.003,.004,.2],[.005,.006,.5],[0,0,1.]])
+        s.set_geometry(plane_kind='affine', plane=P, px_um=350)
+        s.index()
+        target = self.out/'plane-no-acquisition-pc-export.h5oina'
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
+            s.export(target)
+        self.assertEqual(len(caught), 1)
+        with h5py.File(target) as f:
+            for key in keys: self.assertNotIn('1/EBSD/Data/'+key, f)
+            self.assertIn('zebsdsolve/PatternCentres', f)
 
     def test_native_pattern_centres_are_stored_and_validated(self):
         target = self.out/'ordinary-native-pcs.h5'

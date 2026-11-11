@@ -108,6 +108,7 @@ _SIGS = {
     "ze_events": ([P, ctypes.c_char_p, SZ], SZ),
     "ze_cancel": ([P], None),
     "ze_open_scan": ([P, ctypes.c_char_p, SZ], I32),
+    "ze_open_scan_configured": ([P, ctypes.c_char_p, SZ, ctypes.c_char_p, SZ, ctypes.c_char_p, SZ], I32),
     "ze_set_patterns": ([P, P, SZ, U32, U32, U32, U32, U32], I32),
     "ze_synthesize": ([P, f32p, ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_int32), SZ], I32),
     "ze_chunk_index_status": ([P, ctypes.POINTER(U64)], None),

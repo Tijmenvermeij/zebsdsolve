@@ -371,23 +371,68 @@ MIT ([LICENSE](../LICENSE)). The wheels bundle [wgpu-native](https://github.com/
 
 ### Browser batch queue
 
-Configure a file-backed scan in the usual tabs, then choose **Add to batch**.
+Use **Open scan…** to select scan files, or drop them on the window.
+
+Configure the scan in the usual tabs, then choose **Add to batch**.
 Each job freezes its ordered scan/side files and masters, ROI, processing,
 refinement, original file-opening hints, effective geometry, and phase metadata.
-Opening the next scan does not change queued jobs. In **Batch**, edit the output
-name, or **Load** an unstarted job into the normal controls and use **Update batch
-job** to save adjustments. Loading a completed job creates a new configuration;
-it does not alter its saved outputs.
+Opening the next scan does not change queued jobs. **Load** restores an unstarted
+job into the normal controls; **Update batch job** saves adjustments. **Load** on a
+completed job restores its native winners, secondary phase candidates and maps,
+selects IPF-Z and an indexed point for the pattern overlay, and enables exports
+without indexing again. Each completed row retains an immutable in-page result
+checkpoint, independent of Downloads cache cleanup. This is internal state, not
+a sixth output file. Removing the row, clearing the queue or reloading the page
+releases that checkpoint. Loading a job does not change its saved outputs.
 
-Choose an output folder once, then **Run batch**. Edge/Chrome's folder-access API
-writes files directly. Jobs run sequentially on a separate engine/device, with
-the interactive scan preserved. Each scan gets its own directory and five files:
-an EMSphInx-style H5, an Oxford H5OINA (without patterns) or ANG for other sources,
-a settings JSON, and native IPF-Z/NCC PNG maps. H5 also contains the native map
-pixels and numeric NCC raster. Existing names get a suffix; completed files are
-not replaced. The batch manifest records inputs, frozen settings, output status
-and errors. Source file identities are recorded by name, size and modification
-time; these descriptors are not cryptographic file hashes.
+Each row's **Output…** button configures its parent folder and shared folder/file
+name. The default is `<scan>_ZEBSDsolve_BW<bandwidth>` beside the pattern data.
+**Set up output folders…** requests source-folder access before running; **Run batch** requests any missing access as well. Chrome/Edge require a directory grant even after opening an individual file. Verified grants are reused. **Set all output folders…** explicitly assigns a
+common destination to the current unstarted jobs. Fetched examples can use this
+or **Output…** to choose an arbitrary destination.
+
+Jobs run sequentially on a separate engine/device, preserving the interactive
+scan. Each result folder contains exactly five files with its resolved name:
+
+- `<name>.h5`: EMSphInx-style solutions, native IPF-Z/NCC map pixels and numeric NCC.
+- `<name>.h5oina` for Oxford, without patterns, or `<name>.ang` for other sources.
+- `<name>_IPF-Z.png` and `<name>_NCC.png`: native RGBA maps at the original scan resolution, without legends, resizing or additional normalization.
+- `<name>.json`: reopenable project settings and a per-job status/output journal.
+
+Existing directory names get a numbered suffix, applied to every filename too.
+Completed files are not replaced. The JSON retains the source/master descriptors,
+frozen settings, geometry and opening hints; its `batch` section records status,
+errors and completed outputs. No shared manifest is written.
+Source descriptors use name, size and modification time rather than full-file
+hashes. Native file handles verify source-folder identity where available;
+input-only files require an explicitly selected matching folder.
+
+**Save to Downloads** is unchecked by default. When enabled before a job first
+runs, batch skips external output-folder permissions and prepares one
+`<name>.zip` per scan. Each ZIP contains the same five files inside `<name>/`.
+The project JSON records `batch.transport = "downloads"` and
+`batch.status = "archive-ready"`; completion flags mean the files were packaged,
+not that the browser confirmed a disk save.
+
+The app attempts an automatic download and keeps a **Download ZIP** link on each
+ready row. Use that link if automatic downloads are blocked. Download location,
+filename conflicts, multiple-download permission and Save As prompts follow the
+browser's settings. This uses ordinary browser downloads rather than a folder
+write grant. Ready links remain usable while later jobs run; removing a job or
+clearing the queue retires its link. Keep the tab open for manual re-downloads.
+
+Exports are staged in origin-private browser storage for guarded retries. ZIP
+checksums and immutable archive chunks use reads no larger than 1 MiB; the
+browser manages storage for the complete archive. The archive is independent of
+the staged files, which can be reclaimed after packing. Private-storage failures
+are reported; unavailable storage stops before indexing. Stale recognized cache
+workspaces can be reclaimed on a later visit only when no live tab holds their
+ownership lock.
+
+Downloads currently use ZIP32 and require each complete archive to be smaller
+than 4 GiB. A size-limit failure keeps the job pending; its pinned output mode
+cannot be changed in place. To use folder output, clear/requeue the job in that
+mode, which runs indexing again. Folder output has no ZIP32 packaging limit.
 
 **Stop** cancels indexing at a safe batch boundary; it finishes an export already
 in progress. A save failure pauses the queue and retains the completed engine.
@@ -396,3 +441,47 @@ output or an uncertain committed write is left untouched and reported for manual
 inspection. Clearing the queue discards retained unsaved results; it does not
 delete files already saved. Keep the page open until the batch completes: durable
 queue restoration after closing/reloading the browser is not implemented.
+
+## UP1/UP2 scans with ANG map information
+
+Opening an EDAX UP1/UP2 pattern file shows a prompt for the corresponding ANG
+scan file. Click **Choose ANG…** to open the file picker. Choose both files
+together to skip the prompt. Cancelling leaves the current scan open.
+
+The ANG supplies a square raster's dimensions, scan steps in micrometres and
+Image Quality map. Its pixel count and coordinate order must match the UP file;
+hexagonal grids and mismatched pairs are rejected. The Image Quality map loads
+without calculating contrast from the patterns. ANG orientations, phases and detector tilts are not imported by this adapter.
+A complete valid `x-star`, `y-star`, `z-star` header supplies the pattern centre
+when its convention is identified.
+
+Both files remain attached to a batch job. Saved projects record both source
+file descriptors; reopen the project with the original UP and ANG files.
+
+The adapter is checked against pyMTEX 1.0.0's native ANG importer
+(`loadEBSD(..., grid=False, setting=0)`), including a real 502-point EDAX file.
+Coordinates are verified in file order with X varying fastest and Y increasing
+between rows. The ANG origin verifies registration; the app uses scan-relative
+coordinates. No orientation reference-frame conversion is performed.
+
+ANG pattern centres are converted to the engine's Bruker convention using the
+UP file's stored detector width W and height H, before any pattern binning:
+
+- Native EDAX OIM: `(x, 1-y, z*min(W,H)/H)`.
+- Recognized EMSphInx, zebsdsolve and Overlap-GUI headers: `(x, 1-y*W/H, z*W/H)`.
+
+Producer markers and the validated legacy EMSphInx header structure determine
+the conversion. Unrecognized rectangular headers keep the scan and IQ map,
+leave the file PC unset, and report this in the log. Explicit recognized writer
+markers take precedence over structural fingerprints. Conflicting explicit
+markers leave the PC unset on rectangular detectors. For square patterns the
+two normalizations coincide, so the common PC is imported with a diagnostic. Missing or all-zero calibration is treated as unavailable;
+partial, duplicate or invalid PC fields are rejected. Off-detector X/Y values
+are allowed. A positive detector distance is required. No crop or pixel-origin
+correction is inferred from a separate indexing file.
+
+pyMTEX 1.0.0's native ANG importer preserves the raw star values in its header
+metadata but exposes no PC-convention conversion API. The minimal native adapter
+therefore uses the [documented EDAX convention](https://kikuchipy.org/en/stable/reference/generated/kikuchipy.detectors.EBSDDetector.html)
+and the verified EMSphInx writer (`include/modality/ebsd/idx.hpp`);
+Euler angles and spatial reference frames remain unchanged by PC import.
