@@ -1,6 +1,7 @@
 // HDF5 serialization only: orientations and coordinate transformations come from the engine.
 // h5wasm 0.10.3 is vendored verbatim; see vendor/h5wasm/PROVENANCE.json and LICENSE.txt.
 import { copyOxfordMetadata } from "./hdf5-metadata-copy.js";
+import { isOxfordH5, preservesSourcePC, oxfordExportWarnings } from "./oxford-export-policy.js";
 let runtime;
 async function hdf5() {
   runtime ||= import("./vendor/h5wasm/hdf5_hl.js").then(async (h) => { await h.ready; return h; });
@@ -66,6 +67,12 @@ function provenance(f, s, frame) {
   put(g, "GeometryJSON", JSON.stringify(s.geometry));
   put(g, "ProvenanceJSON", JSON.stringify({ schema_version: 1, version: s.version, source_format: s.scan.format, units: { euler: "radians", lattice: "angstrom, degrees", map: "micrometres" }, ...(frame ? { oxford_frame: frame } : {}), ...(s.calibration ? { calibration: s.calibration } : {}) }));
   put(g, "PhasesJSON", JSON.stringify(s.phases));
+  if (s.pattern_centres) {
+    const n = s.scan.rows * s.scan.cols;
+    if (s.pattern_centres.length !== n * 3 || !s.pattern_centres.every(Number.isFinite)) throw new Error("Incomplete native pattern centres.");
+    put(g, "PatternCentres", new Float64Array(s.pattern_centres), [n, 3]).create_attribute("Convention", "Bruker: x from left / width; y from top / height; z / height");
+  }
+
   const selected = g.create_group("Selected"), n = s.scan.rows * s.scan.cols;
   for (const [key, width] of [["quaternions", 4], ["euler", 3], ["phase", 1], ["ncc", 1], ["nmi", 1], ["z", 1], ["sweep", 1]]) {
     if (s.results[key]?.length !== n * width) throw new Error(`Incomplete selected ${key} snapshot.`);
@@ -125,6 +132,16 @@ export async function exportH5(s) {
   return fileBytes(null, (f) => {
     put(f, "Manufacturer", "EMSphInx"); put(f, "Version", String(s.version));
     provenance(f, s);
+    if (s.maps) {
+      const maps = group(f, "zebsdsolve/Maps");
+      put(maps, "Source", "Native zebsdsolve GUI map pixels; IPF-Z and detector NCC");
+      for (const [key, name] of [["ipf_z", "IPFZ_RGBA"], ["ncc", "NCC_RGBA"]]) {
+        const rgba = s.maps[key];
+        if (!rgba || rgba.length !== n * 4) throw new Error(`Incomplete ${key} map.`);
+        put(maps, name, new Uint8Array(rgba), [s.scan.rows, s.scan.cols, 4]);
+      }
+      put(maps, "NCC", Float64Array.from(s.results.ncc, (v, i) => s.results.phase[i] >= 0 ? v : NaN), [s.scan.rows, s.scan.cols]);
+    }
     const ranks = rest.reduce((r, v) => Math.max(r, v.length + 1), 1);
     for (let rank = 0; rank < ranks; rank++) {
       const g = group(f, `Scan ${rank + 1}/EBSD`), hd = g.create_group("Header"), d = g.create_group("Data"), geo = s.geometry;
@@ -199,8 +216,9 @@ const PC_FIELDS = ["Pattern Center X", "Pattern Center Y", "Detector Distance"];
 export async function exportOxford(s, source, frameValue) {
   if (!source || !Number.isFinite(source.size)) throw new Error("Oxford export requires the original H5OINA acquisition file.");
   const frame = oxfordFrame(frameValue);
+  for (const warning of oxfordExportWarnings(s)) console.warn(warning);
   snapshot(s);
-  if (!/oxford|h5oina/i.test(s.scan.format)) throw new Error("Oxford export requires an original Oxford H5OINA scan.");
+  if (!isOxfordH5(s.scan.format)) throw new Error("Oxford export requires an original Oxford H5OINA scan.");
   if (typeof Worker !== "undefined") {
     return new Promise((resolve, reject) => {
       const worker = new Worker(new URL("./hdf5-export-worker.js", import.meta.url), { type: "module" });
@@ -228,6 +246,7 @@ export async function exportOxford(s, source, frameValue) {
 export async function exportOxfordFromPath(s, sourcePath, frameValue) {
   s = currentSnapshot(s);
   const frame = oxfordFrame(frameValue), n = snapshot(s), h = await hdf5();
+  if (preservesSourcePC(s)) { frame.preserve_source_pattern_centres = true; frame.warnings = oxfordExportWarnings(s); }
   const source = new h.File(sourcePath, "r");
   try {
     return await fileBytes(null, (f, h) => {
@@ -289,7 +308,8 @@ function writeOxford(f, h, s, frame, n) {
       for (let j = 0; j < 3; j++) eulerValues[3 * i + j] = indexed[i] ? s.results.euler[3 * i + j] : 0;
     }
     euler.write_slice([[0, n], [0, 3]], eulerValues); phase.write_slice([[0, n]], phaseValues);
-    for (let j = 0; j < PC_FIELDS.length; j++) {
+    // Keep every source PC value, including unindexed cells and missing fields.
+    if (!preservesSourcePC(s)) for (let j = 0; j < PC_FIELDS.length; j++) {
       const name = PC_FIELDS[j], d = data.get(name);
       if (d && (d.shape?.join() !== `${n}` || !/^Float(32|64)Array$/.test(d.value?.constructor?.name))) throw new Error(`Unsupported Oxford ${name} layout; use Python export.`);
       const values = d ? d.value : new Float64Array(n).fill(NaN);

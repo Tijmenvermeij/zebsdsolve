@@ -1,10 +1,10 @@
 {
-  "source_revision": "fa24a4e9678a439e34e20a741d1b91a79dd29648",
+  "source_revision": "0f79b90b53f45171e55e731f24241cfd3ddaba02",
   "source_dirty": false,
   "sha256": {
-    "index.html": "874e1ad4dbb4b54fceb455f1ca9f682a242bedfbee49dc1504bfee8bc25ee748",
-    "js/app.js": "e0d6cb4d3762b69a46070a951f8a99c01b970a125fc29eb7fdc60556dcf46894",
-    "zebsdsolve/zebsdsolve.js": "86a5f287cf8c94d34f3d4185a8b0ed4089bd7f48f2362e7e7c8bb90f03bc0f10",
-    "zebsdsolve/zebsdsolve.wasm": "6599c60781170983dd3179f095d20e70c92cbb9ce11488694bfd8f63e51e524e"
+    "index.html": "e34ec374703db33d0dc5a5bc4ae4a7d779688ee80043774bdb96d645f026d3bf",
+    "js/app.js": "f8e6ee49ddf840928b8c970687e85c6b5a444a877c1c86e33b89051880876cb3",
+    "zebsdsolve/zebsdsolve.js": "66287ec60695a680a084a98c8e990c693d93f8a9c8ad99a3ede0f9458d5c81ed",
+    "zebsdsolve/zebsdsolve.wasm": "0107c86f9a727af900b81aabe60d9718375430474a14e8fd47666e3927681172"
   }
 }
