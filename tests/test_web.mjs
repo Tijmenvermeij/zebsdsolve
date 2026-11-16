@@ -76,8 +76,18 @@ const ws = new WebSocket(wsUrl);
 await new Promise((r, j) => { ws.onopen = r; ws.onerror = j; });
 let seq = 0;
 const pending = new Map();
+// the page's console errors and uncaught exceptions, with their stacks: what an error in the
+// app's log came from (printed by "no errors in the log")
+const pageErrors = [];
+const stackOf = (st) => (st?.callFrames || []).slice(0, 6).map((f) => `${f.functionName || "(anonymous)"} ${f.url.split("/").pop()}:${f.lineNumber + 1}:${f.columnNumber + 1}`).join(" < ");
 ws.onmessage = (ev) => {
   const m = JSON.parse(ev.data);
+  if (m.method === "Runtime.consoleAPICalled" && m.params.type === "error") {
+    pageErrors.push(`${m.params.args.map((a) => a.description || a.value || "").join(" ")} [${stackOf(m.params.stackTrace)}]`);
+  } else if (m.method === "Runtime.exceptionThrown") {
+    const d = m.params.exceptionDetails;
+    pageErrors.push(`${d.exception?.description || d.text} [${stackOf(d.stackTrace)}]`);
+  }
   if (m.id && pending.has(m.id)) {
     const { res, rej } = pending.get(m.id);
     pending.delete(m.id);
@@ -374,7 +384,7 @@ try {
       oxfordDisabled:document.getElementById('btn-h5oina').disabled };
   `);
   check("HDF5 export uses stored results without another solve", hdf5.correct && hdf5.rows===55 && hdf5.same && hdf5.enabled && hdf5.oxfordDisabled,
-    `${hdf5.bytes} bytes; selected phases and raw Euler angles match; Oxford requires an original Oxford source/frame`);
+    `${hdf5.bytes} bytes; selected phases and stored Euler angles match; Oxford requires an original Oxford source/frame`);
   check("the map says what its colours mean", idx.key.w > 20 && idx.key.names === "001 101 111", `an inverse pole figure key ${idx.key.w} px wide, corners ${idx.key.names}`);
   // another colouring from the Index tab: the map and its key follow it
   const keyed = await evaluate(`
@@ -667,6 +677,48 @@ try {
     items()[last].querySelector("input.on").click();
     await wait(1200);
     const on = { engine: window.ze.phases.length, back: items()[last].dataset.on === "1" };
+    // switched while the pattern view is drawing (which, on a slow GPU, it still is when the
+    // engine's phases are emptied and filled again): no error, and the view names a phase
+    // that is there
+    // (each phase taken back 400 ms late, as a slow GPU takes it: the view's drawing goes on
+    // while the list is empty or half full)
+    const errsBefore = document.querySelectorAll("#log .err").length;
+    const stage = document.getElementById("pat-stage");
+    const addPhase = window.ze.addPhase;
+    window.ze.addPhase = async function (f) { await wait(400); return addPhase.call(this, f); };
+    try {
+      for (let t = 0; t < 4; t++) {
+        const k = t % 2 ? last : 0;
+        stage.dispatchEvent(new Event("change"));
+        await wait(t * 40);
+        items()[k].querySelector("input.on").click();
+        await wait(1500);
+        stage.dispatchEvent(new Event("change"));
+        items()[k].querySelector("input.on").click();
+        await wait(1500);
+      }
+    } finally {
+      window.ze.addPhase = addPhase;
+    }
+    // A phase consumer already inside the engine queue remains suspended while
+    // the UI requests replacement. Native destruction must wait for its release.
+    let releaseConsumer, enteredConsumer, consumerActive = false, clearedWhileActive = false, clearCount = 0;
+    const entered = new Promise(resolve => { enteredConsumer = resolve; });
+    const gate = new Promise(resolve => { releaseConsumer = resolve; });
+    const clearPhases = window.ze.clearPhases;
+    window.ze.clearPhases = function () { clearCount++; clearedWhileActive ||= consumerActive; return clearPhases.call(this); };
+    const consumer = window.ze._serial(async () => { consumerActive = true; enteredConsumer(); await gate; consumerActive = false; });
+    await entered;
+    items()[last].querySelector("input.on").click();
+    await wait(100);
+    const waited = clearCount === 0;
+    releaseConsumer(); await consumer;
+    for (let i = 0; i < 100 && document.getElementById("app").dataset.busy === "1"; i++) await wait(50);
+    items()[last].querySelector("input.on").click();
+    for (let i = 0; i < 100 && document.getElementById("app").dataset.busy === "1"; i++) await wait(50);
+    window.ze.clearPhases = clearPhases;
+    on.inflight = { waited, clearedWhileActive, restored: window.ze.phases.length === n0 };
+    on.raced = { errors: document.querySelectorAll("#log .err").length - errsBefore, engine: window.ze.phases.length, said: [...document.querySelectorAll("#log .err")].slice(errsBefore).map((e) => e.textContent).join(" | ") };
     document.querySelector("#tab-simulate").click();
     document.querySelector('#view-mode [data-view="globe"]').click();
     await wait(500);
@@ -692,7 +744,9 @@ try {
     sup.dispatchEvent(new Event("change"));
     await wait(300);
     return { n0, off, on, sameZoom: left === right, cellChanged: c3 !== c1, atoms1, atoms3 };`);
-  check("a master pattern can be switched off and on without removing it", more.off.engine === more.n0 - 1 && more.off.listed === more.n0 && more.off.dimmed && more.on.engine === more.n0 && more.on.back, JSON.stringify(more));
+  check("a master pattern can be switched off and on without removing it", more.off.engine === more.n0 - 1 && more.off.listed === more.n0 && more.off.dimmed && more.on.engine === more.n0 && more.on.back
+    && more.on.raced.errors === 0 && more.on.raced.engine === more.n0
+    && more.on.inflight.waited && !more.on.inflight.clearedWhileActive && more.on.inflight.restored, JSON.stringify(more));
   check("the globe zooms about its middle, wherever the pointer is", more.sameZoom, "");
   check("the cell can be drawn as 3 × 3 × 3 cells", more.cellChanged && more.atoms3 > 20 * more.atoms1 * 0.5 && more.atoms3 > more.atoms1, `${more.atoms1} atoms, ${more.atoms3} in 27 cells`);
 
@@ -763,7 +817,7 @@ try {
     `legend ${sim.cell.legend}; ${sim.cell.energy}`);
 
   const errs = await evaluate(`return [...document.querySelectorAll("#log .err")].map((e) => e.textContent).slice(0, 5);`);
-  check("no errors in the log", errs.length === 0, errs.join(" | "));
+  check("no errors in the log", errs.length === 0, [...errs, ...(errs.length ? pageErrors.slice(0, 5).map((e) => `console: ${e}`) : [])].join(" | "));
 
   // a CIF the reader cannot take: refused, with the reason (and an error in the log, rightly)
   const refused = await evaluate(`

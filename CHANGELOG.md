@@ -4,6 +4,33 @@ What changed in each release, newest first. Work lands under an **Unreleased** h
 heading to the version and date, and the release workflow publishes the section as the release's
 notes.
 
+## Unreleased
+
+- Fork result checkpoints use version 2 and include the native master setting in their context fingerprint.
+
+## 0.2.1 — 2026-11-11
+
+### Fixed
+
+- Orientations were reduced to the fundamental zone by the point group's rotations as tables
+  write them (the unique axis along z, a two-fold along x), whatever axes the master pattern's
+  crystal was set up with. For a master in another setting (a monoclinic crystal with the
+  unique axis b; trigonal P-31m against P-3m1; EMsoft's overlap masters of twins) a stored
+  orientation, its Euler angles in the exports, and the fits' poses could be another
+  orientation, simulating another pattern, though the match itself was right. Each master's
+  symmetry is now measured, when it is loaded, from the operators its file gives or its space
+  group and cell imply, kept only where its intensities obey them; orientations are reduced
+  about the master's own axes, and the dictionary, `reduce`, disorientations and the inverse
+  pole figure colours follow the same rotations. Nothing changes for masters in the usual
+  setting (the bundled nickel and GaN); results indexed with others before should be indexed
+  again. Found by [Tijmenvermeij](https://github.com/Tijmenvermeij) (#3).
+- `zig build test` now runs the symmetry module's own tests, which it had left out.
+- In the app, switching a master pattern off or on, or adding one, left patterns indexed on the
+  spot naming phases by their old places in the list, and a pattern being drawn while the list
+  was rebuilt could look up a phase no longer there. The pattern view could then draw the wrong
+  phase's simulation, or fail with "Cannot read properties of undefined". Both are dropped now
+  whenever the list changes.
+
 ## 0.2.0 — 2026-11-10
 
 ### Geometry

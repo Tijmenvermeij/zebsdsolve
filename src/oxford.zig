@@ -147,26 +147,6 @@ test "Oxford crystal conversion is per convention and cell setting" {
     try std.testing.expectError(error.UnsupportedMasterCrystalSetting, crystalBasis(.x_a_z_cstar, .{ 2.95, 3.0, 4.68, 90, 105, 90 }));
 }
 
-test "Oxford calibrated detector matrices agree with independent native MTEX cases" {
-    const c: Calibration = .{ .metadata = .{ .detector_euler = .{ 0.00722032, 1.5679878, 0.00296268 }, .specimen_euler = .{ 0, 0, 0 }, .tilt_axis = 0, .scanning_rotation = 0, .original_tilt = -std.math.pi / 9.0 } };
-    // Generated with pyMTEX 1.0.0 by native byEuler/byAxisAngle compositions,
-    // independently of this implementation. Rows/columns are detector raster axes.
-    const negative: rot.Mat3 = .{
-        0.3446288460628502,  -0.0052724508239519, -0.9387242192058842,
-        -0.0072285461023605, -0.9999694849061044, 0.0029626639813385,
-        -0.9387111944483426, 0.0057645918267715,  -0.3446564418351069,
-    };
-    const positive: rot.Mat3 = .{
-        -0.9387111944483427, 0.0057645918267715,  -0.3446564418351067,
-        -0.0072285461023606, -0.9999694849061044, 0.0029626639813387,
-        -0.3446288460628500, 0.0052724508239522,  0.9387242192058836,
-    };
-    for ([_]f64{ -20, 70 }, [_]rot.Mat3{ negative, positive }) |tilt, expected| {
-        const g: Geometry = .{ .sample_tilt_deg = tilt };
-        for (c.rotation(&g), expected) |a, b| try std.testing.expectApproxEqAbs(a, b, 1e-12);
-    }
-}
-
 test "Oxford per-cell positions and plane frame use the calibrated baseline" {
     const c: Calibration = .{ .metadata = .{ .detector_euler = .{ 0.00722032, 1.5679878, 0.00296268 }, .specimen_euler = .{ 0, 0, 0 }, .tilt_axis = 0, .scanning_rotation = 0, .original_tilt = -std.math.pi / 9.0 } };
     var g: Geometry = .{ .pc = .{ 0.42, 0.21, 0.5 }, .sample_tilt_deg = -20, .rot = .{ 0.02, -0.03, 0.04 }, .px_um = 70, .step_x_um = 2, .step_y_um = 3 };

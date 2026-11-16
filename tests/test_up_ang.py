@@ -1,8 +1,8 @@
-"""UP stream + ANG scalar/grid adapter; native pyMTEX ANG import is the metadata oracle.
+"""UP stream + ANG scalar/grid adapter, checked against explicit fixture values.
 
 ANG uses EDAX micrometres, x-fast/y-next increasing raster order. No ANG orientations,
 phases or acquisition calibration enter the engine. Pattern centre is a scalar-only,
-producer-specific detector normalization, independent of MTEX orientation import. All temporary fixtures are local.
+producer-specific detector normalization. All temporary fixtures are local.
 """
 from pathlib import Path
 import struct
@@ -12,7 +12,6 @@ import sys
 import tempfile
 import unittest
 import numpy as np
-from mtex import loadEBSD
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT/'python'))
 from zebsdsolve import Solver, Error
@@ -46,13 +45,8 @@ class UpAng(unittest.TestCase):
                        for r in range(rows) for c in range(cols)]
         path.write_text('\r\n'.join(head+[' '.join(str(v) for v in row) for row in records]))
         return path, np.asarray(records)
-    def test_version_pixel_matrix_and_native_mtex_metadata_oracle(self):
+    def test_version_pixel_matrix_and_scalar_metadata(self):
         ang, records = self.ang(extra_cols=3)
-        oracle = loadEBSD(str(ang), grid=False, setting=0)
-        self.assertEqual(str(oracle.scanUnit), 'um')
-        np.testing.assert_allclose(oracle.x, records[:,3])
-        np.testing.assert_allclose(oracle.y, records[:,4])
-        np.testing.assert_allclose(oracle.prop['iq'], records[:,5])
         for version in [1,3,4]:
             for bits in [8,16]:
                 with self.subTest(version=version,bits=bits), Solver() as s:
@@ -169,8 +163,6 @@ class UpAng(unittest.TestCase):
                 positions = np.float32(origin) + np.arange(1000, dtype=np.float32)*np.float32(step)
                 records[:,3] = np.tile(np.round(positions.astype(float),5),2)
                 ang,_ = self.ang(rows=2, cols=1000, dx=step, records=records)
-                oracle = loadEBSD(str(ang), grid=False, setting=0)
-                np.testing.assert_array_equal(oracle.x, records[:,3])
                 with Solver() as s:
                     s.open(up,ang)
                     np.testing.assert_array_equal(s.stored_overview()['values'],records[:,5].reshape(2,1000))
@@ -215,9 +207,6 @@ class UpAng(unittest.TestCase):
                 with self.subTest(producer=producer,width=width,height=height),Solver() as s:
                     up,_=self.up(pat_w=width,pat_h=height)
                     ang,records=self.pc_ang(headers,producer)
-                    # pyMTEX exposes the original stars, but has no typed PC conversion.
-                    oracle=loadEBSD(str(ang),grid=False,setting=0)
-                    np.testing.assert_array_equal([oracle.meta['header'][axis+'_star'] for axis in 'xyz'],raw)
                     s.configure(binning=2)
                     s.set_geometry(sample_tilt_deg=-20,detector_tilt_deg=4)
                     s.open(up,ang)

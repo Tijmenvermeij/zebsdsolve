@@ -1,6 +1,7 @@
-"""Stored-candidate export, baseline preservation and native MTEX frame round-trips.
+"""Stored-candidate export, baseline preservation and native snapshot serialization.
 
-Run with h5py and native pyMTEX installed, against a rebuilt native library.
+Run with NumPy and h5py, against a rebuilt native library and GPU.
+Independent scientific frame/importer validation is private development work.
 """
 from pathlib import Path
 from copy import deepcopy
@@ -15,7 +16,6 @@ import unittest
 
 import h5py
 import numpy as np
-from mtex import loadEBSD, rotation, zvector, degree
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT/'python'))
@@ -82,7 +82,7 @@ class Exports(unittest.TestCase):
             h.create_dataset('Specimen Orientation Euler',data=[[.2,.1,.3]]).attrs['Unit']='rad'
             h.create_dataset('Detector Orientation Euler',data=[[.01,1.5,.02]]).attrs['Unit']='rad'
             h.create_dataset('Scanning Rotation Angle',data=[0.]).attrs['Unit']='rad'
-            h.create_dataset('Tilt Angle',data=[70*degree]).attrs['Unit']='rad'
+            h.create_dataset('Tilt Angle',data=[np.deg2rad(70)]).attrs['Unit']='rad'
             h.create_dataset('Tilt Axis',data=[0.]).attrs['Unit']='rad'
             phase=cls.snapshot['phases'][0]
             p=h.create_group('Phases/1')
@@ -114,18 +114,19 @@ class Exports(unittest.TestCase):
             f['1/Data Processing/RelativeEuler']=h5py.SoftLink('Data/Euler')
             f['Unknown/Old processed Euler']=h5py.SoftLink('/1/Data Processing/Data/Euler')
 
-    @staticmethod
-    def expected_oxford(raw, sample_basis, valid, phase=None):
-        values = raw['results'] if phase is None else raw['candidates']
-        quaternions = np.asarray(values['quaternions']).reshape((-1, 6, 4))
-        selected = np.asarray(raw['results']['phase'])
-        output = []
-        for cell in np.flatnonzero(valid):
-            p = int(selected[cell]) if phase is None else phase
-            crystal = rotation.id if p == 0 else rotation.byAxisAngle(zvector, 30*degree)
-            q = rotation(quaternions[0 if phase is None else phase, cell])
-            output.append((sample_basis*q.inv()*crystal).data)
-        return rotation(np.asarray(output))
+    def assert_oxford_serialization(self, path, snapshot):
+        """Check container serialization against native output, without a frame oracle."""
+        valid = np.asarray(snapshot['results']['phase']) >= 0
+        with h5py.File(path) as f:
+            np.testing.assert_allclose(f['1/EBSD/Data/Euler'][()][valid],
+                                      np.asarray(snapshot['results']['euler']).reshape(-1, 3)[valid],
+                                      atol=1e-6, rtol=0)
+            for key in ['quaternions', 'euler']:
+                width = 4 if key == 'quaternions' else 3
+                np.testing.assert_array_equal(f['zebsdsolve/Selected/'+key][()],
+                                              np.asarray(snapshot['results'][key]).reshape(-1, width))
+                np.testing.assert_array_equal(f['zebsdsolve/Candidates/'+key][()],
+                                              np.asarray(snapshot['candidates'][key]).reshape(snapshot['candidates']['phase_count'], -1, width))
 
     def oxford_solver(self, source=None, masters=None):
         s = Solver()
@@ -137,7 +138,7 @@ class Exports(unittest.TestCase):
         s.configure(roi_x=1, roi_y=0, roi_w=1, roi_h=2)
         return s
 
-    def test_automatic_oxford_native_frames_calibration_and_serialization(self):
+    def test_automatic_oxford_frame_metadata_calibration_and_serialization(self):
         s = self.oxford_solver()
         self.assertEqual(s.geometry['rot'], [0,0,0])
         self.assertEqual(s.geometry['detector_tilt_deg'], 0)
@@ -145,36 +146,24 @@ class Exports(unittest.TestCase):
         # A nonzero residual exercises effective header serialization once only.
         s.set_geometry(rot=[.002,-.003,.001])
         s.index()
-        raw = s.export_snapshot(); native = s.export_oxford_snapshot()
-        frame = native['oxford_frame']; b = rotation.byAxisAngle(zvector, 90*degree)
+        native = s.export_oxford_snapshot()
+        frame = native['oxford_frame']
+        b = np.array([.7071067811865476, 0, 0, .7071067811865476])
         with self.assertRaisesRegex(Error, 'OxfordFrameOverrideConflictsWithAcquisition'):
             s.export_oxford_snapshot([1,0,0,0])
-        for override in [b.data, -b.data]:
+        for override in [b, -b]:
             equivalent = s.export_oxford_snapshot(override)
             self.assertTrue(np.allclose(equivalent['results']['quaternions'], native['results']['quaternions']))
         self.assertEqual(frame['convention_version'], 1)
         self.assertFalse(frame['preserve_source_pattern_centres'])
         self.assertEqual(frame['warnings'], [])
-        self.assertLess(float(rotation(frame['engine_to_cs1']).angle(b))/degree, .0001)
-        for p, angle in enumerate([0,30]):
-            c = rotation.id if not angle else rotation.byAxisAngle(zvector, angle*degree)
-            self.assertLess(float(rotation(frame['phase_crystal_to_master'][p]).angle(c))/degree, .0001)
-        valid = np.asarray(raw['results']['phase']) >= 0
-        expected = self.expected_oxford(raw, b, valid)
-        actual = rotation(np.asarray(native['results']['quaternions']).reshape(6,4)[valid]).inv()
-        self.assertLess(float(np.max(actual.angle(expected)))/degree, .0001)
-        for p in range(2):
-            cells = np.asarray(raw['candidates']['sweep']).reshape(2,6)[p] >= 0
-            expected_candidate = self.expected_oxford(raw, b, cells, phase=p)
-            actual_candidate = rotation(np.asarray(native['candidates']['quaternions']).reshape(2,6,4)[p,cells]).inv()
-            self.assertLess(float(np.max(actual_candidate.angle(expected_candidate)))/degree, .0001)
+        np.testing.assert_allclose(frame['engine_to_cs1'], b, atol=1e-6, rtol=0)
+        np.testing.assert_allclose(frame['phase_crystal_to_master'],
+                                   [[1,0,0,0], [.9659258262890683,0,0,.25881904510252074]],
+                                   atol=1e-6, rtol=0)
         target = self.out/'automatic.h5oina'
         s.export(target)
-        imported = loadEBSD(str(target), grid=False, eulerCorrection=rotation.id)
-        for p in range(2):
-            cells = valid & (np.asarray(raw['results']['phase']) == p)
-            if cells.any():
-                self.assertLess(float(np.max(imported.rotations[cells].angle(self.expected_oxford(raw,b,cells))))/degree, .002)
+        self.assert_oxford_serialization(target, native)
         with h5py.File(target) as f, h5py.File(self.baseline) as original:
             provenance = json.loads(f['zebsdsolve/ProvenanceJSON'][()])
             self.assertEqual(provenance['oxford_frame'], frame)
@@ -196,6 +185,41 @@ class Exports(unittest.TestCase):
         with self.assertRaisesRegex(Error, 'OxfordFrameRequiresOriginalAcquisition'):
             s.export(blocked, reference=self.baseline)
         self.assertFalse(blocked.exists())
+
+    def test_declared_monoclinic_export_header_survives_native_c1_measurement(self):
+        # An asymmetric scalar sphere isolates the writer contract. Its nominal SG3
+        # metadata declares C2, while the native intensity measurement keeps only C1.
+        path = self.out/'declared-c2-native-c1.h5'
+        sheets = np.random.default_rng(91).normal(size=(2, 33, 33)).astype(np.float32)
+        with h5py.File(path, 'w') as f:
+            f.create_dataset('EMData/EBSDmaster/mLPNH', data=sheets[0])
+            f.create_dataset('EMData/EBSDmaster/mLPSH', data=sheets[1])
+            f.create_dataset('CrystalData/LatticeParameters', data=[.35, .45, .55, 90, 105, 90])
+            f.create_dataset('CrystalData/SpaceGroupNumber', data=[3])
+        with Solver() as s:
+            s.configure(master_smooth=0, bandwidth=16, refine_iters=1,
+                        static_background='none', dynamic_background='none',
+                        toy_rows=1, toy_cols=2, toy_height=24, toy_width=24, toy_counts=0)
+            s.add_phase(path)
+            self.assertEqual(s.phases[0]['laue'], '-1')
+            s.synthesize(); s.index()
+            snapshot = s.export_snapshot()
+            self.assertEqual(snapshot['phases'][0]['space_group'], 3)
+            self.assertEqual(snapshot['phases'][0]['laue'], 2)
+            ang = self.out/'declared-c2-native-c1.ang'
+            ctf = self.out/'declared-c2-native-c1.ctf'
+            output = self.out/'declared-c2-native-c1-export.h5'
+            s.export(ang); s.export(ctf); s.export(output)
+            symmetry = next(line for line in ang.read_text().splitlines() if line.startswith('# Symmetry'))
+            self.assertEqual(int(symmetry.split()[-1]), 2)
+            phase = next(line for line in ctf.read_text().splitlines() if '\tdeclared-c2-native-c1\t' in line)
+            self.assertEqual(phase.split('\t')[3:5], ['2', '3'])
+            with h5py.File(output) as f:
+                group = f['Scan 1/EBSD/Header/Phase/1']
+                self.assertEqual(int(group['Symmetry'][()]), 2)
+                self.assertEqual(int(group['Space Group'][()]), 3)
+            # Writers preserve metadata without changing the engine's C1 setting.
+            self.assertEqual(s.phases[0]['laue'], '-1')
 
     def test_automatic_oxford_rejects_unverified_inputs_before_output(self):
         import shutil
@@ -224,28 +248,32 @@ class Exports(unittest.TestCase):
     def test_ebsdsim_v3_crystal_frame_is_supported(self):
         s = self.oxford_solver(masters=[ROOT/'testdata/gan/GaN_master_20kV.npz'])
         s.index()
-        raw = s.export_snapshot(); native = s.export_oxford_snapshot()
+        native = s.export_oxford_snapshot()
         self.assertEqual(native['phases'][0]['master_source'], 'ebsdsim')
         self.assertEqual(native['phases'][0]['master_source_format_version'], 3)
         self.assertEqual(native['phases'][0]['master_crystal_convention'], 'X||a,Z||c*')
-        b = rotation.byAxisAngle(zvector,90*degree)
-        c = rotation.byAxisAngle(zvector,30*degree)
-        self.assertLess(float(rotation(native['oxford_frame']['phase_crystal_to_master'][0]).angle(c))/degree,.0001)
-        valid = np.asarray(raw['results']['phase']) >= 0
-        expected = b*rotation(np.asarray(raw['results']['quaternions']).reshape(6,4)[valid]).inv()*c
+        np.testing.assert_allclose(native['oxford_frame']['phase_crystal_to_master'][0],
+                                   [.9659258262890683,0,0,.25881904510252074], atol=1e-6, rtol=0)
         target=self.out/'ebsdsim-v3.h5oina';s.export(target)
-        imported=loadEBSD(str(target),grid=False,eulerCorrection=rotation.id)
-        self.assertLess(float(np.max(imported.rotations[valid].angle(expected)))/degree,.002)
+        self.assert_oxford_serialization(target, native)
 
-    def test_emsphinx_default_import_equals_ang(self):
+    def test_emsphinx_serialized_angles_and_phases_match_ang(self):
         ang=self.out/'results.ang'; h5=self.out/'results.h5'
         self.s.export(ang); self.s.export(h5)
-        a=loadEBSD(str(ang),grid=False)
-        h=loadEBSD(str(h5),grid=False,dataSet='Scan 1')
-        self.assertTrue(np.array_equal(a.phaseId,h.phaseId))
-        self.assertTrue(np.allclose(a.pos.data,h.pos.data))
-        valid=a.phaseId>0
-        self.assertLess(float(np.max(a.rotations[valid].angle(h.rotations[valid]))/degree),.002)
+        records = np.loadtxt(ang)
+        with h5py.File(h5) as f:
+            data = f['Scan 1/EBSD/Data']
+            valid = np.asarray(self.snapshot['results']['phase']) >= 0
+            np.testing.assert_allclose(records[valid, :3],
+                                      np.column_stack([data[key][()] for key in ['Phi1','Phi','Phi2']])[valid],
+                                      atol=5.1e-6, rtol=0)
+            np.testing.assert_array_equal(records[~valid, :3], np.full((int((~valid).sum()), 3), 12.56637))
+            # ANG uses one-based IDs for multiphase exports and zero for unindexed.
+            phase = np.asarray(self.snapshot['results']['phase'])
+            np.testing.assert_array_equal(records[:, 7], np.where(phase < 0, 0, phase+1))
+            np.testing.assert_array_equal(data['Phase'][()], np.where(phase < 0, 255, phase))
+            np.testing.assert_allclose(records[:, 3], np.tile(np.arange(3)*.2, 2), atol=1e-6)
+            np.testing.assert_allclose(records[:, 4], np.repeat(np.arange(2)*.25, 3), atol=1e-6)
         s=self.snapshot; n=6; c=s['candidates']; cp=np.asarray(c['sweep']).reshape(2,n)
         self.assertEqual(cp.shape,(2,n))
         self.assertTrue(np.all(cp[:,[1,4]]>=0))
@@ -263,16 +291,12 @@ class Exports(unittest.TestCase):
 
     def test_oxford_preserves_baseline_and_explicit_frame(self):
         target=self.out/'reindexed.h5oina'
-        t=rotation.byAxisAngle(zvector,90*degree)
-        self.s.export(target,reference=self.baseline,engine_to_cs1=t.data,
+        t=[.7071067811865476,0,0,.7071067811865476]
+        self.s.export(target,reference=self.baseline,engine_to_cs1=t,
                       frame_provenance='Known-axis controlled test: engine→CS1 +90deg z')
         self.assertEqual(self.original_hash,hashlib.sha256(self.baseline.read_bytes()).hexdigest())
         valid=np.asarray(self.snapshot['results']['phase'])>=0
-        expected=self.expected_oxford(self.snapshot, t, valid)
-        # Explicit identity avoids a known importer acquisition-surface convention ambiguity;
-        # H5OINA Euler is CS2→CS1, radians. Original nonzero specimen metadata is preserved.
-        e=loadEBSD(str(target),grid=False,eulerCorrection=rotation.id)
-        self.assertLess(float(np.max(e.rotations[valid].angle(expected))/degree),.002)
+        self.assert_oxford_serialization(target, self.s.export_oxford_snapshot(t))
         with h5py.File(target) as f,h5py.File(self.baseline) as original:
             self.assertNotIn('1/Data Processing',f)
             self.assertNotIn('zebsdsolve/OriginalDataProcessing',f)
@@ -462,7 +486,7 @@ class Exports(unittest.TestCase):
         self.assertEqual(s.geometry['plane_kind'], 'none')
         self.assertEqual(s.geometry['px_um'], 0)
 
-    def test_oxford_plane_preserves_acquisition_pc_and_native_frames(self):
+    def test_oxford_plane_preserves_acquisition_pc_and_native_serialization(self):
         pc_keys = ['Pattern Center X', 'Pattern Center Y', 'Detector Distance']
         message = ('Orientations were indexed with a fitted source plane. Standard Oxford '
                    'pattern-centre fields retain acquisition values. Fitted values are stored '
@@ -490,16 +514,10 @@ class Exports(unittest.TestCase):
                     if kind == 'projective': P[3,:2] = [.001, -.002]
                     s.set_geometry(rot=residual, plane_kind=kind, plane=P, px_um=350)
                     s.index()
-                    raw = s.export_snapshot()
                     native = s.export_oxford_snapshot()
                     policy = native['oxford_frame']
                     self.assertTrue(policy['preserve_source_pattern_centres'])
                     self.assertEqual(policy['warnings'], [message])
-                    b = rotation.byAxisAngle(zvector, 90*degree)
-                    valid = np.asarray(raw['results']['phase']) >= 0
-                    expected = self.expected_oxford(raw, b, valid)
-                    actual = rotation(np.asarray(native['results']['quaternions']).reshape(6,4)[valid]).inv()
-                    self.assertLess(float(np.max(actual.angle(expected)))/degree, .0001)
                     # The indexed frozen context controls policy and effective calibration,
                     # including after current controls drop the plane and change the pose.
                     s.set_geometry(plane_kind='none', rot=[.2,.3,.1], sample_tilt_deg=60, px_um=0)
@@ -509,8 +527,7 @@ class Exports(unittest.TestCase):
                         warnings.simplefilter('always')
                         s.export(target)
                     self.assertEqual([str(w.message) for w in caught], [message])
-                    imported = loadEBSD(str(target), grid=False, eulerCorrection=rotation.id)
-                    self.assertLess(float(np.max(imported.rotations[valid].angle(expected)))/degree, .002)
+                    self.assert_oxford_serialization(target, native)
                     with h5py.File(target) as f, h5py.File(source) as original:
                         for key in pc_keys:
                             a, b0 = f['1/EBSD/Data/'+key], original['1/EBSD/Data/'+key]

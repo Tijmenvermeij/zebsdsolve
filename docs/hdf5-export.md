@@ -4,7 +4,7 @@
 
 The browser's `.h5` button and Python `solver.export("results.h5")` write:
 
-- `Scan 1/EBSD`: the selected result, using the same raw Bunge angles, raster
+- `Scan 1/EBSD`: the selected result, using the same stored Bunge angles, raster
   order and phase metadata as ANG. Native MTEX default imports agree with ANG
   setting 2. Euler angles are radians; map steps are micrometres; lattice
   lengths are angstroms and lattice angles are degrees.
@@ -88,7 +88,7 @@ calibration without changing that basis. Export uses the native conversion
 engine-to-CS1 rotation and `C_phase` converts Oxford crystal axes to the
 master axes. Selected results and every retained phase candidate receive the
 same native conversion. Python and JavaScript only serialize these values.
-Raw snapshots, ANG and EMSphInx-compatible H5 retain their existing conventions.
+Snapshots, ANG and EMSphInx-compatible H5 retain their existing conventions. Selected orientations are the native symmetry-reduced stored poses; alternate candidates retain their native search poses. Phase headers derive the declared Laue class from the existing point/space-group metadata, so file importers do not downgrade a declared phase when native indexing measures lower symmetry. This header preservation does not establish a crystal-axis setting.
 
 The importer records crystal-frame provenance per master, separately from the
 producer/container name. Verified EMsoft masters and recognized ebsdsim
@@ -132,11 +132,13 @@ select only computed solver results.
 Unsupported HDF5 references fail explicitly; Python supports more metadata
 datatypes than the browser writer.
 
-Validation uses native MTEX/pyMTEX importers and rotations, without a runtime
-MTEX dependency. It checks candidate conversion, phase IDs, empty uncomputed pixels,
-pattern omission, original metadata and source integrity. Sparse Oxford phase
-IDs and some partial multiphase maps also need raw file-ID checks because the
-installed pyMTEX 1.0.0 importer has phase-numbering limitations.
+Private development validation uses external native MTEX/pyMTEX importers and
+rotations to check frame conversion and importer compatibility. Those scientific
+oracles are maintained outside the repository. Repository tests check native
+snapshot serialization, candidate records, phase IDs, empty uncomputed pixels,
+pattern omission, original metadata and source integrity. Neither runtime nor
+repository tests require MTEX. Private checks also inspect raw file IDs because
+pyMTEX 1.0.0 has phase-numbering limitations on sparse and partial multiphase maps.
 
 Reopen the original Oxford acquisition and reindex after upgrading. Old
 Oxford project geometry used a different baseline convention; it is not

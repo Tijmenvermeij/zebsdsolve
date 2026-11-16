@@ -28,7 +28,7 @@ import numpy as np
 
 from . import _native as _n
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 _lib = None
 _wgpu = None
@@ -878,7 +878,7 @@ class Solver:
     def reduce(self, quaternions, phase=0):
         """Explicit symmetry reduction: (quaternions, euler), each quaternion's
         representative in the phase's fundamental zone and its Bunge angles (radians). The zone
-        is that of the proper rotations of the phase's point group (for GaN, 6mm, the six about
+        uses the native proper rotations in the master's own axes (for GaN, 6mm, the six about
         c: not its Laue class's twelve, half of which turn the polar axis over)."""
         q = _f32(quaternions).reshape(-1, 4).copy()
         euler = np.empty((len(q), 3), np.float64)

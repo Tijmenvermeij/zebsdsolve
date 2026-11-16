@@ -43,7 +43,7 @@ const Allocator = std.mem.Allocator;
 pub const Settings = settings_mod.Settings;
 pub const Geometry = geometry_mod.Geometry;
 
-pub const version = "0.2.0";
+pub const version = "0.2.1";
 
 /// A pattern resolution: reduced by settings.binning, or as stored.
 pub const Level = enum(u1) { reduced = 0, full = 1 };
@@ -1583,6 +1583,14 @@ pub const Engine = struct {
         self.events.log("phase {d}: {s} ({s}, {d} px, point group {s})", .{ self.phases.items.len - 1, m.name, m.source, m.side, if (m.point_group >= 1 and m.point_group <= 32) sym.point_group_names[m.point_group - 1] else "?" });
         self.res.clear();
         self.phase_generation += 1;
+        // the symmetry it obeys, as measured, and where its axes are when not the tables' own
+        const st = m.setting;
+        const z = rot.qapply(st.frame, .{ 0, 0, 1 });
+        const x = rot.qapply(st.frame, .{ 1, 0, 0 });
+        if (rot.angleBetween(st.frame, rot.quat_identity) < 1e-6)
+            self.events.log("phase {d}: orientations reduced by the rotations {s} (Laue class {s}) of the master, {d} of its point-group operators holding", .{ self.phases.items.len - 1, st.rotation.rotationName(), st.laue.name(), m.ops.len })
+        else
+            self.events.log("phase {d}: orientations reduced by the rotations {s} (Laue class {s}) of the master, {d} of its point-group operators holding; its unique axis along ({d:.3}, {d:.3}, {d:.3}), its x along ({d:.3}, {d:.3}, {d:.3})", .{ self.phases.items.len - 1, st.rotation.rotationName(), st.laue.name(), m.ops.len, z[0], z[1], z[2], x[0], x[1], x[2] });
         return @intCast(self.phases.items.len - 1);
     }
 
@@ -1805,7 +1813,7 @@ pub const Engine = struct {
         if (p.takeDictionary(&self.g, N)) return;
         var list: std.ArrayList(f32) = .empty;
         errdefer list.deinit(gpa);
-        const ops = sym.operators(p.master.rotation);
+        const ops = p.master.rotations();
         const a = rot.cubochoric_half_edge;
         const nf: f64 = @floatFromInt(N);
         var i: i64 = -@as(i64, N);
@@ -2300,8 +2308,7 @@ pub const Engine = struct {
             // an acceptable match replaces whatever was kept; otherwise the better one stays
             const good = if (s.accept_nmi > 0) r.nmi >= s.accept_nmi else r.z >= s.accept_z;
             if (self.res.phase[at] < 0 or (good and r.step <= settle) or r.z > self.res.z[at]) {
-                // Preserve the winning detector pose; crystal symmetry reduction is explicit.
-                const q = rot.qstd(.{ r.q[0], r.q[1], r.q[2], r.q[3] });
+                const q = sym.toFz(.{ r.q[0], r.q[1], r.q[2], r.q[3] }, self.phases.items[p].master.rotations());
                 for (0..4) |k| self.res.quat[4 * at + k] = @floatCast(q[k]);
                 self.res.ncc[at] = r.ncc;
                 self.res.nmi[at] = r.nmi;

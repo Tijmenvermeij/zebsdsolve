@@ -124,7 +124,7 @@ def write_emsphinx(path, s):
         with h5py.File(temporary, 'w') as f:
             _string(f, 'Manufacturer', 'EMSphInx')  # Native reader's format discriminator.
             f.attrs['Producer'] = 'zebsdsolve'
-            _provenance(f, s, Frame='Same raw Bunge/raster conventions as ANG; MTEX setting 2',
+            _provenance(f, s, Frame='Same stored Bunge/raster conventions as ANG; MTEX setting 2',
                         Ranking='Scan 1 selected; later scans alternate phases ranked by ' + s['settings']['phase_by'])
             for rank, r in enumerate(_maps(s), 1):
                 ebsd = f.create_group(f'Scan {rank}/EBSD')
