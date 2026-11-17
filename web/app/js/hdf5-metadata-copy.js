@@ -1,6 +1,7 @@
 // Lossless value/type/attribute/link copy through the unmodified h5wasm public API.
-// Diffraction patterns are excluded by object identity, including hard/soft aliases.
+// Raw diffraction patterns and EDS spectra are excluded, including hard/soft aliases.
 const PATTERNS = new Set(["Processed Patterns", "Unprocessed Patterns", "Raw Patterns"]);
+function rawSignal(path) { return PATTERNS.has(basename(path)) || /(?:^|\/)EDS\d*\/Data\/Spectrum$/.test(path); }
 function identity(object) { return Array.from(object.create_reference().ref_data).join(","); }
 function join(parent, name) { return `${parent === "/" ? "" : parent}/${name}`; }
 function absolute(target, parent = "/") {
@@ -78,20 +79,20 @@ export function copyOxfordMetadata(source, destination, h) {
       const p = join(path, name), symbolic = source.get_link(p);
       if (symbolic !== null) {
         add(name, { kind: "soft", path: p, target: symbolic });
-        if (PATTERNS.has(name)) omittedPaths.add(p);
+        if (rawSignal(p)) omittedPaths.add(p);
         continue;
       }
       const external = source.get_external_link(p);
       if (external.filename !== undefined) {
         add(name, { kind: "external", path: p, object: external });
-        if (PATTERNS.has(name) || PATTERNS.has(basename(external.obj_path))) omittedPaths.add(p);
+        if (rawSignal(p) || rawSignal(external.obj_path)) omittedPaths.add(p);
         continue;
       }
       const object = source.get(p);
       if (object instanceof h.Group || object instanceof h.Dataset) {
         const id = identity(object);
         add(name, { kind: "hard", path: p, id });
-        if (object instanceof h.Dataset && PATTERNS.has(name)) { omitted.add(id); omittedPaths.add(p); }
+        if (object instanceof h.Dataset && rawSignal(p)) { omitted.add(id); omittedPaths.add(p); }
         if (!objects.has(id)) {
           objects.set(id, object);
           if (object instanceof h.Group) inventory(object, p);
@@ -101,6 +102,8 @@ export function copyOxfordMetadata(source, destination, h) {
       }
     }
   }
+  const spectrumPaths = localHardObject(source, scan).keys().filter(name => /^EDS\d*$/.test(name))
+    .map(name => `/${scan}/${name}/Data/Spectrum`);
   // Visit acquisition data at its canonical path before processing aliases.
   // Otherwise a shared Data group can be inventoried only below an omitted map.
   const acquisition = localHardObject(source, `${scan}/EBSD/Data`);
@@ -122,6 +125,15 @@ export function copyOxfordMetadata(source, destination, h) {
     }
     return id;
   }
+  // Resolve canonical EDS signals from the inventory, including earlier group aliases.
+  // External and dangling raw links are omitted without opening their targets.
+  for (const path of spectrumPaths) {
+    const edge = edges.get(resolve(parent(path)))?.get("Spectrum");
+    if (!edge) continue;
+    omittedPaths.add(path); omittedPaths.add(edge.path);
+    const id = resolve(path);
+    if (id && objects.get(id) instanceof h.Dataset) omitted.add(id);
+  }
   for (const link of links) if (link.kind === "soft") link.id = resolve(link.path);
   // Omit historical processing solutions and aliases to their private objects.
   // Shared acquisition datasets remain and receive current solver values below.
@@ -142,7 +154,7 @@ export function copyOxfordMetadata(source, destination, h) {
     if (omittedPaths.has(link.path) || (link.id && omitted.has(link.id))) return true;
     if (link.kind !== "soft") return false;
     const target = absolute(link.target, parent(link.path));
-    return target === processing || target.startsWith(`${processing}/`) || omittedPaths.has(target) || PATTERNS.has(basename(target));
+    return target === processing || target.startsWith(`${processing}/`) || omittedPaths.has(target) || rawSignal(target);
   }
   // Check all retained types before reading any dataset values or writing output.
   for (const [id, object] of objects) {
@@ -162,7 +174,12 @@ export function copyOxfordMetadata(source, destination, h) {
     const object = objects.get(link.id);
     let result;
     if (object instanceof h.Group) result = ensureGroup(destination, path, h);
-    else result = g.create_dataset({ name, data: object.value, shape: object.shape, dtype: object.dtype });
+    else {
+      // The runtime otherwise discards HDF5 decoder/read failures.
+      h.Module.activate_throwing_error_handler();
+      try { result = g.create_dataset({ name, data: object.value, shape: object.shape, dtype: object.dtype }); }
+      finally { h.Module.deactivate_throwing_error_handler(); }
+    }
     copied.set(link.id, path);
     attributes(object, result, h);
   }
@@ -174,4 +191,5 @@ export function copyOxfordMetadata(source, destination, h) {
     else status = g.create_soft_link(link.target, name);
     if (status < 0) throw new Error(`Cannot preserve Oxford ${link.kind} link ${link.path}.`);
   }
+  return [...omittedPaths].filter(rawSignal).sort();
 }

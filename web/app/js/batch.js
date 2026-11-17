@@ -1,8 +1,8 @@
-import { isOxfordH5, OXFORD_SOURCE_PC_WARNING } from "./oxford-export-policy.js";
+import { isOxfordH5, OXFORD_SOURCE_PC_WARNING, geometryConvention } from "./oxford-export-policy.js";
 import { BatchDownloads } from "./batch-downloads.js";
 // Batch indexing owns its engine and GPU device. It never borrows the interactive engine.
 const HINTS = ["map_rows", "map_cols", "pattern_height", "pattern_width"];
-const SCAN_FIELDS = ["rows", "cols", "patH", "patW", "dtype", "format"];
+const SCAN_FIELDS = ["rows", "cols", "patH", "patW", "dtype", "format", "geometryFrame"];
 const clone = (value) => structuredClone(value);
 const message = (error) => String(error?.message || error);
 const descriptor = (file) => ({ name: file.name, size: file.size, lastModified: file.lastModified ?? null });
@@ -237,7 +237,7 @@ export class BatchQueue {
   }
   _journalData(job, completing = false) {
     return { zebsdsolve: job.version, scan: job.sourceFiles[0].name,
-      geometry_convention: isOxfordH5(job.scanInfo.format) ? "oxford-calibrated-v1" : "generic-v1",
+      geometry_convention: geometryConvention(job.scanInfo),
       geometry: job.geometry, settings: job.settings, source_files: job.sources, master_files: job.masters,
       phases: job.phases, opening_hints: job.openHints, acquisition_geometry: job.openGeometry, scan_info: job.scanInfo,
       warnings: job.warnings, map_source: "native engine map: IPF-Z and detector NCC; same frame and colors as the GUI",

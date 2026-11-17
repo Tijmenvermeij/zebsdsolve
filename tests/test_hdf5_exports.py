@@ -98,7 +98,16 @@ class Exports(unittest.TestCase):
             d.create_dataset('Mean Angular Deviation',data=np.ones(6,dtype='f4')).attrs['Unit']='rad'
             d.create_dataset('Bands',data=np.full(6,8,dtype='u1'))
             d.create_dataset('Processed Patterns',data=np.arange(6*32*40,dtype='u1').reshape(6,32,40))
-            h.create_dataset('Processed Static Background',data=np.ones((32,40),dtype='u1'))
+            eds=f.create_group('1/EDS/Data')
+            eds.create_dataset('Spectrum',data=np.zeros((6,16),dtype='i4'),compression='lzf')
+            eds.create_dataset('Window Integral',data=np.arange(6,dtype='u4'))
+            f['0 EDS data alias']=eds
+            f['Unknown/Spectrum soft link']=h5py.SoftLink('/1/EDS/Data/Spectrum')
+            f.create_dataset('1/EDS2/Data/Spectrum',data=np.zeros(6,dtype='i4'))
+            external=f.create_group('1/EDS3/Data')
+            external['Spectrum']=h5py.ExternalLink('absent.h5','/raw')
+            f['0 External EDS alias']=external
+            h.create_dataset('Processed Static Background' ,data=np.ones((32,40),dtype='u1'))
             for key,v in [('Pattern Center X',.4),('Pattern Center Y',.4),('Detector Distance',.5)]:
                 d.create_dataset(key,data=np.full(6,v,dtype='f4')).attrs['Unit']='fraction'
             unknown=f.create_dataset('Unknown/Values',data=np.array([3,5,8],dtype='i2'))
@@ -154,7 +163,8 @@ class Exports(unittest.TestCase):
         for override in [b, -b]:
             equivalent = s.export_oxford_snapshot(override)
             self.assertTrue(np.allclose(equivalent['results']['quaternions'], native['results']['quaternions']))
-        self.assertEqual(frame['convention_version'], 1)
+        self.assertEqual(frame['convention_version'], 2)
+        self.assertEqual(frame['detector_pose_convention'], 'oxford-cs3-to-microscope-v2')
         self.assertFalse(frame['preserve_source_pattern_centres'])
         self.assertEqual(frame['warnings'], [])
         np.testing.assert_allclose(frame['engine_to_cs1'], b, atol=1e-6, rtol=0)
@@ -296,7 +306,11 @@ class Exports(unittest.TestCase):
                       frame_provenance='Known-axis controlled test: engine→CS1 +90deg z')
         self.assertEqual(self.original_hash,hashlib.sha256(self.baseline.read_bytes()).hexdigest())
         valid=np.asarray(self.snapshot['results']['phase'])>=0
-        self.assert_oxford_serialization(target, self.s.export_oxford_snapshot(t))
+        manual = self.s.export_oxford_snapshot(t)
+        self.assertEqual(manual['calibration']['kind'], 'legacy')
+        self.assertEqual(manual['oxford_frame']['convention_version'], 2)
+        self.assertEqual(manual['oxford_frame']['detector_pose_convention'], 'manual-generic')
+        self.assert_oxford_serialization(target, manual)
         with h5py.File(target) as f,h5py.File(self.baseline) as original:
             self.assertNotIn('1/Data Processing',f)
             self.assertNotIn('zebsdsolve/OriginalDataProcessing',f)
@@ -306,8 +320,9 @@ class Exports(unittest.TestCase):
                 self.assertTrue(np.array_equal(f[key][()],original[key][()]))
                 self.assertEqual(dict(f[key].attrs),dict(original[key].attrs))
             self.assertEqual(f['Hard link'].id,f['Unknown/Values'].id)
-            for key in ['1/EBSD/Data/Processed Patterns','Unknown/Pattern alias','Unknown/Pattern soft link']:
+            for key in ['1/EBSD/Data/Processed Patterns','Unknown/Pattern alias','Unknown/Pattern soft link','1/EDS/Data/Spectrum','0 EDS data alias/Spectrum','Unknown/Spectrum soft link','1/EDS2/Data/Spectrum','1/EDS3/Data/Spectrum','0 External EDS alias/Spectrum']:
                 self.assertNotIn(key,f)
+            np.testing.assert_array_equal(f['1/EDS/Data/Window Integral'][()],np.arange(6))
             self.assertEqual(f.get('Unknown/Soft link',getlink=True).path,'/Unknown/Values')
             self.assertEqual(f.get('Unknown/External link',getlink=True).filename,'other.h5')
             self.assertLess(target.stat().st_size,self.baseline.stat().st_size+100000)

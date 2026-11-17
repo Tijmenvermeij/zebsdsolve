@@ -44,6 +44,9 @@ fn fingerprint(e: *const engine.Engine) [32]u8 {
     hashValue(&h, e.set);
     hashValue(&h, e.geo);
     hashValue(&h, e.calibration);
+    // Every supported Oxford acquisition now uses the corrected detector CS3
+    // direction. Old calibrated and fallback results require fresh indexing.
+    if (e.calibration.status() == .supported) h.update("oxford-detector-cs3-v2");
     for (e.phases.items) |p| {
         const m = p.master;
         hashValue(&h, m.name);

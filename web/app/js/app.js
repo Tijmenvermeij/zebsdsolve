@@ -7,7 +7,7 @@ import { createVotes } from "./votes.js";
 import { exportH5, exportOxford } from "./hdf5-export.js";
 import { BatchQueue, defaultOutputStem } from "./batch.js";
 import { batchArtifacts } from "./batch-artifacts.js";
-import { isOxfordH5, oxfordExportWarnings } from "./oxford-export-policy.js";
+import { isOxfordH5, oxfordExportWarnings, geometryConvention, acceptsGeometryConvention } from "./oxford-export-policy.js";
 import { createPlaneView } from "./planeview.js";
 import { MasterView, PROJECTIONS } from "./masterview.js";
 import { CellView } from "./cellview.js";
@@ -1861,8 +1861,8 @@ async function takeFiles(files) {
   if (scans.length && !await openScan(scans, project?.settings, project?.opening_hints, project?.source_files)) return;
   if (masters.length) await addPhases(masters);
   if (project) {
-    if (project.geometry && /Oxford h5oina/i.test(st.scan?.format || "") && project.geometry_convention !== "oxford-calibrated-v1") {
-      const message = "This Oxford project uses the previous geometry convention. The original calibration is loaded; reindex and save a new project.";
+    if (project.geometry && /Oxford h5oina/i.test(st.scan?.format || "") && !acceptsGeometryConvention(st.scan, project.geometry_convention)) {
+      const message = "This Oxford project uses the previous geometry convention. The original calibration is loaded; refit any fitted geometry, reindex and save a new project.";
       log(message, true); status(message, true); updateEnabled(); return;
     }
     if (project.geometry) { beforeFit(); st.ze.setGeometry(project.geometry); geometryChanged(); }
@@ -1951,7 +1951,7 @@ async function loadExample() {
 }
 
 function projectJson() {
-  return JSON.stringify({ zebsdsolve: st.ze.version, scan: st.scanName, source_files: st.sourceFiles.map(file => ({ name: file.name, size: file.size, lastModified: file.lastModified })), geometry_convention: /Oxford h5oina/i.test(st.scan?.format || "") ? "oxford-calibrated-v1" : "generic-v1", geometry: st.ze.geometry, settings: st.ze.settings, opening_hints: st.sourceOpenHints, phases: st.ze.phases.map((p) => p.name) }, null, 2);
+  return JSON.stringify({ zebsdsolve: st.ze.version, scan: st.scanName, source_files: st.sourceFiles.map(file => ({ name: file.name, size: file.size, lastModified: file.lastModified })), geometry_convention: geometryConvention(st.scan), geometry: st.ze.geometry, settings: st.ze.settings, opening_hints: st.sourceOpenHints, phases: st.ze.phases.map((p) => p.name) }, null, 2);
 }
 
 /** Keep independent browser directory memories for scans and master patterns. */

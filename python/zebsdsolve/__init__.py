@@ -288,7 +288,7 @@ class Solver:
         fmt = buf.raw[:n].decode()
         return {
             "rows": s.rows, "cols": s.cols, "pattern_shape": (s.pat_h, s.pat_w), "dtype": ["uint8", "uint16", "float32"][s.pixel],
-            "format": fmt, "has_background": bool(s.has_background), "has_pc": bool(s.has_pc), "has_px": bool(s.has_px),
+            "format": fmt, "has_background": bool(s.has_background), "has_pc": bool(s.has_pc), "has_px": bool(s.has_px), "geometry_frame": s.geometry_frame,
             "voltage_kv": s.voltage_kv or None, "bytes": int(s.bytes),
         }
 

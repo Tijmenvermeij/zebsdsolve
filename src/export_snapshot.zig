@@ -111,7 +111,9 @@ fn snapshotImpl(e: *engine.Engine, requested: ?rot.Quat, is_oxford: bool) ![]u8 
     }
     try w.writeByte('}');
     if (is_oxford) {
-        try w.writeAll(",\"oxford_frame\":{\"convention_version\":1,\"engine_to_cs1\":");
+        try w.writeAll(",\"oxford_frame\":{\"convention_version\":2,\"detector_pose_convention\":");
+        try value(w, if (context.calibration.status() == .supported) "oxford-cs3-to-microscope-v2" else "manual-generic");
+        try w.writeAll(",\"engine_to_cs1\":");
         try numbers(w, transform.?);
         try w.writeAll(",\"provenance\":");
         try value(w, if (requested == null) "Inherited Oxford acquisition: fixed engine-to-CS1 basis, full detector calibration, phase-specific master crystal conversion" else "Explicit engine-to-CS1 override; phase-specific master crystal conversion");
@@ -132,8 +134,9 @@ fn snapshotImpl(e: *engine.Engine, requested: ?rot.Quat, is_oxford: bool) ![]u8 
         try w.writeAll("],\"master_crystal_convention\":\"X||a,Z||c*\",\"output_crystal_convention\":\"X||a*,Z||c\"}");
     }
     try w.writeAll(",\"pattern_centres\":[");
+    const signs = context.calibration.scanSigns(context.settings.scan_x_sign, context.settings.scan_y_sign);
     for (0..e.res.phase.len) |i| {
-        const t = geometry.positionForRotation(context.calibration.rotation(&geometry), @floatFromInt(i / info.cols), @floatFromInt(i % info.cols), 0.5 * @as(f64, @floatFromInt(info.rows - 1)), 0.5 * @as(f64, @floatFromInt(info.cols - 1)), context.settings.scan_x_sign, context.settings.scan_y_sign, 1, @floatFromInt(info.pat_h), @floatFromInt(info.pat_w));
+        const t = geometry.positionForRotation(context.calibration.rotation(&geometry), @floatFromInt(i / info.cols), @floatFromInt(i % info.cols), 0.5 * @as(f64, @floatFromInt(info.rows - 1)), 0.5 * @as(f64, @floatFromInt(info.cols - 1)), signs[0], signs[1], 1, @floatFromInt(info.pat_h), @floatFromInt(info.pat_w));
         const pc = engine.Geometry.pcOf(context.calibration.rotation(&geometry), t, @floatFromInt(info.pat_h), @floatFromInt(info.pat_w));
         for (pc, 0..) |x, k| {
             if (i != 0 or k != 0) try w.writeByte(',');

@@ -66,7 +66,9 @@ pub const ScanInfo = extern struct {
     bytes: f64 = 0,
     /// 1 when the file gave a pixel size
     has_px: u32 = 0,
-    _pad: u32 = 0,
+    /// Source-derived geometry convention: 0 generic, 1 legacy Oxford (reserved),
+    /// 2 Oxford detector CS3-to-microscope v2, 3 Oxford fallback.
+    geometry_frame: u32 = 0,
 };
 
 pub const PhaseInfo = extern struct {
@@ -926,6 +928,9 @@ pub const Engine = struct {
         var out: ScanInfo = .{ .rows = i.rows, .cols = i.cols, .pat_h = i.pat_h, .pat_w = i.pat_w, .pixel = @intFromEnum(i.pixel) };
         out.has_pc = @intFromBool(!std.math.isNan(i.pc[0]));
         out.has_px = @intFromBool(!std.math.isNan(i.px_um));
+        if (self.calibration.metadata != null) {
+            out.geometry_frame = if (self.calibration.status() == .supported) 2 else 3;
+        }
         if (!std.math.isNan(i.voltage_kv)) out.voltage_kv = i.voltage_kv;
         switch (self.source) {
             .file => |s| {
@@ -1548,7 +1553,8 @@ pub const Engine = struct {
         const i = self.info() catch return .{ 0, 0, 0 };
         const row: f64 = @floatFromInt(cell / i.cols);
         const col: f64 = @floatFromInt(cell % i.cols);
-        return geo.scanOffset(row, col, 0.5 * @as(f64, @floatFromInt(i.rows - 1)), 0.5 * @as(f64, @floatFromInt(i.cols - 1)), self.set.scan_x_sign, self.set.scan_y_sign, self.binOf(lv));
+        const signs = self.calibration.scanSigns(self.set.scan_x_sign, self.set.scan_y_sign);
+        return geo.scanOffset(row, col, 0.5 * @as(f64, @floatFromInt(i.rows - 1)), 0.5 * @as(f64, @floatFromInt(i.cols - 1)), signs[0], signs[1], self.binOf(lv));
     }
 
     /// The detector's position for a cell under `geo`, in a level's pixels.
@@ -1557,7 +1563,8 @@ pub const Engine = struct {
         const sz = try self.sizeOf(lv);
         const row: f64 = @floatFromInt(cell / i.cols);
         const col: f64 = @floatFromInt(cell % i.cols);
-        return geo.positionForRotation(self.calibration.rotation(geo), row, col, 0.5 * @as(f64, @floatFromInt(i.rows - 1)), 0.5 * @as(f64, @floatFromInt(i.cols - 1)), self.set.scan_x_sign, self.set.scan_y_sign, self.binOf(lv), sz[0], sz[1]);
+        const signs = self.calibration.scanSigns(self.set.scan_x_sign, self.set.scan_y_sign);
+        return geo.positionForRotation(self.calibration.rotation(geo), row, col, 0.5 * @as(f64, @floatFromInt(i.rows - 1)), 0.5 * @as(f64, @floatFromInt(i.cols - 1)), signs[0], signs[1], self.binOf(lv), sz[0], sz[1]);
     }
 
     pub fn positionOf(self: *const Engine, geo: *const Geometry, cell: u64, lv: Level) ![3]f32 {

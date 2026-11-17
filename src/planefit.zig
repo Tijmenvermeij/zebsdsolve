@@ -648,7 +648,8 @@ pub fn plane(e: *Engine) !PlaneResult {
         }
     }
     const h_px: f64 = @floatFromInt(info.pat_h);
-    const said = plane_mod.saidWithNominal(P, &before, e.calibration.nominal(&before), info.rows, info.cols, aspect, h_px, s.scan_x_sign, s.scan_y_sign);
+    const signs = e.calibration.scanSigns(s.scan_x_sign, s.scan_y_sign);
+    const said = plane_mod.saidWithNominal(P, &before, e.calibration.nominal(&before), info.rows, info.cols, aspect, h_px, signs[0], signs[1]);
 
     // each one's standard error: the plane fitted again without the points of one block of the map, block by block
     {
@@ -667,7 +668,7 @@ pub fn plane(e: *Engine) !PlaneResult {
             }
             if (!any) continue;
             const Pg = plane_mod.fit(kind, pts, fr) orelse continue;
-            const w = plane_mod.saidWithNominal(Pg, &before, e.calibration.nominal(&before), info.rows, info.cols, aspect, h_px, s.scan_x_sign, s.scan_y_sign);
+            const w = plane_mod.saidWithNominal(Pg, &before, e.calibration.nominal(&before), info.rows, info.cols, aspect, h_px, signs[0], signs[1]);
             val[got] = .{ w.rot[0], w.rot[1], w.rot[2], w.step[0], w.step[1], w.skew, w.pc[0], w.pc[1], w.pc[2] };
             for (0..9) |i| mean[i] += val[got][i];
             got += 1;
