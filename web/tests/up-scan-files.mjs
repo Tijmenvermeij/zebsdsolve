@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { pairUPScan, validateUPProjectSources } from "../app/js/up-scan-files.js";
+import { pairUPScan, validateUPProjectSources, validateScanSelection } from "../app/js/up-scan-files.js";
 const up = {name:"patterns.up2",size:120}, ang = {name:"scan.ang",size:220};
 let calls=0;
 const choose=async pattern=>{assert.equal(pattern,up);calls++;return ang;};
@@ -23,3 +23,8 @@ assert.throws(()=>validateUPProjectSources([up,ang],[{name:"other.h5"}]),/origin
 assert.doesNotThrow(()=>validateUPProjectSources([up,ang],[up,ang]));
 assert.doesNotThrow(()=>validateUPProjectSources(undefined,[{name:"other.h5"}]));
 assert.throws(()=>validateUPProjectSources([{...up,lastModified:10},ang],[{...up,lastModified:11},ang]),/original patterns.up2/);
+
+assert.throws(() => validateScanSelection([{name:"first.h5oina"},{name:"second.H5OINA"}]), /Multiple independent scans/);
+assert.throws(() => validateScanSelection([up,{name:"other.ebsp"}]), /Multiple independent scans/);
+assert.doesNotThrow(() => validateScanSelection([up,ang]));
+assert.doesNotThrow(() => validateScanSelection([{name:"Pattern.dat"},{name:"Setting.txt"}]));

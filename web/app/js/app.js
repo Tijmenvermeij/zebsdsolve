@@ -14,7 +14,7 @@ import { CellView } from "./cellview.js";
 import { drawEnergy } from "./energy.js";
 import { filesFromHandles, rememberFileHandle, fileHandleFor, sourceFolders, chooseScanFolder } from "./source-folders.js";
 import { replacePhaseEntries } from "./phase-state.js";
-import { pairUPScan, chooseANG, validateUPProjectSources } from "./up-scan-files.js";
+import { pairUPScan, chooseANG, validateUPProjectSources, validateScanSelection } from "./up-scan-files.js";
 
 const $ = (id) => document.getElementById(id);
 const app = $("app");
@@ -1833,6 +1833,8 @@ async function takeFiles(files) {
   const projects = files.filter((f) => /\.json$/i.test(f.name));
   const masters = files.filter((f) => !projects.includes(f) && isMaster(f));
   const scans = files.filter((f) => !projects.includes(f) && !masters.includes(f));
+  try { validateScanSelection(scans); }
+  catch (error) { status(error.message, true); log(error.message, true); return; }
   let project = null;
   if (projects.length) {
     try {

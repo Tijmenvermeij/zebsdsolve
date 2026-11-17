@@ -1,6 +1,10 @@
 // Selection only. Grid parsing and pixel-order validation belong to the native scan reader.
 const isUP = (file) => /\.up[12]$/i.test(file.name);
 const isANG = (file) => /\.ang$/i.test(file.name);
+export function validateScanSelection(files) {
+  const scans = files.filter(file => /\.(h5|hdf5|hdf|h5ebsd|h5oina|oh5|up1|up2|ebsp|dat)$/i.test(file.name));
+  if (scans.length > 1) throw new Error("Multiple independent scans selected. Open one scan at a time, together with its companion files.");
+}
 export function validateUPProjectSources(expectedSources, files) {
   if (!expectedSources?.some(isUP) || !expectedSources.some(isANG)) return;
   if (files.filter(isUP).length !== 1 || files.filter(isANG).length !== 1) {
