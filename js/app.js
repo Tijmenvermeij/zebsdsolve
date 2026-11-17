@@ -14,7 +14,7 @@ import { CellView } from "./cellview.js";
 import { drawEnergy } from "./energy.js";
 import { filesFromHandles, rememberFileHandle, fileHandleFor, sourceFolders, chooseScanFolder } from "./source-folders.js";
 import { replacePhaseEntries } from "./phase-state.js";
-import { pairUPScan, chooseANG, validateUPProjectSources } from "./up-scan-files.js";
+import { pairUPScan, chooseANG, validateUPProjectSources, validateScanSelection } from "./up-scan-files.js";
 
 const $ = (id) => document.getElementById(id);
 const app = $("app");
@@ -206,6 +206,10 @@ const factRows = (facts) => facts.flatMap(([k, v]) => { const dt = document.crea
 
 // ── the steps ──
 
+function showImportedGeometryNotice() {
+  $("imported-geometry-notice").hidden = !(st.scan?.hasPc && st.scan.geometryFrame !== 3 && st.sourceFiles.length && st.geoOpened?.pc?.every(Number.isFinite));
+}
+
 function selectTab(name) {
   if (st.batchRunning && name !== "batch") return;
   app.dataset.tab = name;
@@ -217,6 +221,7 @@ function selectTab(name) {
   }
   for (const p of $("panels").children) p.hidden = p.dataset.tab !== name;
   $("panels").scrollTop = 0;
+  if (name === "geometry") showImportedGeometryNotice();
   // the Geometry step is a console for the fits: the dock takes most of the stage there, and
   // shows a fit (the pattern-centre search, unless it is already on the plane)
   app.dataset.tab = name;
@@ -1798,6 +1803,7 @@ function setRoi(set) {
 }
 
 function updateEnabled() {
+  showImportedGeometryNotice();
   const ready = !!st.scan && !st.gpuLost && st.ze.phases.length > 0;
   for (const id of ["btn-fit-auto", "btn-fit-pc", "btn-fit-plane", "btn-index", "btn-tune"]) $(id).disabled = !ready;
   for (const b of document.querySelectorAll(".needs-results")) b.disabled = !st.results;
@@ -1833,6 +1839,8 @@ async function takeFiles(files) {
   const projects = files.filter((f) => /\.json$/i.test(f.name));
   const masters = files.filter((f) => !projects.includes(f) && isMaster(f));
   const scans = files.filter((f) => !projects.includes(f) && !masters.includes(f));
+  try { validateScanSelection(scans); }
+  catch (error) { status(error.message, true); log(error.message, true); return; }
   let project = null;
   if (projects.length) {
     try {
