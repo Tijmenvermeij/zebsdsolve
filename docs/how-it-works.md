@@ -27,6 +27,10 @@ The steps are tabs down the left, each with its own settings, under a header tha
 | **Geometry** | The pattern centre, tilts, detector rotation and pixel size, from the file where it records them (a pixel size the file does not record is estimated from the pattern's width, and can be typed in). **Fit centre** is the vote for one pattern centre for the map; **Fit plane** the plane of source points (below): every fit pattern's own source point, and the affine or projective transformation of the scan's rows and columns through them, which asks nothing of the steps, the pixel size or the tilt; **Auto fit geometry** is the one and then the other, from the geometry as it was given. Any of them can be undone, and the geometry put back as the scan was opened. |
 | **Index** | Spherical indexing (or a dictionary) of the map or a region of it, each orientation refined on the detector, a batch at a time, in one pass or in sweeps of rising bandwidth; the map fills in as it goes. **Tune speed** fits the batch and workgroup sizes to the machine first. Export as `.ang`, `.ctf`, and the geometry and settings as JSON. |
 
+**Open scan…** accepts one scan with its companion files. Multiple independent
+scans are rejected. A possible future change is to offer to load a multi-scan
+selection directly into Batch instead.
+
 Beside the steps are three panes, with bars between them to drag (with no scan open, the pattern's pane gives its room to the others):
 
 - **The map** zooms with the scroll wheel about the pointer (never out past the whole map), a drag moves a zoomed map, and the arrow keys step the selected pattern (wherever the focus is but in a field). The region of interest, which the fits and indexing keep to, is a box drawn on the map: press **region** on its bar and drag (or shift-drag at any time); the bar then gives its size, and a cross clears it. Its corner says what its colours mean: the inverse pole figure key of the phase's Laue class in the colours chosen under Index, a scale, or the phases.
