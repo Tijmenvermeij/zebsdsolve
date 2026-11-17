@@ -7,12 +7,13 @@ import { createVotes } from "./votes.js";
 import { exportH5, exportOxford } from "./hdf5-export.js";
 import { BatchQueue, defaultOutputStem } from "./batch.js";
 import { batchArtifacts } from "./batch-artifacts.js";
-import { isOxfordH5, oxfordExportWarnings } from "./oxford-export-policy.js";
+import { isOxfordH5, oxfordExportWarnings, geometryConvention, acceptsGeometryConvention } from "./oxford-export-policy.js";
 import { createPlaneView } from "./planeview.js";
 import { MasterView, PROJECTIONS } from "./masterview.js";
 import { CellView } from "./cellview.js";
 import { drawEnergy } from "./energy.js";
 import { filesFromHandles, rememberFileHandle, fileHandleFor, sourceFolders, chooseScanFolder } from "./source-folders.js";
+import { replacePhaseEntries } from "./phase-state.js";
 import { pairUPScan, chooseANG, validateUPProjectSources } from "./up-scan-files.js";
 
 const $ = (id) => document.getElementById(id);
@@ -56,6 +57,8 @@ const st = {
   geoOpened: null,     // the geometry as the scan was opened
   geoBefore: null,     // pattern centre and rotation before the last fit (or after it, once put back)
   geoIsBefore: false,
+  phaseRun: 0,
+  phaseChanging: false,
   phase: 0,            // selected phase (in the list under Data)
   phaseFiles: [],      // the master pattern files, as added ({ file, on, info }): the engine holds those that are on, and is given them again when one is removed or switched
   masterSrc: 0,        // the master the dock shows: a phase, or −1 the last simulation
@@ -623,9 +626,21 @@ async function runOverview() {
 // ── phases ──
 
 /** What a change of the candidate phases leaves standing: nothing found with the old ones. */
-function phasesChanged() {
+/** Everything that names a phase by its place in the list, dropped when the list changes (and
+ *  before the engine's is emptied and filled again, which takes a while on a slow GPU): a
+ *  pattern on its way to the pattern view, which would find another phase there or none, the
+ *  patterns indexed on the spot, the fits' and the indexing's results. */
+function forgetPhases() {
+  st.phaseRun++;
+  st.masterRun++;
+  st.showRun++;
+  st.live.clear();
   st.results = null;
   st.fit = null;
+}
+
+function phasesChanged() {
+  forgetPhases();
   st.keys.clear();
   done("index", false);
   showPhases();
@@ -651,15 +666,26 @@ async function removePhase(i) {
   if (!gpuAvailable()) return;
   await busy("removing the phase…", async () => {
     st.phaseFiles = st.phaseFiles.filter((_, k) => k !== i);
-    await rebuildPhases();
+    if (!await rebuildPhases()) return;
     phasesChanged();
   });
 }
 
 /** The engine's phases are the master patterns that are on, in order: give it them again. */
 async function rebuildPhases() {
-  st.ze.clearPhases();
-  for (const p of st.phaseFiles) if (p.on) await st.ze.addPhase(p.file);
+  forgetPhases();
+  const engine = st.ze, generation = st.phaseRun;
+  const current = () => st.ze === engine && st.phaseRun === generation && !st.gpuLost && !engine.deviceLost;
+  st.phaseChanging = true;
+  try {
+    return await replacePhaseEntries(engine, st.phaseFiles, current);
+  } catch (error) {
+    // Reconcile the visible active prefix even when an import failed after clearing.
+    showPhases();
+    throw error;
+  } finally {
+    if (st.phaseRun === generation) st.phaseChanging = false;
+  }
 }
 
 /** Switch a master pattern on or off for the fits and the indexing, without removing it. */
@@ -667,7 +693,7 @@ async function togglePhase(i) {
   if (!gpuAvailable() || st.busy) return;
   await busy("switching the phase…", async () => {
     st.phaseFiles[i].on = !st.phaseFiles[i].on;
-    await rebuildPhases();
+    if (!await rebuildPhases()) return;
     st.masterSrc = Math.max(0, Math.min(st.masterSrc, st.ze.phases.length - 1));
     st.phase = Math.min(st.phase, Math.max(0, st.ze.phases.length - 1));
     phasesChanged();
@@ -1289,9 +1315,11 @@ function orientationOf(cell) {
 /** Index one cell on the spot, as the fits index their patterns (the spherical correlation at
  *  the fit's bandwidth, then the refinement), under the settings and geometry as they are. */
 async function indexNow(cell) {
+  const generation = st.phaseRun;
   const hit = st.live.get(cell);
   if (hit) return hit;
   const recs = await st.ze.indexCells([cell], { method: "spherical", bandwidth: st.settings.fit_bandwidth });
+  if (generation !== st.phaseRun || st.phaseChanging || st.gpuLost) return null;
   // the phase as the engine chooses it (the phase_by setting)
   const by = st.settings.phase_by === "ncc" ? 4 : 5;
   let p = 0;
@@ -1335,7 +1363,7 @@ function showNlpar(a) {
 }
 
 async function showCell() {
-  if (!st.scan || st.cell < 0 || st.gpuLost || st.overviewLoading || st.batchRunning) return;
+  if (!st.scan || st.cell < 0 || st.gpuLost || st.overviewLoading || st.batchRunning || st.phaseChanging) return;
   const run = ++st.showRun;
   const cell = st.cell;
   const { cols } = st.scan;
@@ -1368,7 +1396,8 @@ async function showCell() {
       o = await indexNow(cell);
       if (run !== st.showRun) return;
     }
-    if (o && nPh) {
+    // (an orientation always names a phase of the list as it is: forgetPhases drops the others)
+    if (o && o.phase < nPh) {
       const sim = await st.ze.simulate(o.phase, [cell], o.q, full);
       if (run !== st.showRun) return;
       drawGray($("pat-sim"), sim, w, h, { mask });
@@ -1832,8 +1861,8 @@ async function takeFiles(files) {
   if (scans.length && !await openScan(scans, project?.settings, project?.opening_hints, project?.source_files)) return;
   if (masters.length) await addPhases(masters);
   if (project) {
-    if (project.geometry && /Oxford h5oina/i.test(st.scan?.format || "") && project.geometry_convention !== "oxford-calibrated-v1") {
-      const message = "This Oxford project uses the previous geometry convention. The original calibration is loaded; reindex and save a new project.";
+    if (project.geometry && /Oxford h5oina/i.test(st.scan?.format || "") && !acceptsGeometryConvention(st.scan, project.geometry_convention)) {
+      const message = "This Oxford project uses the previous geometry convention. The original calibration is loaded; refit any fitted geometry, reindex and save a new project.";
       log(message, true); status(message, true); updateEnabled(); return;
     }
     if (project.geometry) { beforeFit(); st.ze.setGeometry(project.geometry); geometryChanged(); }
@@ -1908,8 +1937,8 @@ async function loadExample() {
     const originalHints = openHints();
     await st.ze.openScan([scan], { settings: { roi_x: 0, roi_y: 0, roi_w: 0, roi_h: 0 } });
     st.scanName = scan.name;
-    st.ze.clearPhases();
-    await st.ze.addPhase(master);
+    st.phaseFiles = [{ file: master, on: true, info: null }];
+    if (!await rebuildPhases()) return;
     st.ze.configure({ static_background: "file", dynamic_background: "subtract" });
     st.exampleBackground = previousBackground;
     st.phaseFiles = [{ file: master, on: true, info: null }];
@@ -1922,7 +1951,7 @@ async function loadExample() {
 }
 
 function projectJson() {
-  return JSON.stringify({ zebsdsolve: st.ze.version, scan: st.scanName, source_files: st.sourceFiles.map(file => ({ name: file.name, size: file.size, lastModified: file.lastModified })), geometry_convention: /Oxford h5oina/i.test(st.scan?.format || "") ? "oxford-calibrated-v1" : "generic-v1", geometry: st.ze.geometry, settings: st.ze.settings, opening_hints: st.sourceOpenHints, phases: st.ze.phases.map((p) => p.name) }, null, 2);
+  return JSON.stringify({ zebsdsolve: st.ze.version, scan: st.scanName, source_files: st.sourceFiles.map(file => ({ name: file.name, size: file.size, lastModified: file.lastModified })), geometry_convention: geometryConvention(st.scan), geometry: st.ze.geometry, settings: st.ze.settings, opening_hints: st.sourceOpenHints, phases: st.ze.phases.map((p) => p.name) }, null, 2);
 }
 
 /** Keep independent browser directory memories for scans and master patterns. */
@@ -1960,10 +1989,12 @@ async function main() {
   planeView = createPlaneView();
   // the master view (a phase's master or the last simulation's) and the crystal's cell, both
   // rendered by the engine (nothing until there is one to show)
-  st.masterView = new MasterView($("master-well"), (o) => {
+  st.masterView = new MasterView($("master-well"), async (o) => {
     const source = st.ze ? masterSource() : null;
-    if (source === null || st.batchRunning || st.gpuLost) return null;
-    return st.ze.sphereView({ ...o, source, stored: source >= 0 && st.masterStage === "stored", bin: source < 0 ? st.simBin : null, site: source < 0 ? st.simSite : null });
+    if (source === null || st.batchRunning || st.gpuLost || st.phaseChanging) return null;
+    const engine = st.ze, generation = st.phaseRun;
+    const pixels = await engine.sphereView({ ...o, source, stored: source >= 0 && st.masterStage === "stored", bin: source < 0 ? st.simBin : null, site: source < 0 ? st.simSite : null });
+    return st.ze === engine && st.phaseRun === generation && !st.gpuLost ? pixels : null;
   }, (rot) => { if (st.link) st.cellView.setRotation(rot); });
   // (the cell and the master share the crystal's Cartesian frame: linked, one rotation turns both)
   st.cellView = new CellView($("cell-well"), (o) => (st.ze && st.crystal && !st.batchRunning && !st.gpuLost ? st.ze.cellView(o) : null), (rot) => { if (st.link) st.masterView.setRotation(rot); });
@@ -2437,19 +2468,21 @@ async function addBatchJob() {
 async function loadBatchJob(job) {
   if (st.busy || st.batchRunning || st.scanPicking || !gpuAvailable()) return;
   await busy("loading batch job…", async () => {
+    forgetPhases();
     await st.ze._queue;
+    if (!gpuAvailable()) return;
     await st.ze.openScan(job.sourceFiles, { hints: job.openHints });
     const acquired = structuredClone(job.openGeometry || st.ze.geometry);
     // From this point native state is the new acquisition, even if a master fails.
     st.exampleBackground = null; st.scanName = job.sourceFiles[0].name;
     afterOpen(); st.sourceFile = job.sourceFiles[0]; st.sourceFiles = [...job.sourceFiles]; st.sourceOpenHints = structuredClone(job.openHints);
     st.geoOpened = acquired; st.pcFile = st.scan.hasPc ? [...acquired.pc] : null;
-    st.ze.clearPhases(); st.phaseFiles = [];
+    st.phaseFiles = job.masterFiles.map(file => ({ file, on: true, info: null }));
     try {
       st.ze.configure(job.settings); st.ze.setGeometry(job.geometry);
       st.settings = st.ze.settings; fields.show(st.settings); showGeometry();
       showResolution(); showStage(); showSweeps(); showAngle(); showRoi();
-      for (const file of job.masterFiles) { await st.ze.addPhase(file); st.phaseFiles.push({ file, on: true, info: null }); }
+      if (!await rebuildPhases()) return;
       st.batchEditing = job.status === "queued" && !job.folderName ? job.id : null;
       selectTab("index");
     } finally { phasesChanged(); updateEnabled(); }

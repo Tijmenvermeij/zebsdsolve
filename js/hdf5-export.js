@@ -250,7 +250,9 @@ export async function exportOxfordFromPath(s, sourcePath, frameValue) {
   const source = new h.File(sourcePath, "r");
   try {
     return await fileBytes(null, (f, h) => {
-      copyOxfordMetadata(source, f, h);
+      const omitted = copyOxfordMetadata(source, f, h);
+      put(group(f, "zebsdsolve"), "OmittedSignalPaths", JSON.stringify(omitted));
+      put(group(f, "zebsdsolve"), "RawSignalData", "EBSD patterns and EDS spectra omitted; metadata and stored maps retained");
       writeOxford(f, h, s, frame, n);
     });
   } finally { source.close(); }

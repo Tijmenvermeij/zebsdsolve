@@ -411,7 +411,7 @@ const SYNC_EXPORTS = new Set(["ze_alloc", "ze_free", "ze_version", "ze_create", 
 
 // Struct layouts (src/engine.zig, geometry.zig, pcfit.zig, planefit.zig): [name, type, byte offset].
 const SCAN = [["rows", "u32", 0], ["cols", "u32", 4], ["patH", "u32", 8], ["patW", "u32", 12], ["pixel", "u32", 16],
-  ["hasBackground", "bool", 20], ["hasPc", "bool", 24], ["formatId", "u32", 28], ["voltageKv", "f64", 32], ["bytes", "f64", 40], ["hasPx", "bool", 48]];
+  ["hasBackground", "bool", 20], ["hasPc", "bool", 24], ["formatId", "u32", 28], ["voltageKv", "f64", 32], ["bytes", "f64", 40], ["hasPx", "bool", 48], ["geometryFrame", "u32", 52]];
 const SCAN_SIZE = 56;
 const PHASE = [["side", "u32", 0], ["pointGroup", "u32", 4], ["spaceGroup", "u32", 8], ["laueId", "u32", 12],
   ["nFold", "u32", 16], ["mirror", "bool", 20], ["inversion", "bool", 24], ["voltageKv", "f64", 32]];

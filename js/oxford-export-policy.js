@@ -10,3 +10,16 @@ export function oxfordExportWarnings(snapshot) {
 export function isOxfordH5(format) {
   return /^(?:Oxford h5oina|h5_oxford)$/i.test(format || "");
 }
+
+// Saved fitted geometry is tied to the detector convention used during fitting.
+export function geometryConvention(scan) {
+  if (!isOxfordH5(scan?.format)) return "generic-v1";
+  if (scan.geometryFrame === 2) return "oxford-calibrated-v3";
+  if (scan.geometryFrame === 3) return "oxford-fallback-v1";
+  return "oxford-calibrated-v1";
+}
+
+export function acceptsGeometryConvention(scan, saved) {
+  return saved === geometryConvention(scan) ||
+    (isOxfordH5(scan?.format) && scan.geometryFrame === 3 && saved === "oxford-calibrated-v1");
+}
