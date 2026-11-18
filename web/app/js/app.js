@@ -112,7 +112,7 @@ function deviceLost(info) {
   ++st.masterRun;
   app.dataset.gpuLost = "1";
   invalidateOverview();
-  for (const id of ["btn-open", "btn-example", "btn-phase", "btn-toy", "btn-fit-auto", "btn-fit-pc", "btn-fit-plane", "btn-simulate", "btn-sim-phase", "btn-index", "btn-tune", "btn-roi-full", "btn-geo-undo", "btn-geo-file", "pat-live", "file-scan", "file-phase"]) $(id).disabled = true;
+  for (const id of ["btn-open", "btn-example", "btn-phase", "btn-toy", "btn-fit-auto", "btn-fit-pc", "btn-fit-plane", "btn-simulate", "btn-sim-phase", "btn-index", "btn-tune", "btn-geo-undo", "btn-geo-file", "pat-live", "file-scan", "file-phase"]) $(id).disabled = true;
   for (const input of document.querySelectorAll(".panel .fields input, .panel .fields select")) input.disabled = true;
   for (const button of $("phases").querySelectorAll("button")) button.disabled = true;
   log(`GPU device lost: ${JSON.stringify({ ...info, adapter: st.ze.adapterInfo, bandwidth: st.settings.bandwidth, batch: st.settings.batch, tile_mb: st.settings.tile_mb })}`, true);
@@ -1809,7 +1809,6 @@ function updateEnabled() {
   for (const b of document.querySelectorAll(".needs-results")) b.disabled = !st.results;
   for (const b of $("map-kind").children) if (RESULT_KINDS.includes(b.dataset.kind)) b.disabled = !st.results;
   $("btn-json").disabled = !st.scan;
-  $("btn-roi-full").disabled = !st.scan || !!st.gpuLost;
   const oxford = !!st.sourceFile && isOxfordH5(st.scan?.format);
   const oxfordReason = !oxford ? "Open the original Oxford H5OINA scan."
     : !st.results ? "Index the scan first." : "";
@@ -2144,12 +2143,6 @@ function updateWiring() {
   });
   $("btn-index").addEventListener("click", runIndex);
   $("btn-tune").addEventListener("click", runTune);
-  $("btn-roi-full").addEventListener("click", () => {
-    const set = { roi_x: 0, roi_y: 0, roi_w: 0, roi_h: 0 };
-    try { st.ze.configure(set); } catch (err) { status(String(err.message || err), true); return; }
-    st.roiDrag = null;
-    afterSettings(Object.keys(set));
-  });
   $("btn-stop").addEventListener("click", () => { st.stop = true; if (st.batchRunning) batch.stop(); else st.ze.cancel(); status("stopping…"); });
   $("btn-ang").addEventListener("click", () => download(st.scanName.replace(/\.[^.]+$/, "") + ".ang", st.ze.exportText("ang"), "text/plain"));
   $("btn-ctf").addEventListener("click", () => download(st.scanName.replace(/\.[^.]+$/, "") + ".ctf", st.ze.exportText("ctf"), "text/plain"));
