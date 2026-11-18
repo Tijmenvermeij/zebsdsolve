@@ -401,7 +401,7 @@ function ioImports(state) {
 // Exports that never wait (plain calls); every other function export may suspend (on the GPU
 // or on a file read) and is called through WebAssembly.promising.
 const SYNC_EXPORTS = new Set(["ze_alloc", "ze_free", "ze_version", "ze_create", "ze_destroy", "ze_adapter", "ze_error",
-  "ze_has_acquisition_calibration", "ze_configure", "ze_settings", "ze_events", "ze_cancel", "ze_close_scan", "ze_scan_info", "ze_scan_format", "ze_scan_overview_kind", "ze_chunk_index_status",
+  "ze_has_acquisition_calibration", "ze_configure", "ze_settings", "ze_events", "ze_cancel", "ze_close_scan", "ze_scan_info", "ze_scan_format", "ze_scan_overview_kind",
   "ze_get_geometry", "ze_set_geometry", "ze_clear_phases", "ze_phase_count", "ze_phase_info", "ze_pattern_shape", "ze_nlpar_view",
   "ze_pc_scores", "ze_fit_patterns", "ze_results", "ze_map", "ze_ipf_key", "ze_export", "ze_export_snapshot", "ze_export_oxford_snapshot", "ze_result_checkpoint", "ze_restore_result_checkpoint", "ze_result_chance", "ze_bunge", "ze_reduce", "ze_disorientation", "ze_shader",
   "ze_index_status", "ze_tune_begin", "ze_tune_report", "ze_pixel_angle", "ze_lattice", "ze_sweep", "ze_pc_level_count", "ze_pc_level", "ze_pc_level_ballots",
@@ -507,13 +507,8 @@ export class Zebsdsolve {
     this.x = x;
     this.state = state;
     this._queue = Promise.resolve();
-    this._foreground = 0;
     this._disposed = false;
-    this._indexBudget = 65536;
     this._scanGeneration = 0;
-    this._indexTimer = null;
-    this._indexQueued = false;
-    this.chunkIndexWarmup = { state: "idle" };
     this.e = x.ze_create();
     if (!this.e) throw new Error("zebsdsolve: engine creation failed");
   }
@@ -617,80 +612,22 @@ export class Zebsdsolve {
   }
 
   /** Calls are serialized: one operation on the module at a time (only cancel() may interleave). */
-  _serial(fn, background = false, allowDisposed = false) {
-    if (!background) this._foreground++;
-    const guarded = () => { if (this._disposed && !allowDisposed) throw new Error("zebsdsolve: engine disposed"); if (this.deviceLost && !allowDisposed) throw this._deviceLossError(); return fn(); };
-    const run = this._queue.then(guarded, guarded);
-    const settled = background ? run : run.finally(() => { this._foreground--; });
-    this._queue = settled.catch(() => {});
-    return settled;
+  _serial(fn, allowDisposed = false) {
+    const guarded = () => {
+      if (this._disposed && !allowDisposed) throw new Error("zebsdsolve: engine disposed");
+      if (this.deviceLost && !allowDisposed) throw this._deviceLossError();
+      return fn();
+    };
+    const run = this._queue.then(guarded);
+    this._queue = run.catch(() => {});
+    return run;
   }
 
-  _invalidateIndexPreparation() {
-    this._scanGeneration++;
-    if (this._indexTimer !== null) clearTimeout(this._indexTimer);
-    this._indexTimer = null;
-    this.chunkIndexWarmup = { state: "idle" };
-    this._indexBudget = 65536;
-  }
-
-  /** Drain in-flight work before freeing the engine; also stops background preparation. */
+  /** Drain in-flight work before freeing the engine. */
   dispose() {
     if (this._disposed) return this._queue;
-    this._invalidateIndexPreparation();
     this._disposed = true;
-    return this._serial(() => { if (this.e) { this.x.ze_destroy(this.e); this.e = 0; } }, false, true);
-  }
-
-  /** Stop background lookup preparation. A later preview can start it again. */
-  pauseIndexPreparation() { this._invalidateIndexPreparation(); }
-
-  /** Native readiness; an allocated or partly filled lookup is never reported ready. */
-  get indexPreparation() {
-    return this._frame((f) => {
-      const p = f.alloc(48);
-      this.x.ze_chunk_index_status(this.e, p);
-      const values = Array.from(new BigUint64Array(this.mem, p, 6), Number);
-      return Object.fromEntries(["ready", "failed", "visited", "pending", "reads", "bytes"].map((key, i) => [key, values[i]]));
-    });
-  }
-
-  /** One bounded preparation batch. Foreground reads use targeted lookup meanwhile. */
-  prepareIndexStep(maxNodes = 8, maxBytes = 65536) {
-    return this._serial(async () => !!this._check(await this.x.ze_prepare_index_step(this.e, maxNodes, maxBytes), "prepare_index"));
-  }
-
-  _scheduleIndexPreparation(generation = this._scanGeneration) {
-    if (generation !== this._scanGeneration || this._disposed || this.deviceLost || this._indexTimer !== null || this._indexQueued || ["ready", "failed"].includes(this.chunkIndexWarmup.state)) return;
-    this.chunkIndexWarmup = { state: "pending" };
-    this._indexTimer = setTimeout(() => {
-      this._indexTimer = null;
-      if (generation !== this._scanGeneration || this._disposed || this.deviceLost) return;
-      if (this._foreground) { this._scheduleIndexPreparation(generation); return; }
-      this._indexQueued = true;
-      this._serial(async () => {
-        if (generation !== this._scanGeneration || this._foreground) return;
-        const ready = !!this._check(await this.x.ze_prepare_index_step(this.e, 8, this._indexBudget), "prepare_index");
-        if (generation === this._scanGeneration) this.chunkIndexWarmup = { state: ready ? "ready" : "pending" };
-      }, true).catch((error) => {
-        if (generation !== this._scanGeneration) return;
-        // Valid nondefault fan-outs can exceed a normal batch. Grow the explicit
-        // per-turn byte cap, up to the largest version-1 node (rank <= 8).
-        if (/ChunkIndexBudgetTooSmall/.test(error.message) && this._indexBudget < 8 * 1024 * 1024) {
-          this._indexBudget *= 2;
-          this.chunkIndexWarmup = { state: "pending" };
-          return;
-        }
-        this.chunkIndexWarmup = { state: "failed", error };
-        const event = { kind: "chunkIndexError", message: error.message };
-        for (const listener of this.state.listeners) listener(event);
-      }).finally(() => {
-        this._indexQueued = false;
-        // If a new scan's preview finished while the old batch drained, resume
-        // only its requested generation, never revive the superseded scan.
-        if (this.chunkIndexWarmup.state === "pending") this._scheduleIndexPreparation(this._scanGeneration);
-      });
-    }, 10);
+    return this._serial(() => { if (this.e) { this.x.ze_destroy(this.e); this.e = 0; } }, true);
   }
 
   _text(call, cap = 256) {
@@ -771,7 +708,7 @@ export class Zebsdsolve {
         const [hp, hn] = f.str(JSON.stringify(options.hints || {}));
         this._check(await this.x.ze_open_scan_configured(this.e, p, n, sp, sn, hp, hn), "open");
       } else this._check(await this.x.ze_open_scan(this.e, p, n), "open");
-      this._invalidateIndexPreparation();
+      ++this._scanGeneration;
       return this.scan;
     }));
   }
@@ -781,11 +718,11 @@ export class Zebsdsolve {
    *  laid on a background and counted as electrons. Resolves to its answer: { quaternions (4 per
    *  cell), phase (−1: a blank cell), grain, geometry }. */
   synthesize() {
-    this._invalidateIndexPreparation();
     return this._serial(() => this._frame(async (f) => {
       const s = this.settings, n = s.toy_rows * s.toy_cols;
       const qp = f.alloc(16 * n), pp = f.alloc(4 * n), gp = f.alloc(4 * n);
       this._check(await this.x.ze_synthesize(this.e, qp, pp, gp, n), "synthesize");
+      ++this._scanGeneration;
       const geometry = this.geometry;
       return { quaternions: new Float32Array(this.mem, qp, 4 * n).slice(), phase: new Int32Array(this.mem, pp, n).slice(), grain: new Int32Array(this.mem, gp, n).slice(), geometry };
     }));
@@ -793,19 +730,22 @@ export class Zebsdsolve {
 
   /** Take rows · cols patterns of h × w from a Uint8Array, Uint16Array or Float32Array (row-major). */
   setPatterns(data, rows, cols, h, w) {
-    this._invalidateIndexPreparation();
     return this._serial(() => this._frame(async (f) => {
       const pixel = data instanceof Uint8Array ? 0 : data instanceof Uint16Array ? 1 : 2;
       const bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
       const p = f.alloc(bytes.length);
       new Uint8Array(this.mem, p, bytes.length).set(bytes);
       this._check(await this.x.ze_set_patterns(this.e, p, bytes.length, pixel, rows, cols, h, w), "set_patterns");
+      ++this._scanGeneration;
     }));
   }
 
+  /** Close the scan, after the calls queued before (one may be waiting on the file's bytes). */
   closeScan() {
-    this._invalidateIndexPreparation();
-    return this._serial(() => this.x.ze_close_scan(this.e));
+    return this._serial(() => {
+      this.x.ze_close_scan(this.e);
+      ++this._scanGeneration;
+    });
   }
 
   /** What the scan is: { rows, cols, patH, patW, pixel, format, hasBackground, hasPc, voltageKv, bytes }. */
@@ -854,7 +794,6 @@ export class Zebsdsolve {
    *  pattern but the static background subtracted from every pattern (an error when the
    *  static_background setting subtracts none). */
   pattern(cell, stage = true, full = false) {
-    const generation = this._scanGeneration;
     return this._serial(() => this._frame(async (f) => {
       const [h, w] = this.shape(full);
       const p = f.alloc(h * w * 4);
@@ -864,7 +803,7 @@ export class Zebsdsolve {
       // what the averaging did to it, kept with it (another pattern() replaces the engine's)
       out.nlpar = this._nlparView();
       return out;
-    })).then((out) => { this._scheduleIndexPreparation(generation); return out; });
+    }));
   }
 
   /** What averaging with its neighbours did to the pattern last read: { noise (as stored,
