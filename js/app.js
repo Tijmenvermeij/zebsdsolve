@@ -112,7 +112,7 @@ function deviceLost(info) {
   ++st.masterRun;
   app.dataset.gpuLost = "1";
   invalidateOverview();
-  for (const id of ["btn-open", "btn-example", "btn-phase", "btn-toy", "btn-fit-auto", "btn-fit-pc", "btn-fit-plane", "btn-simulate", "btn-sim-phase", "btn-index", "btn-tune", "btn-roi-full", "btn-geo-undo", "btn-geo-file", "pat-live", "file-scan", "file-phase"]) $(id).disabled = true;
+  for (const id of ["btn-open", "btn-example", "btn-phase", "btn-toy", "btn-fit-auto", "btn-fit-pc", "btn-fit-plane", "btn-simulate", "btn-sim-phase", "btn-index", "btn-tune", "btn-geo-undo", "btn-geo-file", "pat-live", "file-scan", "file-phase"]) $(id).disabled = true;
   for (const input of document.querySelectorAll(".panel .fields input, .panel .fields select")) input.disabled = true;
   for (const button of $("phases").querySelectorAll("button")) button.disabled = true;
   log(`GPU device lost: ${JSON.stringify({ ...info, adapter: st.ze.adapterInfo, bandwidth: st.settings.bandwidth, batch: st.settings.batch, tile_mb: st.settings.tile_mb })}`, true);
@@ -549,10 +549,12 @@ function updateOverviewControls() {
 
 async function loadStoredOverview() {
   const run = st.overviewRun, ze = st.ze;
+  let missing = false;
   try {
     const stored = await ze.storedOverview();
     if (run !== st.overviewRun || ze !== st.ze) return;
     st.storedOverview = stored;
+    missing = !stored;
     if (stored) {
       st.overview = stored.values;
       st.overviewSource = "stored";
@@ -570,12 +572,13 @@ async function loadStoredOverview() {
         st.overviewLoading = false;
         updateOverviewControls();
         if (!st.busy) showCell();
+        if (missing) runOverview();
       }
     }
   }
 }
 
-/** Explicit progressive contrast calculation. Each batch yields to other engine jobs. */
+/** Progressive contrast for scans without stored quality, or on request. Each batch yields to other jobs. */
 async function runOverview() {
   const run = ++st.overviewRun, ze = st.ze;
   const { rows, cols, patH, patW, pixel } = st.scan;
@@ -594,7 +597,7 @@ async function runOverview() {
   let top = 0;
   while (nr >> (top + 1) >= 12) top++;
   const t0 = performance.now();
-  let read = 0, lastDraw = 0;
+  let read = 0, fileBytes = 0, fileReads = 0, lastDraw = 0;
   try {
     for (let p = top; p >= 0; p--) {
       const step = 1 << p, todo = [];
@@ -610,6 +613,8 @@ async function runOverview() {
         const res = await ze.patternStats(part);
         if (!current()) return;
         read += part.length;
+        fileBytes += res.io.fileBytes;
+        fileReads += res.io.fileReads;
         for (let k = 0; k < part.length; k++) {
           const r0 = Math.floor(part[k] / cols), c0 = part[k] % cols;
           const r1 = Math.min(rows, r0 + stride * step), c1 = Math.min(cols, c0 + stride);
@@ -620,7 +625,7 @@ async function runOverview() {
     }
     if (!current()) return;
     redraw();
-    log(`overview: ${read.toLocaleString()} patterns${stride > 1 ? ` (every ${stride}${stride === 2 ? "nd" : stride === 3 ? "rd" : "th"} each way)` : ""} in ${((performance.now() - t0) / 1000).toFixed(2)} s`);
+    log(`overview: ${read.toLocaleString()} patterns${stride > 1 ? ` (every ${stride}${stride === 2 ? "nd" : stride === 3 ? "rd" : "th"} each way)` : ""} in ${((performance.now() - t0) / 1000).toFixed(2)} s, ${(fileBytes / 2 ** 20).toFixed(1)} MiB in ${fileReads.toLocaleString()} reads`);
   } catch (e) {
     if (current()) log(String(e.message || e), true);
   } finally {
@@ -1809,7 +1814,6 @@ function updateEnabled() {
   for (const b of document.querySelectorAll(".needs-results")) b.disabled = !st.results;
   for (const b of $("map-kind").children) if (RESULT_KINDS.includes(b.dataset.kind)) b.disabled = !st.results;
   $("btn-json").disabled = !st.scan;
-  $("btn-roi-full").disabled = !st.scan || !!st.gpuLost;
   const oxford = !!st.sourceFile && isOxfordH5(st.scan?.format);
   const oxfordReason = !oxford ? "Open the original Oxford H5OINA scan."
     : !st.results ? "Index the scan first." : "";
@@ -2144,12 +2148,6 @@ function updateWiring() {
   });
   $("btn-index").addEventListener("click", runIndex);
   $("btn-tune").addEventListener("click", runTune);
-  $("btn-roi-full").addEventListener("click", () => {
-    const set = { roi_x: 0, roi_y: 0, roi_w: 0, roi_h: 0 };
-    try { st.ze.configure(set); } catch (err) { status(String(err.message || err), true); return; }
-    st.roiDrag = null;
-    afterSettings(Object.keys(set));
-  });
   $("btn-stop").addEventListener("click", () => { st.stop = true; if (st.batchRunning) batch.stop(); else st.ze.cancel(); status("stopping…"); });
   $("btn-ang").addEventListener("click", () => download(st.scanName.replace(/\.[^.]+$/, "") + ".ang", st.ze.exportText("ang"), "text/plain"));
   $("btn-ctf").addEventListener("click", () => download(st.scanName.replace(/\.[^.]+$/, "") + ".ctf", st.ze.exportText("ctf"), "text/plain"));
