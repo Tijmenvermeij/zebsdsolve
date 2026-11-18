@@ -4,7 +4,7 @@ import { clearPhasesWhenIdle, replacePhaseEntries } from '../app/js/phase-state.
 
 const deferred = () => { let resolve; const promise = new Promise(r => resolve = r); return {promise, resolve}; };
 const engine = Object.create(Zebsdsolve.prototype);
-Object.assign(engine, {_queue: Promise.resolve(), _foreground: 0, _disposed: false, state: {deviceLoss: null}});
+Object.assign(engine, {_queue: Promise.resolve(), _disposed: false, state: {deviceLoss: null}});
 let active = 0, cleared = 0;
 engine.clearPhases = () => { assert.equal(active, 0, 'native phase storage survives suspended consumers'); cleared++; };
 const started = deferred(), release = deferred(), lateStarted = deferred(), lateRelease = deferred();

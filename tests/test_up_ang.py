@@ -59,18 +59,12 @@ class UpAng(unittest.TestCase):
                     self.assertFalse(s.scan['has_pc'])
                     self.assertFalse(s.has_acquisition_calibration)
                     self.assertEqual(s.phases, [])
-                    stats = s.index_preparation
-                    self.assertEqual(stats['bytes'],24 if version == 1 else 50)
-                    self.assertEqual(stats['reads'],2 if version == 1 else 3)
                     overview = s.stored_overview()
                     self.assertEqual(overview['kind'],2)
                     self.assertEqual(overview['label'],'Image quality')
                     np.testing.assert_array_equal(overview['values'], records[:,5].reshape(2,3))
-                    self.assertEqual(s.index_preparation,stats)
                     for cell in [0,4,5]:
                         np.testing.assert_array_equal(s.pattern(cell,processed=False,full=True),patterns[cell])
-                    self.assertGreater(s.index_preparation['bytes'],stats['bytes'])
-                    self.assertGreater(s.index_preparation['reads'],stats['reads'])
     def test_standalone_raw_and_embedded_geometry(self):
         for version in [1,3,4]:
             with self.subTest(version=version), Solver() as s:
@@ -325,14 +319,12 @@ class UpAng(unittest.TestCase):
             s.index()
             before=s.export_snapshot()
             settings=s.settings;geometry=s.geometry;scan=s.scan;overview=s.stored_overview()['values'].copy()
-            stats=s.index_preparation
             patch={'bandwidth':32,'mask':False,'roi_x':2,'roi_w':1,'static_background':'average'}
             with self.assertRaisesRegex(Error,'ScanShapeMismatch'):
                 self.configured_open(s,[up,ang],patch,{'map_rows':3,'map_cols':2})
             self.assertEqual(s.settings,settings);self.assertEqual(s.geometry,geometry);self.assertEqual(s.scan,scan)
             self.assertEqual(s.export_snapshot(),before)
             np.testing.assert_array_equal(s.stored_overview()['values'],overview)
-            self.assertEqual(s.index_preparation,stats)
             # A bad settings patch must fail before even attempting a missing input.
             with self.assertRaisesRegex(Error,'BadSetting'):
                 self.configured_open(s,[self.root/'missing.up1'],{'bandwidth':3})
@@ -345,7 +337,6 @@ class UpAng(unittest.TestCase):
             # Ordinary open shares the staged path and must preserve the same live state.
             with self.assertRaisesRegex(Error,'ANGCoordinatesNotRowMajor'):s.open(up,ang)
             self.assertEqual(s.export_snapshot(),before);self.assertEqual(s.settings,settings)
-            self.assertEqual(s.index_preparation,stats)
             # No failed full-settings restore may have made the automatic mask explicit.
             s.open(self.oxford_fixture())
             self.assertFalse(s.settings['mask'])
@@ -376,9 +367,7 @@ class UpAng(unittest.TestCase):
         self.assertGreater(ang.stat().st_size,65536)
         with Solver() as s:
             s.open(up,ang)
-            stats=s.index_preparation
             np.testing.assert_array_equal(s.stored_overview()['values'],records[:,5].reshape(rows,cols))
-            self.assertEqual(s.index_preparation,stats)
             s.open(up)
             self.assertIsNone(s.stored_overview())
             s.set_patterns(np.zeros((1,1,8,10),dtype='u1'))

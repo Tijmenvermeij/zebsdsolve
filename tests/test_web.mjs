@@ -160,8 +160,9 @@ try {
     const shown = () => [...document.querySelectorAll("#panels .panel")].filter((p) => !p.hidden).map((p) => p.dataset.tab).join();
     const before = shown();
     document.getElementById("tab-index").click();
-    return { overview: (/overview: [^\\n]*/.exec(document.getElementById("log").textContent) || [""])[0], before, after: shown(), done: document.getElementById("tab-data").dataset.done };`);
-  check("explicit contrast calculation reads every pattern", /overview: 4,125 patterns/.test(seen.overview), seen.overview);
+    return { overview: (/overview: [^\\n]*/.exec(document.getElementById("log").textContent) || [""])[0], before, after: shown(), done: document.getElementById("tab-data").dataset.done,
+      source: document.getElementById("overview-source").value };`);
+  check("explicit contrast calculation reads every pattern", /overview: 4,125 patterns/.test(seen.overview) && seen.source === "calculated", seen.overview);
   check("the steps are tabs, one panel at a time", seen.before === "data" && seen.after === "index" && seen.done === "1", `${seen.before} → ${seen.after}`);
 
   // before anything is fitted or indexed, the selected pattern is indexed on the spot

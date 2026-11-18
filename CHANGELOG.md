@@ -6,7 +6,32 @@ notes.
 
 ## Unreleased
 
+### Added
+
+- The map shows the quality the scan file stores for each pattern (Oxford's band contrast,
+  EDAX's image quality, Bruker's Radon quality) the moment the file opens, read without reading
+  a pattern. **Calculate pattern contrast** remains available on demand. `Solver.stored_overview()` in Python
+  (#5, by [Tijmenvermeij](https://github.com/Tijmenvermeij)).
+
+### Changed
+
 - Fork result checkpoints use version 2 and include the native master setting in their context fingerprint.
+
+- A chunked HDF5 scan's first pattern no longer waits for the whole chunk index: the reader
+  reads only the paths through the chunk tree to the chunks a read needs (keeping the inner
+  nodes), where it read every leaf first. On a 501 × 601 EDAX scan of one chunk per pattern the
+  first pattern reads 40 KB in 9 reads instead of 16 MB in 5,384, which over a network share or
+  from a server is the difference between at once and a wait. Found by
+  [Tijmenvermeij](https://github.com/Tijmenvermeij) (#6).
+
+### Fixed
+
+- EDAX `.up1` / `.up2` files of version 3 and later had their map size and steps read one byte
+  early, so a rectangular scan could open as one row with wrong steps; a file that ends partway
+  through a pattern, or whose header is cut short, is refused (#7, by
+  [Tijmenvermeij](https://github.com/Tijmenvermeij)).
+- `closeScan()` in the JavaScript module closed the scan at once, even under a call still waiting
+  on the file's bytes; it now waits for the calls before it, as every other call does (#6).
 
 ## 0.2.1 — 2026-11-11
 

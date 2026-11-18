@@ -2623,7 +2623,7 @@ async function runBatch() {
     launched = true;
     await busy("batch indexing…", async () => {
       try {
-        invalidateOverview(); ++st.showRun; ++st.masterRun; st.ze.pauseIndexPreparation();
+        invalidateOverview(); ++st.showRun; ++st.masterRun;
         await st.ze._queue;
         if (!st.stop) await batch.run();
       } catch (e) { launchError = e; throw e; }

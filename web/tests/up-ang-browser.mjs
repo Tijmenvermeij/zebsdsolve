@@ -172,7 +172,7 @@ try {
     await waitFor(()=>document.getElementById('app').dataset.busy==='0' && document.getElementById('status').classList.contains('err'));
     require(JSON.stringify(ze.settings)===beforeRejectedOpen.settings,'Rejected native open changed settings');
     require(JSON.stringify(ze.geometry)===beforeRejectedOpen.geometry,'Rejected native open changed geometry');
-    require(ze._scanGeneration===beforeRejectedOpen.generation,'Rejected open invalidated prior scan warmup');
+    require(ze._scanGeneration===beforeRejectedOpen.generation,'Rejected open changed the scan generation');
     require(ze.scan.dtype==='uint16' && (await ze.storedOverview()).values[5]===60,'Rejected native open replaced source');
     require(document.getElementById('overview-source').textContent.toLowerCase().includes('image quality'),'Rejected open lost old map');
   `);

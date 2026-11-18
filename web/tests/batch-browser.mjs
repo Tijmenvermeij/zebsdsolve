@@ -212,7 +212,8 @@ try {
     const add=ze.addPhase.bind(ze);let calls=0;ze.addPhase=async(...args)=>{if(++calls===2)throw Error('Test missing second master');return add(...args);};
     const row=document.querySelector('#batch-jobs tr');[...row.querySelectorAll('button')].find(b=>b.textContent==='Load').click();
     await waitBatch(()=>document.getElementById('status').textContent.includes('Test missing second master') && document.getElementById('app').dataset.busy==='0');ze.addPhase=add;
-    require(ze.phases.length===1 && document.querySelectorAll('#phases li').length===1,'Partial phase list stale');
+    const entries=[...document.querySelectorAll('#phases li')];
+    require(ze.phases.length===1 && entries.length===2 && entries.filter(li=>li.dataset.on==='1').length===1,'Partial phase list stale');
     require(document.getElementById('scan-meta').textContent.includes('other-acquisition.h5'),'Loaded source label stale');
     require([...document.querySelectorAll('.needs-results')].every(b=>b.disabled),'Previous results still exportable');
     document.getElementById('btn-batch-current').click();await waitBatch(()=>document.querySelectorAll('#batch-jobs tr').length===2);

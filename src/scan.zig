@@ -98,12 +98,6 @@ pub const Scan = struct {
     overview_values: []f32 = &.{},
     why: []const u8 = "",
 
-    /// Advance only the pattern dataset's chunk lookup, without reading patterns.
-    pub fn prepareIndexStep(self: *Scan, max_nodes: usize, max_bytes: usize) !bool {
-        if (self.h5) |*h| return h.prepareIndexStep(&self.ds, max_nodes, max_bytes);
-        return true;
-    }
-
     pub fn count(self: *const Scan) u64 {
         return @as(u64, self.info.rows) * self.info.cols;
     }
@@ -140,12 +134,16 @@ pub const Scan = struct {
         const candidates = [_]Candidate{
             .{ .name = "Band Contrast", .kind = .band_contrast },
             .{ .name = "band_contrast", .kind = .band_contrast },
+            .{ .name = "BandContrast", .kind = .band_contrast },
             .{ .name = "Image Quality", .kind = .image_quality },
             .{ .name = "IQ", .kind = .image_quality },
             .{ .name = "image_quality", .kind = .image_quality },
             .{ .name = "iq", .kind = .image_quality },
+            .{ .name = "ImageQuality", .kind = .image_quality },
             .{ .name = "RadonQuality", .kind = .radon_quality },
+            .{ .name = "Radon Quality", .kind = .radon_quality },
             .{ .name = "Pattern Quality", .kind = .pattern_quality },
+            .{ .name = "PatternQuality", .kind = .pattern_quality },
         };
         const h = &self.h5.?;
         const original_why = h.why;
@@ -562,6 +560,8 @@ pub const Scan = struct {
             info.rows = hints.rows;
             info.cols = hints.cols;
         }
+        // EMsoft keeps optional per-pattern scalars beside EBSDPatterns.
+        self.discoverOverview((try h.find("EMData/EBSD")).?);
         const nml = (try h.find("NMLparameters/EBSDNameList")) orelse return;
         const get = struct {
             fn f(hh: *hdf5.Hdf5, group: u64, name: []const u8) f64 {
