@@ -378,6 +378,10 @@ function ioImports(state) {
       state.io.slices += pieces.length;
       state.io.bytes += at - dst;
       state.io.ms += performance.now() - t0;
+      if (state.patternStatsIo) {
+        state.patternStatsIo.fileReads++;
+        state.patternStatsIo.fileBytes += at - dst;
+      }
       return 0;
     } catch (e) { state.errors.push(`file read: ${e.message || e}`); return 1; }
   };
@@ -460,7 +464,7 @@ export class Zebsdsolve {
     }
     const compiling = { done: 0, total: 0, listeners: onCompile ? [onCompile] : [] };
     const state = { device, memory: null, reads: [], errors: [], info, adapterInfo: Object.freeze(adapterInfo), deviceLoss: null, listeners: [], stats: newStats(), compiling,
-      files: [null], io: { reads: 0, slices: 0, bytes: 0, ms: 0 } };
+      files: [null], io: { reads: 0, slices: 0, bytes: 0, ms: 0 }, patternStatsIo: null };
     // This callback only reports JS state. It must never enter wasm while an operation is
     // suspended, nor race that operation's lifetime against device.lost.
     device.lost?.then((loss) => {
@@ -835,16 +839,22 @@ export class Zebsdsolve {
   /** Angular width of one stored detector pixel as the master filters take it, degrees. */
   get pixelAngle() { if (this._disposed) throw new Error("zebsdsolve: engine disposed"); return this.x.ze_pixel_angle(this.e); }
 
-  /** Mean and standard deviation of the stored patterns of the given cells: { mean, std }. */
+  /** Mean, standard deviation and file traffic of this batch of stored patterns: { mean, std, io }. */
   patternStats(cells) {
     return this._serial(() => this._frame(async (f) => {
       const n = cells.length;
       const out = f.alloc(n * 8);
-      this._check(await this.x.ze_pattern_stats(this.e, f.u64(cells), n, out, 2 * n), "pattern_stats");
+      const io = { fileReads: 0, fileBytes: 0 };
+      this.state.patternStatsIo = io;
+      try {
+        this._check(await this.x.ze_pattern_stats(this.e, f.u64(cells), n, out, 2 * n), "pattern_stats");
+      } finally {
+        this.state.patternStatsIo = null;
+      }
       const v = new Float32Array(this.mem, out, 2 * n);
       const mean = new Float32Array(n), std = new Float32Array(n);
       for (let i = 0; i < n; i++) { mean[i] = v[2 * i]; std[i] = v[2 * i + 1]; }
-      return { mean, std };
+      return { mean, std, io };
     }));
   }
 

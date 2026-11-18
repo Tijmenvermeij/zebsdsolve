@@ -549,10 +549,12 @@ function updateOverviewControls() {
 
 async function loadStoredOverview() {
   const run = st.overviewRun, ze = st.ze;
+  let missing = false;
   try {
     const stored = await ze.storedOverview();
     if (run !== st.overviewRun || ze !== st.ze) return;
     st.storedOverview = stored;
+    missing = !stored;
     if (stored) {
       st.overview = stored.values;
       st.overviewSource = "stored";
@@ -570,12 +572,13 @@ async function loadStoredOverview() {
         st.overviewLoading = false;
         updateOverviewControls();
         if (!st.busy) showCell();
+        if (missing) runOverview();
       }
     }
   }
 }
 
-/** Explicit progressive contrast calculation. Each batch yields to other engine jobs. */
+/** Progressive contrast for scans without stored quality, or on request. Each batch yields to other jobs. */
 async function runOverview() {
   const run = ++st.overviewRun, ze = st.ze;
   const { rows, cols, patH, patW, pixel } = st.scan;
@@ -594,7 +597,7 @@ async function runOverview() {
   let top = 0;
   while (nr >> (top + 1) >= 12) top++;
   const t0 = performance.now();
-  let read = 0, lastDraw = 0;
+  let read = 0, fileBytes = 0, fileReads = 0, lastDraw = 0;
   try {
     for (let p = top; p >= 0; p--) {
       const step = 1 << p, todo = [];
@@ -610,6 +613,8 @@ async function runOverview() {
         const res = await ze.patternStats(part);
         if (!current()) return;
         read += part.length;
+        fileBytes += res.io.fileBytes;
+        fileReads += res.io.fileReads;
         for (let k = 0; k < part.length; k++) {
           const r0 = Math.floor(part[k] / cols), c0 = part[k] % cols;
           const r1 = Math.min(rows, r0 + stride * step), c1 = Math.min(cols, c0 + stride);
@@ -620,7 +625,7 @@ async function runOverview() {
     }
     if (!current()) return;
     redraw();
-    log(`overview: ${read.toLocaleString()} patterns${stride > 1 ? ` (every ${stride}${stride === 2 ? "nd" : stride === 3 ? "rd" : "th"} each way)` : ""} in ${((performance.now() - t0) / 1000).toFixed(2)} s`);
+    log(`overview: ${read.toLocaleString()} patterns${stride > 1 ? ` (every ${stride}${stride === 2 ? "nd" : stride === 3 ? "rd" : "th"} each way)` : ""} in ${((performance.now() - t0) / 1000).toFixed(2)} s, ${(fileBytes / 2 ** 20).toFixed(1)} MiB in ${fileReads.toLocaleString()} reads`);
   } catch (e) {
     if (current()) log(String(e.message || e), true);
   } finally {

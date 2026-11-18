@@ -132,9 +132,14 @@ try {
   if (!/^ready/.test(ready.status)) throw new Error("no WebGPU: " + ready.status);
 
   await evaluate(`
-    window.overviewCalls = 0;
+    window.overviewIo = { bytes: 0, reads: 0 };
     const patternStats = window.ze.patternStats.bind(window.ze);
-    window.ze.patternStats = (...args) => { window.overviewCalls++; return patternStats(...args); };
+    window.ze.patternStats = async (...args) => {
+      const result = await patternStats(...args);
+      window.overviewIo.bytes += result.io.fileBytes;
+      window.overviewIo.reads += result.io.fileReads;
+      return result;
+    };
   `);
   // the example: the module reads the HDF5 scan and the master pattern itself
   const opened = await evaluate(`${job("btn-example")}
@@ -144,25 +149,19 @@ try {
     `${opened.s.format}, ${opened.s.rows} × ${opened.s.cols}, phase ${opened.phases[0]?.name} (${opened.phases[0]?.pointGroupName})`);
   const pcFile = opened.pc;
 
-  // No stored scalar map: opening stays neutral until calculation is requested.
-  const idle = await evaluate(`
-    for (let i = 0; i < 200 && !/found now/.test(document.getElementById("pat-sim-cap").textContent); i++) await new Promise(r => setTimeout(r, 100));
-    await window.ze._queue;
-    window.ze.stats();
-    await new Promise(r => setTimeout(r, 250));
-    return {calls:window.overviewCalls,io:window.ze.stats(),legend:document.getElementById("map-legend").hidden,
-      stage:document.getElementById('pat-stage').value,live:document.getElementById('pat-live').checked};
-  `);
-  check("opening leaves contrast optional and on-spot indexing enabled", idle.calls === 0 && idle.io.fileBytes === 0 && idle.legend && idle.stage === "stored" && idle.live, JSON.stringify(idle));
+  // The example has no stored scalar map and calculates contrast on opening.
   const seen = await evaluate(`
-    document.getElementById("btn-overview").click();
     for (let i = 0; i < 300 && !/overview:/.test(document.getElementById("log").textContent); i++) await new Promise((r) => setTimeout(r, 100));
     const shown = () => [...document.querySelectorAll("#panels .panel")].filter((p) => !p.hidden).map((p) => p.dataset.tab).join();
     const before = shown();
     document.getElementById("tab-index").click();
     return { overview: (/overview: [^\\n]*/.exec(document.getElementById("log").textContent) || [""])[0], before, after: shown(), done: document.getElementById("tab-data").dataset.done,
-      source: document.getElementById("overview-source").value };`);
-  check("explicit contrast calculation reads every pattern", /overview: 4,125 patterns/.test(seen.overview) && seen.source === "calculated", seen.overview);
+      source: document.getElementById("overview-source").value, io: window.overviewIo, totalReads: window.ze.stats().fileReads,
+      stage: document.getElementById("pat-stage").value, live: document.getElementById("pat-live").checked };`);
+  check("no stored quality map starts contrast and reports its file reads", /overview: 4,125 patterns/.test(seen.overview)
+    && seen.source === "calculated" && seen.io.bytes > 0 && seen.io.reads > 0 && seen.totalReads >= seen.io.reads
+    && seen.overview.endsWith(`${(seen.io.bytes / 2 ** 20).toFixed(1)} MiB in ${seen.io.reads.toLocaleString()} reads`), seen.overview);
+  check("opening still displays the stored pattern with on-spot indexing enabled", seen.stage === "stored" && seen.live);
   check("the steps are tabs, one panel at a time", seen.before === "data" && seen.after === "index" && seen.done === "1", `${seen.before} → ${seen.after}`);
 
   // before anything is fitted or indexed, the selected pattern is indexed on the spot
