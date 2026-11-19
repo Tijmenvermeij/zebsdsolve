@@ -26,6 +26,10 @@ export async function pairUPScan(files, chooseANG, expectedSources = null) {
   }
   if (patterns.length !== 1 || scans.length > 1 || files.some(file => !isUP(file) && !isANG(file))) throw new Error("Select one UP1/UP2 pattern file and its corresponding ANG scan file.");
   const ang = scans[0] || await chooseANG(patterns[0]);
+  if (ang === false) {
+    validateUPProjectSources(expectedSources, patterns);
+    return patterns;
+  }
   if (!ang) return null;
   if (!isANG(ang)) throw new Error("Select an ANG scan file.");
   const paired = [patterns[0], ang];
@@ -33,7 +37,7 @@ export async function pairUPScan(files, chooseANG, expectedSources = null) {
   return paired;
 }
 
-export function chooseANG(pattern) {
+export function chooseANG(pattern, { allowSkip = true } = {}) {
   return new Promise((resolve, reject) => {
     const dialog = document.createElement("dialog"); dialog.id = "scan-info-dialog";
     dialog.className = "scan-info-dialog"; dialog.setAttribute("aria-labelledby", "scan-info-title");
@@ -42,7 +46,17 @@ export function chooseANG(pattern) {
     const open = document.createElement("button"); open.type = "button"; open.className = "primary"; open.textContent = "Choose ANG…";
     const cancel = document.createElement("button"); cancel.type = "button"; cancel.textContent = "Cancel";
     const input = document.createElement("input"); input.type = "file"; input.accept = ".ang"; input.hidden = true; input.id = "file-scan-info";
-    row.append(open, cancel); dialog.append(title, row, input); document.body.append(dialog);
+    const detail = document.createElement("p"); detail.id = "scan-info-detail";
+    detail.textContent = "The matching ANG file supplies the scan layout, image quality and supported pattern-centre calibration.";
+    dialog.setAttribute("aria-describedby", detail.id);
+    row.append(open);
+    if (allowSkip) {
+      detail.textContent = `Optional. ${detail.textContent}`;
+      const skip = document.createElement("button"); skip.type = "button"; skip.textContent = "Open without ANG";
+      skip.addEventListener("click", () => finish(false));
+      row.append(skip);
+    }
+    row.append(cancel); dialog.append(title, detail, row, input); document.body.append(dialog);
     let done = false, choosing = false;
     function finish(file, error = null) {
       if (done) return; done = true; dialog.close(); dialog.remove();

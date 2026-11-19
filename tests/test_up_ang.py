@@ -101,6 +101,13 @@ class UpAng(unittest.TestCase):
         with Solver() as s:
             s.open(up)
             self.assertEqual((s.scan['rows'],s.scan['cols']), (1,6))
+    def test_up_step_drift_accumulates_across_wide_scan(self):
+        up, _ = self.up(version=3, cols=4096, dx=.025004)
+        ang, _ = self.ang(cols=4096, dx=.025)
+        with Solver() as s:
+            with self.assertRaisesRegex(Error, "UPANGStepMismatch"):
+                s.open(up, ang)
+
     def test_duplicate_sidecar_and_hint_conflicts(self):
         ang,_ = self.ang();up,_ = self.up()
         with Solver() as s:
@@ -129,6 +136,23 @@ class UpAng(unittest.TestCase):
             with self.subTest(options=options),Solver() as s:
                 ang,_=self.ang(**options)
                 with self.assertRaisesRegex(Error,error):s.open(up,ang)
+    def test_header_boundaries_and_duplicate_grid_metadata(self):
+        up, _ = self.up()
+        ang, _ = self.ang()
+        original = ang.read_text()
+        with Solver() as s:
+            ang.write_text("# OPERATOR: Giacomo\n" + original)
+            s.open(up, ang)
+            for prefix, suffix, error in [
+                ("# File created from (ACOM) data\n", "", "UnsupportedANGConvention"),
+                ("# NROWS: 2\n", "", "DuplicateANGMetadata"),
+                ("", "\n# XSTEP: .025\n", "InvalidANGRecord"),
+            ]:
+                with self.subTest(error=error):
+                    ang.write_text(prefix + original + suffix)
+                    with self.assertRaisesRegex(Error, error):
+                        s.open(up, ang)
+
     def test_explicit_columns_units_and_missing_iq_values(self):
         up,_=self.up(); _,standard=self.ang()
         reordered=standard[:,[0,1,2,6,5,4,3,7,8,9]]
@@ -167,10 +191,12 @@ class UpAng(unittest.TestCase):
     def test_ambiguous_coordinate_precision_is_rejected(self):
         up,_ = self.up()
         _, records = self.ang()
-        records[:,3] = np.float32(1e9) + (records[:,3]-10).astype('f4')
-        ang,_ = self.ang(records=records)
-        with Solver() as s:
-            with self.assertRaisesRegex(Error,'ANGCoordinatePrecisionInsufficient'):s.open(up,ang)
+        for origin in (1e9, 1e20):
+            records[:, 3] = origin
+            ang, _ = self.ang(records=records)
+            with self.subTest(origin=origin), Solver() as s:
+                with self.assertRaisesRegex(Error, "ANGCoordinatePrecisionInsufficient"):
+                    s.open(up, ang)
         # Double precision positions with the same large origin remain identifiable.
         records[:,3] = 1e9 + np.tile(np.arange(3)*.025,2)
         ang,_ = self.ang(records=records)
@@ -180,14 +206,18 @@ class UpAng(unittest.TestCase):
         ang,records=self.ang()
         text=ang.read_text()
         if producer == 'edax': text='# HEADER: Start\n'+text
-        elif producer == 'zebsdsolve': pass # explicit marker below wins over inherited VERSION
+        elif producer in ('zebsdsolve', 'zebsdsolve_edax'): pass # explicit marker wins over inherited VERSION
         elif producer == 'legacy':
             text=text.replace('# VERSION 7\n','').replace('# MaterialName Nickel','# MaterialName')
             text=text.replace('# LatticeConstants', '# NumberFamilies 0\n# LatticeConstants')
             text=text.replace('# GRID:', ('# ElasticConstants 0 0 0 0 0 0\n'*6)+'# Categories\n# OPERATOR: unknown\n# SAMPLEID:\n# SCANID:\n# GRID:')
         elif producer == 'unknown': text=text.replace('# VERSION 7\n','')
         elif producer != 'overlap': raise AssertionError(producer)
-        marker={'zebsdsolve':'# SOFTWARE: zebsdsolve 0.2.0','overlap':'# VERSION Overlap-GUI positive phase IDs'}.get(producer,'')
+        marker = {
+            "zebsdsolve": "# SOFTWARE: zebsdsolve 0.2.0",
+            "zebsdsolve_edax": "# SOFTWARE: zebsdsolve 0.2.2 (EDAX pattern centre)",
+            "overlap": "# VERSION Overlap-GUI positive phase IDs",
+        }.get(producer, "")
         # Keep all metadata before records; the scalar parser never reads Euler columns.
         lines=text.splitlines();first=next(i for i,line in enumerate(lines) if not line.startswith('#'))
         lines[first:first]=([marker] if marker else [])+pc_lines
@@ -196,7 +226,7 @@ class UpAng(unittest.TestCase):
     def test_ang_pc_producer_normalizations_use_stored_detector_shape(self):
         raw=np.array([.43,.27,.61])
         headers=[f'# {axis}-star: {value}' for axis,value in zip('xyz',raw)]
-        for producer in ['edax','zebsdsolve','overlap','legacy']:
+        for producer in ['edax','zebsdsolve_edax','zebsdsolve','overlap','legacy']:
             for width,height in [(16,8),(8,16),(8,8)]:
                 with self.subTest(producer=producer,width=width,height=height),Solver() as s:
                     up,_=self.up(pat_w=width,pat_h=height)
@@ -204,7 +234,7 @@ class UpAng(unittest.TestCase):
                     s.configure(binning=2)
                     s.set_geometry(sample_tilt_deg=-20,detector_tilt_deg=4)
                     s.open(up,ang)
-                    expected=[raw[0],1-raw[1],raw[2]*min(width,height)/height] if producer=='edax' else [raw[0],1-raw[1]*width/height,raw[2]*width/height]
+                    expected=[raw[0],1-raw[1],raw[2]*min(width,height)/height] if producer in ('edax', 'zebsdsolve_edax') else [raw[0],1-raw[1]*width/height,raw[2]*width/height]
                     np.testing.assert_allclose(s.geometry['pc'],expected,atol=1e-14,rtol=0)
                     self.assertTrue(s.scan['has_pc'])
                     self.assertFalse(s.has_acquisition_calibration)
@@ -213,6 +243,22 @@ class UpAng(unittest.TestCase):
                     self.assertEqual(s.phases,[])
                     np.testing.assert_array_equal(s.stored_overview()['values'],records[:,5].reshape(2,3))
                     self.assertTrue(any('Imported ANG pattern centre:' in event.get('text','') for event in s.events()))
+    def test_edax_hdf5_pattern_centre_matches_ang_convention(self):
+        path = self.root / "scan.h5"
+        for width, height in [(16, 8), (8, 16)]:
+            with self.subTest(width=width, height=height), Solver() as s:
+                with h5py.File(path, "w") as f:
+                    header = f.create_group("1/EBSD/Header")
+                    header["nRows"] = [2]
+                    header["nColumns"] = [3]
+                    pc = header.create_group("Pattern Center Calibration")
+                    pc["x-star"], pc["y-star"], pc["z-star"] = [.43], [.27], [.61]
+                    f["1/EBSD/Data/Pattern"] = np.zeros((6, height, width), dtype="u1")
+                s.open(path)
+                self.assertTrue(s.scan["has_pc"])
+                expected = [.43, .73, .61 * min(width, height) / height]
+                np.testing.assert_allclose(s.geometry["pc"], expected, atol=1e-14, rtol=0)
+
     def test_ang_pc_explicit_producers_outrank_structural_hints(self):
         raw=[.43,.27,.61]
         pc=[f'# {axis}-star {value}' for axis,value in zip('xyz',raw)]

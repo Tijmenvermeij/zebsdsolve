@@ -1,6 +1,6 @@
-//! ANG scalar/grid/producer-specific PC sidecar. Euler angles, phases and crystal metadata are not imported.
-//! EDAX positions and XSTEP/YSTEP are micrometres by default (native pyMTEX ANG convention).
-//! This streaming adapter proves row-major registration before joining IQ to UP pixel IDs.
+//! ANG scalar/grid and producer-specific pattern-centre companion for UP patterns.
+//! Positions and steps are micrometres. Validate x-fast/y-next acquisition order relative
+//! to the first position; engine geometry remains scan-local, with no origin fit or reorder.
 const std = @import("std");
 const File = @import("io/file.zig").File;
 const Allocator = std.mem.Allocator;
@@ -11,8 +11,8 @@ pub const Metadata = struct {
     step_x_um: f64,
     step_y_um: f64,
     iq: []f32,
-    pc: ?[3]f64 = null,
-    pc_note: []const u8 = "",
+    pc: ?[3]f64,
+    pc_note: []const u8,
 };
 
 const Lines = struct {
@@ -71,6 +71,9 @@ const Columns = struct {
 fn eq(a: []const u8, b: []const u8) bool {
     return std.ascii.eqlIgnoreCase(a, b);
 }
+fn wordByte(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_';
+}
 fn micro(value: []const u8) bool {
     const v = std.mem.trim(u8, value, " \t[]()");
     for ([_][]const u8{ "um", "µm", "μm", "micron", "microns", "micrometer", "micrometers", "micrometre", "micrometres" }) |unit| if (eq(v, unit)) return true;
@@ -88,7 +91,7 @@ fn dimension(v: []const u8) !u32 {
 }
 fn checkCoordinate(actual: f64, expected: f64, origin: f64, travel: f64, step: f64) !void {
     if (!std.math.isFinite(actual) or !std.math.isFinite(expected)) return error.ANGCoordinatesNotRowMajor;
-    const residual = @abs(actual - expected);
+    const residual = @abs((actual - origin) - travel);
     const strict = @max(step * 1e-6, @min(5e-6, step * 0.01));
     if (residual <= strict) return; // also accepts well-resolved f64 coordinates at large origins
     // EDAX may compute positions in float32 and print five decimal places. Account
@@ -111,6 +114,9 @@ const LegacyPhase = struct {
         return self.material_seen and self.blank_material and self.zero_families_before_lattice and self.lattice and self.elastic == 6 and self.categories;
     }
 };
+/// EDAX (OIM) measures x and y in fractions of the pattern's width and height, y from
+/// the bottom, and z in fractions of its smaller side. EMSphInx, Overlap-GUI and
+/// earlier zebsdsolve exports scale y and z by width. On a square pattern the two agree.
 const PcHeader = struct {
     raw: [3]?f64 = .{ null, null, null },
     width_producer: bool = false,
@@ -137,8 +143,12 @@ const PcHeader = struct {
             self.software_seen = true;
             var words = std.mem.tokenizeAny(u8, value, " \t");
             const producer = words.next() orelse return;
-            if (eq(producer, "zebsdsolve") or eq(producer, "EMSphInx")) self.width_producer = true;
             if (eq(producer, "EDAX") or eq(producer, "OIM")) self.edax_producer = true;
+            if (eq(producer, "EMSphInx")) self.width_producer = true;
+            // Since 0.2.2, the software line explicitly names its EDAX convention.
+            if (eq(producer, "zebsdsolve")) {
+                if (std.mem.indexOf(u8, words.rest(), "EDAX") != null) self.edax_producer = true else self.width_producer = true;
+            }
         } else if (eq(key, "HEADER") and eq(value, "Start")) {
             self.header_start = true;
         } else if (eq(key, "VERSION")) {
@@ -192,17 +202,15 @@ const PcHeader = struct {
         if (!width_scaled and !edax and width != height) return .{ .note = "ANG pattern centre was not applied: producer convention is unknown for a rectangular detector." };
         const w: f64 = @floatFromInt(width);
         const h: f64 = @floatFromInt(height);
-        // Existing native detector conventions, not crystallographic rotations:
-        // EDAX/OIM: x/width, y/height from bottom, distance/min(width,height).
-        // EMSphInx/zebsdsolve/Overlap-GUI: all three normalized by width.
+        // Engine coordinates use x/width, y/height from the top and distance/height.
         const pc: [3]f64 = if (width_scaled) .{ raw[0], 1 - raw[1] * w / h, raw[2] * w / h } else .{ raw[0], 1 - raw[1], raw[2] * @min(w, h) / h };
         for (pc) |x| if (!std.math.isFinite(x)) return error.InvalidANGPatternCentre;
         if (!(pc[2] > 0)) return error.InvalidANGPatternCentre;
-        return .{ .value = pc, .note = if (conflict) "Imported ANG pattern centre: square detector; conflicting producer normalizations coincide." else if (width_scaled) "Imported ANG pattern centre: EMSphInx/zebsdsolve width-normalized convention." else if (edax) "Imported ANG pattern centre: EDAX/OIM convention." else "Imported ANG pattern centre: square detector; ANG normalizations coincide." };
+        return .{ .value = pc, .note = if (conflict) "Imported ANG pattern centre: square detector; conflicting producer normalizations coincide." else if (width_scaled) "Imported ANG pattern centre: EMSphInx/legacy zebsdsolve/Overlap-GUI width-normalized convention." else if (edax) "Imported ANG pattern centre: EDAX/OIM convention." else "Imported ANG pattern centre: square detector; ANG normalizations coincide." };
     }
 };
 
-pub fn load(gpa: Allocator, file: *File, expected_count: u64, pattern_width: u32, pattern_height: u32) !Metadata {
+pub fn load(gpa: Allocator, file: *File, expected_count: u64, up_steps: ?[2]f64, pattern_width: u32, pattern_height: u32) !Metadata {
     var lines: Lines = .{ .f = file };
     defer lines.line.deinit(gpa);
     var rows: u32 = 0;
@@ -227,25 +235,43 @@ pub fn load(gpa: Allocator, file: *File, expected_count: u64, pattern_width: u32
         const line = std.mem.trim(u8, raw, " \t\r");
         if (line.len == 0) continue;
         if (line[0] == '#') {
-            if (count != 0) continue;
+            if (count != 0) return error.InvalidANGRecord;
             const content = std.mem.trim(u8, line[1..], " \t");
-            if (std.ascii.indexOfIgnoreCase(content, "ACOM") != null or std.ascii.indexOfIgnoreCase(content, "TEM data") != null) return error.UnsupportedANGConvention;
+            var at: usize = 0;
+            var tem = false;
+            while (at < content.len) {
+                if (!wordByte(content[at])) {
+                    at += 1;
+                    continue;
+                }
+                const start = at;
+                while (at < content.len and wordByte(content[at])) at += 1;
+                const word = content[start..at];
+                if (eq(word, "ACOM") or (tem and eq(word, "data"))) return error.UnsupportedANGConvention;
+                tem = eq(word, "TEM");
+            }
             var pair = std.mem.tokenizeAny(u8, content, ": \t");
             const key = pair.next() orelse continue;
             const value = std.mem.trim(u8, pair.rest(), ": \t");
             try pc_header.header(key, value);
             if (eq(key, "GRID")) {
+                if (square) return error.DuplicateANGMetadata;
                 if (!eq(value, "SqrGrid")) return error.UnsupportedANGGrid;
                 square = true;
             } else if (eq(key, "NROWS")) {
+                if (rows != 0) return error.DuplicateANGMetadata;
                 rows = try dimension(value);
             } else if (eq(key, "NCOLS_ODD")) {
+                if (odd != 0) return error.DuplicateANGMetadata;
                 odd = try dimension(value);
             } else if (eq(key, "NCOLS_EVEN")) {
+                if (even != 0) return error.DuplicateANGMetadata;
                 even = try dimension(value);
             } else if (eq(key, "XSTEP")) {
+                if (dx != 0) return error.DuplicateANGMetadata;
                 dx = try positive(value);
             } else if (eq(key, "YSTEP")) {
+                if (dy != 0) return error.DuplicateANGMetadata;
                 dy = try positive(value);
             } else if (eq(key, "COLUMN_HEADERS")) {
                 if (names_seen) return error.DuplicateANGColumns;
@@ -289,6 +315,8 @@ pub fn load(gpa: Allocator, file: *File, expected_count: u64, pattern_width: u32
             iq = try gpa.alloc(f32, @intCast(expected_count));
         }
         if (count >= iq.len) return error.ANGPatternCountMismatch;
+        // Legacy ANG: phi1 Phi phi2 x y IQ CI phase [SEM fit ...]. Only x/y/IQ
+        // are scalar inputs; Euler angles and phase columns are left unread.
         var values = std.mem.tokenizeAny(u8, line, " \t");
         var k: usize = 0;
         var x: f64 = std.math.nan(f64);
@@ -309,6 +337,12 @@ pub fn load(gpa: Allocator, file: *File, expected_count: u64, pattern_width: u32
         const yt = @as(f64, @floatFromInt(count / odd)) * dy;
         try checkCoordinate(x, x0 + xt, x0, xt, dx);
         try checkCoordinate(y, y0 + yt, y0, yt, dy);
+        if (up_steps) |steps| {
+            const ux = @as(f64, @floatFromInt(count % odd)) * steps[0];
+            const uy = @as(f64, @floatFromInt(count / odd)) * steps[1];
+            checkCoordinate(x, x0 + ux, x0, ux, steps[0]) catch return error.UPANGStepMismatch;
+            checkCoordinate(y, y0 + uy, y0, uy, steps[1]) catch return error.UPANGStepMismatch;
+        }
         iq[count] = if (std.math.isFinite(quality) and @abs(quality) <= std.math.floatMax(f32)) @floatCast(quality) else std.math.nan(f32);
         count += 1;
     }

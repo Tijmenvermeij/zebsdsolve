@@ -498,9 +498,10 @@ pub const Scan = struct {
                     const x = num.get(h, pc, "x-star");
                     const y = num.get(h, pc, "y-star");
                     const z = num.get(h, pc, "z-star");
-                    // EDAX measures y from the bottom, y and z in fractions of the width; an
-                    // all-zero entry means not calibrated
-                    if (x != 0 or y != 0 or z != 0) info.pc = .{ x, 1 - y * ratio, z * ratio };
+                    // EDAX measures y from the bottom, x and y in fractions of the width and
+                    // height, z of the smaller of the two (as kikuchipy has it); an all-zero
+                    // entry means not calibrated
+                    if (x != 0 or y != 0 or z != 0) info.pc = .{ x, 1 - y, z * @min(ratio, 1) };
                 }
             },
             .h5_oxford => {
@@ -635,10 +636,10 @@ pub const Scan = struct {
         if (sidecar) |k| {
             if (hex != 0) return error.UnsupportedUPHexGrid;
             if (version >= 3) {
-                if (@as(u64, nx) * ny != n or nx == 0 or ny == 0) return if (extra != 0) error.AmbiguousUPExtraPatterns else error.UPPatternCountMismatch;
+                if (nx == 0 or ny == 0 or @as(u64, nx) * ny != n) return if (extra != 0) error.AmbiguousUPExtraPatterns else error.UPPatternCountMismatch;
                 if (!validStep(dx) or !validStep(dy)) return error.InvalidUPStep;
             }
-            const ang = try @import("ang.zig").load(self.gpa, &self.files[k], n, w, hgt);
+            const ang = try @import("ang.zig").load(self.gpa, &self.files[k], n, if (version >= 3) .{ dx, dy } else null, w, hgt);
             errdefer self.gpa.free(ang.iq);
             if (version >= 3 and (nx != ang.cols or ny != ang.rows)) return error.ScanShapeMismatch;
             if (version >= 3 and (!sameStep(dx, ang.step_x_um) or !sameStep(dy, ang.step_y_um))) return error.UPANGStepMismatch;
@@ -821,6 +822,7 @@ pub const Scan = struct {
 fn validStep(x: f64) bool {
     return std.math.isFinite(x) and x > 0;
 }
+
 fn sameStep(a: f64, b: f64) bool {
     return @abs(a - b) <= @max(@max(a, b) * 1e-6, @min(5e-6, @min(a, b) * 0.01));
 }

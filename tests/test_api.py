@@ -672,6 +672,7 @@ def main():
           f"chance NMI {med:.4f} ± {spread:.4f}: z {s.settings['accept_z']:g} is NMI {med + s.settings['accept_z'] * spread:.4f}; batches of 97 and 256 accept the same cells")
     acc = ra["sweep"] >= 0
     check("or an absolute mutual information", acc.mean() > 0.95 and (ra["nmi"][acc] >= 0.05).all() and not acc[ra["nmi"] < 0.05].any(), f"NMI ≥ 0.05 accepts {100 * acc.mean():.1f} %")
+    s.configure(ipf_colors="classic")  # (the default is the paper's key by direction)
     rgba = s.map("ipf_z")
     check("maps are images", rgba.shape == (55, 75, 4) and (rgba[..., 3] == 255).all() and s.map("ncc").shape == (55, 75, 4) and s.map("z").shape == (55, 75, 4) and s.map("sweep").shape == (55, 75, 4))
     key, box = s.ipf_key(0, 128)
@@ -733,6 +734,23 @@ def main():
           and np.array_equal(s.results()["quaternions"], r["quaternions"]),
           f"{len(some)} cells: median {np.median(near):.4f}° from what indexing stored; at bandwidth 32 as the setting would give")
 
+    # a cell under another pattern centre, the one in use staying: what setting that centre,
+    # indexing the cell and simulating it would give
+    original_geo = s.geometry
+    pc0 = np.array(original_geo["pc"])
+    s.set_geometry(plane_kind="affine", plane=[[0, 0, v] for v in pc0] + [[0, 0, 1]])
+    with_plane = s.geometry
+    other, cell = np.array(with_plane["pc"]) + [0.01, -0.01, 0.005], int(some[7])
+    u = s.cell_under(cell, pc=other)
+    kept = s.geometry == with_plane
+    s.set_geometry(pc=other)
+    v = s.index_cells([cell], method="spherical", bandwidth=s.settings["fit_bandwidth"])
+    sim_v = s.simulate(v["quaternions"][0, 0], cells=[cell], phase=0)
+    s.set_geometry(**original_geo)
+    check("a cell can be indexed and simulated under another pattern centre, the fitted plane staying", kept and np.allclose(u["quaternion"], v["quaternions"][0, 0])
+          and abs(u["ncc"] - float(v["ncc"][0, 0])) < 1e-6 and np.abs(u["simulation"].ravel() - np.asarray(sim_v).ravel()).max() < 1e-6,
+          f"NCC {u['ncc']:.4f} there, as setting it gives")
+
     # tuning: the fastest batch size and cutting-up of the work for this machine, by a few
     # timed trials on a sample; the stored results stay as they are and the orientations do
     # not depend on it
@@ -793,6 +811,20 @@ def main():
     e = np.abs(np.array(p["pc"]) - pc_file)
     check("the fits recover the nickel scan's pattern centre", e.max() < 0.004,
           f"vote {np.round(p['start_pc'], 4)}, plane {np.round(p['pc'], 5)}, {np.round(e, 5)} from kikuchipy's, mean NCC {p['ncc']:.4f}")
+    # the automatic fit checks the simpler models as well and takes the simplest the map
+    # supports: over the whole map the plane; on a strip six columns wide, which says nothing
+    # across its columns, a tilt line (PCx the same everywhere, PCy and PCz along the rows)
+    s.configure(roi_x=34, roi_y=0, roi_w=6, roi_h=55, plane_kind="projective")
+    s.set_geometry(pc=pc_file)
+    t = s.fit_geometry()
+    P = np.array(s.geometry["plane"], dtype=np.float64).reshape(-1)
+    s.configure(roi_x=0, roi_y=0, roi_w=0, roi_h=0, plane_kind="affine")
+    e_line = np.abs(np.array(t["pc"]) - pc_file).max()
+    check("the automatic fit takes the simplest model the map supports: the plane, or on a narrow strip a tilt line",
+          p["model"] == "affine" and set(p["models"]) == {"centre", "line", "affine"} and t["model"] == "line" and t["kind"] == s.geometry["plane_kind"] == "affine"
+          and np.allclose(P[[0, 1, 3, 6]], 0) and not np.allclose(P[[4, 7]], 0) and e_line < 0.004,
+          "whole map: " + ", ".join(f"{m} ×{v['cv'] / min(x['cv'] for x in p['models'].values()):.2f}" for m, v in p["models"].items())
+          + "; strip: " + ", ".join(f"{m} ×{v['cv'] / min(x['cv'] for x in t['models'].values()):.2f}" for m, v in t["models"].items()) + f"; its centre {e_line:.4f} from kikuchipy's")
     ev = s.events()
     check("events are queued for the caller", any(x["kind"] == "pc" for x in ev) and any(x["kind"] == "progress" and x["stage"] == "plane" for x in ev))
     s.close()
@@ -966,6 +998,13 @@ def main():
     check("its fits keep poses that simulate their patterns", (phases == 0).all() and vote > 0.999 and plane > 0.99,
           f"the vote's poses against the search's: at least {vote:.4f}; the plane fit's against the patterns: at least {plane:.4f}")
     s.close()
+
+    # a region of interest belongs to its scan: the next one opens on the whole map
+    with ze.Solver() as s2:
+        s2.configure(roi_x=3, roi_y=2, roi_w=5, roi_h=4)
+        s2.open(SCAN)
+        roi = [s2.settings[k] for k in ("roi_x", "roi_y", "roi_w", "roi_h")]
+    check("a scan opens on the whole map", roi == [0, 0, 0, 0], f"region after opening: {roi}")
 
     # ── the plain functions ──
     res = ze.index(SCAN, [NI], roi_x=0, roi_y=0, roi_w=30, roi_h=10, batch=128)

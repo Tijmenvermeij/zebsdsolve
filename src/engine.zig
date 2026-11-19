@@ -43,7 +43,7 @@ const Allocator = std.mem.Allocator;
 pub const Settings = settings_mod.Settings;
 pub const Geometry = geometry_mod.Geometry;
 
-pub const version = "0.2.1";
+pub const version = "0.2.2";
 
 /// A pattern resolution: reduced by settings.binning, or as stored.
 pub const Level = enum(u1) { reduced = 0, full = 1 };
@@ -572,6 +572,9 @@ pub const Engine = struct {
     geo: Geometry = .{},
     calibration: @import("oxford.zig").Calibration = .{},
     phase_generation: u64 = 0,
+    /// the geometry in use while `cellUnder` runs under another (reading and setting the
+    /// geometry go to it meanwhile)
+    geo_home: ?Geometry = null,
     /// The geometry as it was given: by the scan when it was opened, and by the caller since
     /// (exports.ze_set_geometry). The fits change `geo` and never this, and start from this, so
     /// that a fit is a function of the scan, the settings and what was given, not of the fits
@@ -822,13 +825,16 @@ pub const Engine = struct {
     /// Open a scan from files (the pattern file first). The geometry takes whatever the file
     /// records; the rest keeps its current value.
     pub fn openScan(self: *Engine, paths: []const []const u8) !void {
-        try self.openScanPrepared(paths, self.set, self.set, self.mask_explicit);
+        var settings = self.set;
+        wholeMap(&settings);
+        try self.openScanPrepared(paths, settings, settings, self.mask_explicit);
     }
 
     /// Project/read patches are prospective until parsing and result allocation succeed.
     /// Read hints win while opening; the project patch wins in committed settings.
     pub fn openScanConfigured(self: *Engine, paths: []const []const u8, settings_json: []const u8, hints_json: []const u8) !void {
         var read_settings = self.set;
+        wholeMap(&read_settings);
         var explicit = self.mask_explicit;
         const project_mask = try read_settings.applyTrackingMask(self.gpa, settings_json);
         explicit = explicit or project_mask;
@@ -876,10 +882,20 @@ pub const Engine = struct {
         const copy = try self.gpa.dupe(u8, data);
         self.closeScan();
         self.source = .{ .memory = .{ .data = copy, .info = .{ .rows = rows, .cols = cols, .pat_h = h, .pat_w = w, .pixel = pixel } } };
+        wholeMap(&self.set);
         try self.res.resize(self.gpa, @as(usize, rows) * cols);
         if (!self.mask_explicit) self.set.mask = true;
         // (patterns from memory come with no geometry: a pixel size set by hand stays)
         if (!(self.geo.px_um > 0)) self.geo.px_um = self.defaultPx();
+    }
+
+    /// A new scan (or new patterns) starts at the whole map: a region drawn on another scan
+    /// says nothing of this one, and would silently keep the fits and indexing to it.
+    fn wholeMap(set: *Settings) void {
+        set.roi_x = 0;
+        set.roi_y = 0;
+        set.roi_w = 0;
+        set.roi_h = 0;
     }
 
     fn adoptInfo(self: *Engine, si: scan_mod.Info, detector_width_mm: f64) void {
@@ -1919,6 +1935,30 @@ pub const Engine = struct {
     // ── the batch ──
 
     /// What a search runs with outside a sweep: the settings' method, bandwidth and dictionary.
+    /// One cell indexed and simulated under another geometry than the one in use, to set two
+    /// pattern centres side by side; the one in use stays as it is (kept in `geo_home` for the
+    /// call). `out` gets a record per phase (the spherical correlation at `bandwidth`, then the
+    /// refinement, as the fits index their patterns), `sim` the best phase's simulation at
+    /// `lv`, the phase chosen as the phase_by setting says. Returns that phase.
+    pub fn cellUnder(self: *Engine, cell: u64, geo: Geometry, bandwidth: u32, lv: Level, out: []Record, sim: []f32) !u32 {
+        if (self.geo_home != null) return error.Busy;
+        self.geo_home = self.geo;
+        self.geo = geo;
+        defer {
+            self.geo = self.geo_home.?;
+            self.geo_home = null;
+        }
+        try self.indexCells(&[_]u64{cell}, .{ .method = .spherical, .bandwidth = bandwidth, .dict_grid = self.set.dict_grid }, out);
+        var p: usize = 0;
+        for (out, 0..) |r, k| {
+            const v = if (self.set.phase_by == .nmi) r.nmi else r.ncc;
+            const b = if (self.set.phase_by == .nmi) out[p].nmi else out[p].ncc;
+            if (v > b) p = k;
+        }
+        try self.simulate(@intCast(p), &[_]u64{cell}, &out[p].q, lv, sim);
+        return @intCast(p);
+    }
+
     pub fn searchOf(self: *const Engine) Search {
         return .{ .method = self.set.method, .bandwidth = self.set.bandwidth, .dict_grid = self.set.dict_grid };
     }

@@ -162,7 +162,7 @@ try {
     await waitBatch(()=>document.getElementById('app').dataset.busy==='0' && document.getElementById('tab-index').getAttribute('aria-selected')==='true');
     require(JSON.stringify(ze.geometry.pc)===JSON.stringify(expected[1].geometry.pc),'Load did not restore fitted geometry');
     require(document.getElementById('bin-choices').value==='2' && !document.getElementById('pat-full-box').hidden,'Saved binning controls stale');
-    require(document.getElementById('sweep-readout').textContent.includes('one pass'),'Saved sweeps stale');
+    require(document.querySelector('#sweep-readout dd').textContent==='spherical '+expected[1].settings.bandwidth && ze.settings.sweeps===1,'Saved sweeps stale');
     document.getElementById('btn-geo-file').click();
     require(JSON.stringify(ze.geometry.pc)===JSON.stringify(fixtureBaseGeo.pc),'As-opened geometry became fitted geometry');
     document.getElementById('btn-batch-clear').click();await pause(100);

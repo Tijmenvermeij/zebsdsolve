@@ -116,7 +116,7 @@ try {
   console.error('UP1 + ANG: second chooser, grid, scan steps and stored IQ passed');
   await evaluate(`ze.configure({roi_x:1,roi_y:1,roi_w:1,roi_h:1});`);
   await inputFiles('#file-scan',[up2]);
-  await evaluate(`await waitFor(()=>document.querySelector('#scan-info-dialog')?.open);document.querySelector('#scan-info-dialog button:not(.primary)').click();await pause(50);require(ze.scan.dtype==='uint8' && ze.scan.rows===2,'Cancel replaced scan');require(ze.settings.roi_w===1 && ze.settings.roi_x===1,'Cancel changed prior ROI');`);
+  await evaluate(`await waitFor(()=>document.querySelector('#scan-info-dialog')?.open);[...document.querySelectorAll('#scan-info-dialog button')].find(b=>b.textContent==='Cancel').click();await pause(50);require(ze.scan.dtype==='uint8' && ze.scan.rows===2,'Cancel replaced scan');require(ze.settings.roi_w===1 && ze.settings.roi_x===1,'Cancel changed prior ROI');`);
   await evaluate(`window.scanBeforeRejectedSelection=ze._scanGeneration;`);
   await inputFiles('#file-scan',[firstScan,secondScan]);
   await evaluate(`await waitFor(()=>document.getElementById('status').textContent.includes('Multiple independent scans'));require(ze._scanGeneration===scanBeforeRejectedSelection,'Multiple scans replaced the open scan');require(ze.settings.roi_x===1 && ze.settings.roi_w===1,'Multiple scans changed the ROI');require(!document.querySelector('#scan-info-dialog'),'Multiple scans opened a companion prompt');`);

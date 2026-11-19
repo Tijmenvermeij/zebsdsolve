@@ -172,7 +172,7 @@ try {
   // A real master added through the retained input path must still trigger the
   // default on-spot preview. Use the app's bandwidth control to bound the search.
   await evaluate(`
-    const control=[...document.querySelectorAll('.field')].find(el=>el.querySelector('span')?.textContent==='bandwidth L').querySelector('input');
+    const control=document.querySelector('.field[data-key="fit_bandwidth"] input');
     control.value='32';control.dispatchEvent(new Event('change'));
     await ze._queue;
     window.phaseIndexBefore=previewCalls.indexStarts.length;
