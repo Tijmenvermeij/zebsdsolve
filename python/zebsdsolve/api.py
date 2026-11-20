@@ -24,7 +24,7 @@ class Result:
     """Indexing results per map cell, with the geometry they were indexed under."""
 
     quaternions: np.ndarray
-    """(rows, cols, 4): w, x, y, z; sample → crystal, fitted pose without symmetry reduction"""
+    """(rows, cols, 4): w, x, y, z; sample → crystal, equivalent pose reduced by the master’s native proper rotations"""
     euler: np.ndarray
     """(rows, cols, 3): the quaternions' Bunge angles, radians"""
     ncc: np.ndarray
@@ -52,6 +52,8 @@ def _open(solver, scan, phases, kwargs):
     # plane_kind selects the fitter unless an explicit source-plane matrix accompanies it.
     if "plane" in geo and "plane_kind" in kwargs:
         geo["plane_kind"] = kwargs.pop("plane_kind")
+    # (a scan opens on the whole map: the region of interest goes in after it)
+    roi = {k: kwargs.pop(k) for k in list(kwargs) if k in ("roi_x", "roi_y", "roi_w", "roi_h")}
     # options that decide how a file is read must be set before it is opened
     solver.configure(**kwargs)
     if isinstance(scan, (str, Path)):
@@ -60,6 +62,8 @@ def _open(solver, scan, phases, kwargs):
         solver.open(*scan)
     else:
         solver.set_patterns(scan)
+    if roi:
+        solver.configure(**roi)
     if geo:
         solver.set_geometry(**geo)
     for p in [phases] if isinstance(phases, (str, Path)) else phases:

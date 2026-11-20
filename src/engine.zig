@@ -47,7 +47,7 @@ const Allocator = std.mem.Allocator;
 pub const Settings = settings_mod.Settings;
 pub const Geometry = geometry_mod.Geometry;
 
-pub const version = "0.2.0";
+pub const version = "0.2.2";
 
 /// A pattern resolution: reduced by settings.binning, or as stored.
 pub const Level = enum(u1) { reduced = 0, full = 1 };
@@ -70,7 +70,9 @@ pub const ScanInfo = extern struct {
     bytes: f64 = 0,
     /// 1 when the file gave a pixel size
     has_px: u32 = 0,
-    _pad: u32 = 0,
+    /// Source-derived geometry convention: 0 generic, 1 legacy Oxford (reserved),
+    /// 2 Oxford detector CS3-to-microscope v2, 3 Oxford fallback.
+    geometry_frame: u32 = 0,
 };
 
 pub const PhaseInfo = extern struct {
@@ -594,6 +596,9 @@ pub const Engine = struct {
     geo: Geometry = .{},
     calibration: @import("oxford.zig").Calibration = .{},
     phase_generation: u64 = 0,
+    /// the geometry in use while `cellUnder` runs under another (reading and setting the
+    /// geometry go to it meanwhile)
+    geo_home: ?Geometry = null,
     /// The geometry as it was given: by the scan when it was opened, and by the caller since
     /// (exports.ze_set_geometry). The fits change `geo` and never this, and start from this, so
     /// that a fit is a function of the scan, the settings and what was given, not of the fits
@@ -844,13 +849,16 @@ pub const Engine = struct {
     /// Open a scan from files (the pattern file first). The geometry takes whatever the file
     /// records; the rest keeps its current value.
     pub fn openScan(self: *Engine, paths: []const []const u8) !void {
-        try self.openScanPrepared(paths, self.set, self.set, self.mask_explicit);
+        var settings = self.set;
+        wholeMap(&settings);
+        try self.openScanPrepared(paths, settings, settings, self.mask_explicit);
     }
 
     /// Project/read patches are prospective until parsing and result allocation succeed.
     /// Read hints win while opening; the project patch wins in committed settings.
     pub fn openScanConfigured(self: *Engine, paths: []const []const u8, settings_json: []const u8, hints_json: []const u8) !void {
         var read_settings = self.set;
+        wholeMap(&read_settings);
         var explicit = self.mask_explicit;
         const project_mask = try read_settings.applyTrackingMask(self.gpa, settings_json);
         explicit = explicit or project_mask;
@@ -898,10 +906,20 @@ pub const Engine = struct {
         const copy = try self.gpa.dupe(u8, data);
         self.closeScan();
         self.source = .{ .memory = .{ .data = copy, .info = .{ .rows = rows, .cols = cols, .pat_h = h, .pat_w = w, .pixel = pixel } } };
+        wholeMap(&self.set);
         try self.res.resize(self.gpa, @as(usize, rows) * cols);
         if (!self.mask_explicit) self.set.mask = true;
         // (patterns from memory come with no geometry: a pixel size set by hand stays)
         if (!(self.geo.px_um > 0)) self.geo.px_um = self.defaultPx();
+    }
+
+    /// A new scan (or new patterns) starts at the whole map: a region drawn on another scan
+    /// says nothing of this one, and would silently keep the fits and indexing to it.
+    fn wholeMap(set: *Settings) void {
+        set.roi_x = 0;
+        set.roi_y = 0;
+        set.roi_w = 0;
+        set.roi_h = 0;
     }
 
     fn adoptInfo(self: *Engine, si: scan_mod.Info, detector_width_mm: f64) void {
@@ -950,6 +968,9 @@ pub const Engine = struct {
         var out: ScanInfo = .{ .rows = i.rows, .cols = i.cols, .pat_h = i.pat_h, .pat_w = i.pat_w, .pixel = @intFromEnum(i.pixel) };
         out.has_pc = @intFromBool(!std.math.isNan(i.pc[0]));
         out.has_px = @intFromBool(!std.math.isNan(i.px_um));
+        if (self.calibration.metadata != null) {
+            out.geometry_frame = if (self.calibration.status() == .supported) 2 else 3;
+        }
         if (!std.math.isNan(i.voltage_kv)) out.voltage_kv = i.voltage_kv;
         switch (self.source) {
             .file => |s| {
@@ -1572,7 +1593,8 @@ pub const Engine = struct {
         const i = self.info() catch return .{ 0, 0, 0 };
         const row: f64 = @floatFromInt(cell / i.cols);
         const col: f64 = @floatFromInt(cell % i.cols);
-        return geo.scanOffset(row, col, 0.5 * @as(f64, @floatFromInt(i.rows - 1)), 0.5 * @as(f64, @floatFromInt(i.cols - 1)), self.set.scan_x_sign, self.set.scan_y_sign, self.binOf(lv));
+        const signs = self.calibration.scanSigns(self.set.scan_x_sign, self.set.scan_y_sign);
+        return geo.scanOffset(row, col, 0.5 * @as(f64, @floatFromInt(i.rows - 1)), 0.5 * @as(f64, @floatFromInt(i.cols - 1)), signs[0], signs[1], self.binOf(lv));
     }
 
     /// The detector's position for a cell under `geo`, in a level's pixels.
@@ -1581,7 +1603,8 @@ pub const Engine = struct {
         const sz = try self.sizeOf(lv);
         const row: f64 = @floatFromInt(cell / i.cols);
         const col: f64 = @floatFromInt(cell % i.cols);
-        return geo.positionForRotation(self.calibration.rotation(geo), row, col, 0.5 * @as(f64, @floatFromInt(i.rows - 1)), 0.5 * @as(f64, @floatFromInt(i.cols - 1)), self.set.scan_x_sign, self.set.scan_y_sign, self.binOf(lv), sz[0], sz[1]);
+        const signs = self.calibration.scanSigns(self.set.scan_x_sign, self.set.scan_y_sign);
+        return geo.positionForRotation(self.calibration.rotation(geo), row, col, 0.5 * @as(f64, @floatFromInt(i.rows - 1)), 0.5 * @as(f64, @floatFromInt(i.cols - 1)), signs[0], signs[1], self.binOf(lv), sz[0], sz[1]);
     }
 
     pub fn positionOf(self: *const Engine, geo: *const Geometry, cell: u64, lv: Level) ![3]f32 {
@@ -1607,6 +1630,14 @@ pub const Engine = struct {
         self.events.log("phase {d}: {s} ({s}, {d} px, point group {s})", .{ self.phases.items.len - 1, m.name, m.source, m.side, if (m.point_group >= 1 and m.point_group <= 32) sym.point_group_names[m.point_group - 1] else "?" });
         self.res.clear();
         self.phase_generation += 1;
+        // the symmetry it obeys, as measured, and where its axes are when not the tables' own
+        const st = m.setting;
+        const z = rot.qapply(st.frame, .{ 0, 0, 1 });
+        const x = rot.qapply(st.frame, .{ 1, 0, 0 });
+        if (rot.angleBetween(st.frame, rot.quat_identity) < 1e-6)
+            self.events.log("phase {d}: orientations reduced by the rotations {s} (Laue class {s}) of the master, {d} of its point-group operators holding", .{ self.phases.items.len - 1, st.rotation.rotationName(), st.laue.name(), m.ops.len })
+        else
+            self.events.log("phase {d}: orientations reduced by the rotations {s} (Laue class {s}) of the master, {d} of its point-group operators holding; its unique axis along ({d:.3}, {d:.3}, {d:.3}), its x along ({d:.3}, {d:.3}, {d:.3})", .{ self.phases.items.len - 1, st.rotation.rotationName(), st.laue.name(), m.ops.len, z[0], z[1], z[2], x[0], x[1], x[2] });
         return @intCast(self.phases.items.len - 1);
     }
 
@@ -1833,7 +1864,7 @@ pub const Engine = struct {
         if (p.takeDictionary(&self.g, N)) return;
         var list: std.ArrayList(f32) = .empty;
         errdefer list.deinit(gpa);
-        const ops = sym.operators(p.master.rotation);
+        const ops = p.master.rotations();
         const a = rot.cubochoric_half_edge;
         const nf: f64 = @floatFromInt(N);
         var i: i64 = -@as(i64, N);
@@ -1932,6 +1963,30 @@ pub const Engine = struct {
     // ── the batch ──
 
     /// What a search runs with outside a sweep: the settings' method, bandwidth and dictionary.
+    /// One cell indexed and simulated under another geometry than the one in use, to set two
+    /// pattern centres side by side; the one in use stays as it is (kept in `geo_home` for the
+    /// call). `out` gets a record per phase (the spherical correlation at `bandwidth`, then the
+    /// refinement, as the fits index their patterns), `sim` the best phase's simulation at
+    /// `lv`, the phase chosen as the phase_by setting says. Returns that phase.
+    pub fn cellUnder(self: *Engine, cell: u64, geo: Geometry, bandwidth: u32, lv: Level, out: []Record, sim: []f32) !u32 {
+        if (self.geo_home != null) return error.Busy;
+        self.geo_home = self.geo;
+        self.geo = geo;
+        defer {
+            self.geo = self.geo_home.?;
+            self.geo_home = null;
+        }
+        try self.indexCells(&[_]u64{cell}, .{ .method = .spherical, .bandwidth = bandwidth, .dict_grid = self.set.dict_grid }, out);
+        var p: usize = 0;
+        for (out, 0..) |r, k| {
+            const v = if (self.set.phase_by == .nmi) r.nmi else r.ncc;
+            const b = if (self.set.phase_by == .nmi) out[p].nmi else out[p].ncc;
+            if (v > b) p = k;
+        }
+        try self.simulate(@intCast(p), &[_]u64{cell}, &out[p].q, lv, sim);
+        return @intCast(p);
+    }
+
     pub fn searchOf(self: *const Engine) Search {
         return .{ .method = self.set.method, .bandwidth = self.set.bandwidth, .dict_grid = self.set.dict_grid };
     }
@@ -2132,7 +2187,7 @@ pub const Engine = struct {
                         defer {
                             if (comptime @hasField(spherical.Spherical, "candidate_cancel")) self.sp.candidate_cancel = null;
                         }
-                        try self.sp.candidatePeaks(ph, nt, ph.rden.at(8), nt, phase.master.rotation, keep_n, tile_peaks);
+                        try self.sp.candidatePeaks(ph, nt, ph.rden.at(8), nt, phase.master.rotations(), keep_n, tile_peaks);
                         for (0..keep_n) |rank| @memcpy(peaks[rank * n + first ..][0..nt], tile_peaks[rank * nt ..][0..nt]);
                     }
                 } else return error.MultiCandidateSphericalUnavailable;
@@ -3051,8 +3106,7 @@ pub const Engine = struct {
             // an acceptable match replaces whatever was kept; otherwise the better one stays
             const good = if (s.accept_nmi > 0) r.nmi >= s.accept_nmi else r.z >= s.accept_z;
             if (self.res.phase[at] < 0 or (good and r.step <= settle) or r.z > self.res.z[at]) {
-                // Preserve the winning detector pose; crystal symmetry reduction is explicit.
-                const q = rot.qstd(.{ r.q[0], r.q[1], r.q[2], r.q[3] });
+                const q = sym.toFz(.{ r.q[0], r.q[1], r.q[2], r.q[3] }, self.phases.items[p].master.rotations());
                 for (0..4) |k| self.res.quat[4 * at + k] = @floatCast(q[k]);
                 self.res.ncc[at] = r.ncc;
                 self.res.nmi[at] = r.nmi;

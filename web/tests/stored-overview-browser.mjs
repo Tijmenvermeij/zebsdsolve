@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Stored acquisition quality and opt-in contrast in the actual app, no npm.
+// Stored acquisition quality and contrast fallback in the actual app, no npm.
 // Node 22+: node web/tests/stored-overview-browser.mjs source.h5oina
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
@@ -151,9 +151,6 @@ try {
   const first = await evaluate(`
     await waitPreview(()=>document.getElementById('map-legend').textContent==='Band contrast' && !document.getElementById('btn-overview').disabled && previewCalls.patterns.length>0);
     await ze._queue;
-    // Progressive chunk metadata warmup is independently tested by the scheduler
-    // suite; pause it here to isolate unintended pattern/contrast traffic.
-    ze.pauseIndexPreparation();await ze._queue;
     const before = ze.stats();await new Promise(r=>setTimeout(r,250));const idle=ze.stats();
     return {calls:previewCalls,initialBytes:before.fileBytes,idleBytes:idle.fileBytes,live:document.getElementById('pat-live').checked,stage:document.getElementById('pat-stage').value};
   `);
@@ -175,7 +172,7 @@ try {
   // A real master added through the retained input path must still trigger the
   // default on-spot preview. Use the app's bandwidth control to bound the search.
   await evaluate(`
-    const control=[...document.querySelectorAll('.field')].find(el=>el.querySelector('span')?.textContent==='bandwidth L').querySelector('input');
+    const control=document.querySelector('.field[data-key="fit_bandwidth"] input');
     control.value='32';control.dispatchEvent(new Event('change'));
     await ze._queue;
     window.phaseIndexBefore=previewCalls.indexStarts.length;
@@ -220,13 +217,14 @@ try {
     selector.value='stored';selector.dispatchEvent(new Event('change'));
     const selected=document.getElementById('map-legend').textContent;
     document.getElementById('btn-example').click();
-    await waitPreview(()=>ze.scan.rows===55 && document.getElementById('app').dataset.busy==='0' && !document.getElementById('btn-overview').disabled);
+    await waitPreview(()=>ze.scan.rows===55 && previewCalls.contrast>started && document.getElementById('btn-overview').textContent==='Calculate pattern contrast');
+    const finished = previewCalls.contrast;
     releaseContrast();await new Promise(r=>setTimeout(r,300));
-    return {started,after:previewCalls.contrast,choices,selected,neutral:document.getElementById('map-legend').hidden,button:document.getElementById('btn-overview').textContent,sourceHidden:document.getElementById('overview-source').hidden};
+    return {started,finished,after:previewCalls.contrast,choices,selected,source:document.getElementById('overview-source').value};
   `);
-  assert.equal(cancelled.started,1);assert.equal(cancelled.after,1);
+  assert.equal(cancelled.started,1);assert.ok(cancelled.finished>cancelled.started);assert.equal(cancelled.after,cancelled.finished);
   assert.deepEqual(cancelled.choices,['Band contrast','Pattern contrast']);assert.equal(cancelled.selected,'Band contrast');
-  assert.ok(cancelled.neutral && !cancelled.sourceHidden);assert.equal(cancelled.button,'Calculate pattern contrast');
+  assert.equal(cancelled.source,'calculated');
   console.error("preview: contrast replacement guard passed");
   // A late stored scalar result must also be discarded after a new source opens.
   await evaluate(`window.holdStored=true;window.releaseStored=null;document.getElementById('pat-live').checked=false;`);
@@ -234,19 +232,18 @@ try {
   console.error("preview: checking late stored result and Stop");
   const stale = await evaluate(`
     await waitPreview(()=>!!window.releaseStored && document.getElementById('app').dataset.busy==='0');
+    window.holdContrast=true;window.releaseContrast=null;
     document.getElementById('btn-example').click();
-    await waitPreview(()=>ze.scan.rows===55 && document.getElementById('app').dataset.busy==='0' && !document.getElementById('btn-overview').disabled);
-    releaseStored();await new Promise(r=>setTimeout(r,300));
-    const neutral=document.getElementById('map-legend').hidden;
-    window.holdContrast=true;window.releaseContrast=null;document.getElementById('btn-overview').click();
-    await waitPreview(()=>!!window.releaseContrast);
+    await waitPreview(()=>ze.scan.rows===55 && !!window.releaseContrast);
+    releaseStored();await new Promise(r=>setTimeout(r,100));
+    const source=document.getElementById('overview-source').value;
     const before=previewCalls.contrast;document.getElementById('btn-overview').click();releaseContrast();await new Promise(r=>setTimeout(r,300));
-    return {neutral,before,after:previewCalls.contrast,button:document.getElementById('btn-overview').textContent,live:document.getElementById('pat-live').checked};
+    return {source,before,after:previewCalls.contrast,button:document.getElementById('btn-overview').textContent,live:document.getElementById('pat-live').checked};
   `);
-  assert.ok(stale.neutral);assert.equal(stale.after,stale.before);assert.equal(stale.button,'Calculate pattern contrast');
+  assert.equal(stale.source,'calculated');assert.equal(stale.after,stale.before);assert.equal(stale.button,'Calculate pattern contrast');
   assert.equal(stale.live,false,'An explicit on-spot opt-out persists across scan changes');
   console.log(JSON.stringify({first,onSpot,average,cancelled,stale}));
-  console.log('Stored overview browser checks passed: bounded scalar IO, zero automatic contrast, neutral fallback, explicit calculation, source switching, stop and stale callback guards.');
+  console.log('Stored overview browser checks passed: bounded scalar IO for stored quality, automatic fallback, explicit calculation, source switching, stop and stale callback guards.');
 } finally {
   clearTimeout(wallTimeout);ws?.close();chrome?.kill();server.closeAllConnections();await new Promise(resolve=>server.close(resolve));
   try {rmSync(profile,{recursive:true,force:true});} catch { /* Chrome may still be shutting down. */ }

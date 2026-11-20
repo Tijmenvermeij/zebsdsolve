@@ -98,12 +98,6 @@ pub const Scan = struct {
     overview_values: []f32 = &.{},
     why: []const u8 = "",
 
-    /// Advance only the pattern dataset's chunk lookup, without reading patterns.
-    pub fn prepareIndexStep(self: *Scan, max_nodes: usize, max_bytes: usize) !bool {
-        if (self.h5) |*h| return h.prepareIndexStep(&self.ds, max_nodes, max_bytes);
-        return true;
-    }
-
     pub fn count(self: *const Scan) u64 {
         return @as(u64, self.info.rows) * self.info.cols;
     }
@@ -140,12 +134,16 @@ pub const Scan = struct {
         const candidates = [_]Candidate{
             .{ .name = "Band Contrast", .kind = .band_contrast },
             .{ .name = "band_contrast", .kind = .band_contrast },
+            .{ .name = "BandContrast", .kind = .band_contrast },
             .{ .name = "Image Quality", .kind = .image_quality },
             .{ .name = "IQ", .kind = .image_quality },
             .{ .name = "image_quality", .kind = .image_quality },
             .{ .name = "iq", .kind = .image_quality },
+            .{ .name = "ImageQuality", .kind = .image_quality },
             .{ .name = "RadonQuality", .kind = .radon_quality },
+            .{ .name = "Radon Quality", .kind = .radon_quality },
             .{ .name = "Pattern Quality", .kind = .pattern_quality },
+            .{ .name = "PatternQuality", .kind = .pattern_quality },
         };
         const h = &self.h5.?;
         const original_why = h.why;
@@ -500,9 +498,10 @@ pub const Scan = struct {
                     const x = num.get(h, pc, "x-star");
                     const y = num.get(h, pc, "y-star");
                     const z = num.get(h, pc, "z-star");
-                    // EDAX measures y from the bottom, y and z in fractions of the width; an
-                    // all-zero entry means not calibrated
-                    if (x != 0 or y != 0 or z != 0) info.pc = .{ x, 1 - y * ratio, z * ratio };
+                    // EDAX measures y from the bottom, x and y in fractions of the width and
+                    // height, z of the smaller of the two (as kikuchipy has it); an all-zero
+                    // entry means not calibrated
+                    if (x != 0 or y != 0 or z != 0) info.pc = .{ x, 1 - y, z * @min(ratio, 1) };
                 }
             },
             .h5_oxford => {
@@ -562,6 +561,8 @@ pub const Scan = struct {
             info.rows = hints.rows;
             info.cols = hints.cols;
         }
+        // EMsoft keeps optional per-pattern scalars beside EBSDPatterns.
+        self.discoverOverview((try h.find("EMData/EBSD")).?);
         const nml = (try h.find("NMLparameters/EBSDNameList")) orelse return;
         const get = struct {
             fn f(hh: *hdf5.Hdf5, group: u64, name: []const u8) f64 {
@@ -635,10 +636,10 @@ pub const Scan = struct {
         if (sidecar) |k| {
             if (hex != 0) return error.UnsupportedUPHexGrid;
             if (version >= 3) {
-                if (@as(u64, nx) * ny != n or nx == 0 or ny == 0) return if (extra != 0) error.AmbiguousUPExtraPatterns else error.UPPatternCountMismatch;
+                if (nx == 0 or ny == 0 or @as(u64, nx) * ny != n) return if (extra != 0) error.AmbiguousUPExtraPatterns else error.UPPatternCountMismatch;
                 if (!validStep(dx) or !validStep(dy)) return error.InvalidUPStep;
             }
-            const ang = try @import("ang.zig").load(self.gpa, &self.files[k], n, w, hgt);
+            const ang = try @import("ang.zig").load(self.gpa, &self.files[k], n, if (version >= 3) .{ dx, dy } else null, w, hgt);
             errdefer self.gpa.free(ang.iq);
             if (version >= 3 and (nx != ang.cols or ny != ang.rows)) return error.ScanShapeMismatch;
             if (version >= 3 and (!sameStep(dx, ang.step_x_um) or !sameStep(dy, ang.step_y_um))) return error.UPANGStepMismatch;
@@ -821,6 +822,7 @@ pub const Scan = struct {
 fn validStep(x: f64) bool {
     return std.math.isFinite(x) and x > 0;
 }
+
 fn sameStep(a: f64, b: f64) bool {
     return @abs(a - b) <= @max(@max(a, b) * 1e-6, @min(5e-6, @min(a, b) * 0.01));
 }

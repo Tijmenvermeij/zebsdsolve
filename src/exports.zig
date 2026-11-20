@@ -112,31 +112,6 @@ export fn ze_synthesize(e: *Engine, quats: [*]f32, phase: [*]i32, grain: [*]i32,
     return 0;
 }
 
-/// One bounded full chunk-index batch (0 pending, 1 complete, negative on error).
-/// Preview reads use targeted lookups until the full index is complete.
-export fn ze_prepare_index_step(e: *Engine, max_nodes: u32, max_bytes: u32) i32 {
-    return switch (e.source) {
-        .file => |s| @intFromBool(s.prepareIndexStep(max_nodes, max_bytes) catch |err| return failed(e, "prepare_index", err)),
-        else => 1,
-    };
-}
-
-/// ready, failed, visited nodes, pending nodes, file reads, file bytes.
-export fn ze_chunk_index_status(e: *Engine, out: *[6]u64) void {
-    out.* = .{ 1, 0, 0, 0, 0, 0 };
-    switch (e.source) {
-        .file => |s| {
-            out[4] = s.files[0].reads;
-            out[5] = s.files[0].bytes_read;
-            if (s.h5 != null) {
-                const ds = &s.ds;
-                out.* = .{ @intFromBool(ds.index_ready), @intFromBool(ds.index_failed), ds.warmed_nodes, ds.frontier.items.len - ds.frontier_at, s.files[0].reads, s.files[0].bytes_read };
-            }
-        },
-        else => {},
-    }
-}
-
 export fn ze_close_scan(e: *Engine) void {
     e.closeScan();
 }
@@ -168,23 +143,32 @@ export fn ze_has_acquisition_calibration(e: *Engine) u32 {
 }
 
 export fn ze_get_geometry(e: *Engine, out: *engine.Geometry) void {
-    out.* = e.geo;
+    // (the geometry in use, also while a cell is indexed under another: ze_cell_under)
+    out.* = e.geo_home orelse e.geo;
 }
 
-export fn ze_set_geometry(e: *Engine, in: *const engine.Geometry) void {
-    // what the caller changed is given; what it passed back as it read it (a fit's result
-    // among it) is not
-    const was = e.geo;
-    var g = in.*;
-    // (no pixel size: the scan's own, or the one its detector's width gives)
+fn geometryPlaneChanged(next: *const engine.Geometry, was: *const engine.Geometry) bool {
+    return next.plane_kind != was.plane_kind or !std.meta.eql(next.plane, was.plane);
+}
+
+fn asGiven(e: *Engine, next: *const engine.Geometry, was: *const engine.Geometry, plane_changed: bool) engine.Geometry {
+    var g = next.*;
+    // Preserve a calibrated acquisition's unknown pixel size. Otherwise use the scan's estimate.
     if (!(g.px_um > 0) and e.calibration.metadata == null) g.px_um = e.defaultPx();
-    const plane_changed = in.plane_kind != was.plane_kind or !std.meta.eql(in.plane, was.plane);
-    // A manual reference-PC edit drops an unchanged fitted plane; an explicit plane
-    // supplies its reference PC, rather than inheriting the previous acquisition's.
-    if (!std.meta.eql(in.pc, was.pc) and !plane_changed) g.plane_kind = 0;
+    // A reference-PC edit drops an unchanged fitted plane. An explicit plane supplies its PC.
+    if (!std.meta.eql(next.pc, was.pc) and !plane_changed) g.plane_kind = 0;
     if (g.plane_kind != 0 and plane_changed) {
         if (e.info()) |i| g.adoptPlaneReference(i.rows, i.cols) else |_| {}
     }
+    return g;
+}
+
+export fn ze_set_geometry(e: *Engine, in: *const engine.Geometry) void {
+    // What the caller changed is given. A fit's result passed back unchanged is not.
+    const home = if (e.geo_home) |*h| h else &e.geo;
+    const was = home.*;
+    const plane_changed = geometryPlaneChanged(in, &was);
+    const g = asGiven(e, in, &was, plane_changed);
     if (!std.meta.eql(g.pc, was.pc)) e.geo_given.pc = g.pc;
     if (plane_changed) {
         e.geo_given.plane_kind = g.plane_kind;
@@ -196,7 +180,7 @@ export fn ze_set_geometry(e: *Engine, in: *const engine.Geometry) void {
     if (g.px_um != was.px_um) e.geo_given.px_um = g.px_um;
     if (in.step_x_um != was.step_x_um) e.geo_given.step_x_um = in.step_x_um;
     if (in.step_y_um != was.step_y_um) e.geo_given.step_y_um = in.step_y_um;
-    e.geo = g;
+    home.* = g;
 }
 
 // ── phases ──
@@ -515,7 +499,7 @@ export fn ze_pattern_stats(e: *Engine, cells: [*]const u64, n: usize, out: [*]f3
     return 0;
 }
 
-/// Stored scalar quality kind: 0 absent, 1 BC, 2 IQ, 3 Radon, 4 pattern quality.
+/// Stored scalar quality kind: 0 absent, 1 BC, 2 IQ, 3 Radon quality, 4 pattern quality.
 export fn ze_scan_overview_kind(e: *Engine) u32 {
     return @intFromEnum(e.storedOverviewKind());
 }
@@ -723,6 +707,22 @@ export fn ze_index_cells(e: *Engine, cells: [*]const u64, n: usize, out: [*]f32,
     return 0;
 }
 
+/// One cell indexed and simulated under the geometry `geo` instead of the one in use, which is
+/// left as it is (two pattern centres set side by side): a record per phase into `recs` (8 f32
+/// each, as ze_index_cells; the spherical correlation at `bandwidth`, then the refinement) and
+/// the best phase's simulation into `sim`, at the reduced size or (`full`) the stored one.
+/// Returns that phase.
+export fn ze_cell_under(e: *Engine, cell: u64, geo: *const engine.Geometry, bandwidth: u32, full: u32, recs: [*]f32, n_recs: usize, sim: [*]f32, len: usize) i32 {
+    const n_ph = e.phases.items.len;
+    if (n_ph == 0 or n_recs != n_ph * 8) return failed(e, "cell_under", error.BadLength);
+    if (bandwidth < 8 or bandwidth > 256) return failed(e, "cell_under", error.BadSetting);
+    const was = e.geo_home orelse e.geo;
+    const g = asGiven(e, geo, &was, geometryPlaneChanged(geo, &was));
+    const rs = @as([*]engine.Record, @ptrCast(@alignCast(recs)))[0..n_ph];
+    const p = e.cellUnder(cell, g, bandwidth, e.viewLevel(full != 0), rs, sim[0..len]) catch |err| return failed(e, "cell_under", err);
+    return @intCast(p);
+}
+
 /// ze_index_cells with the search given instead of the settings': `method` in
 /// settings.Method's order, the spherical correlation's bandwidth, the dictionary's grid.
 export fn ze_index_cells_by(e: *Engine, cells: [*]const u64, n: usize, method: u32, bandwidth: u32, dict_grid: u32, out: [*]f32, len: usize) i32 {
@@ -767,7 +767,8 @@ export fn ze_orientation_colors(e: *Engine, q: [*]const f32, phases: [*]const i3
         var v: rot.Vec3 = .{ 0, 0, 0 };
         v[direction] = 1;
         const key = e.ipfKeyOf(@intCast(phase));
-        const c = key.color(rot.normalize(rot.qapply(.{ quat[0], quat[1], quat[2], quat[3] }, v)));
+        const d = rot.normalize(rot.qapply(.{ quat[0], quat[1], quat[2], quat[3] }, v));
+        const c = key.color(e.phases.items[@intCast(phase)].master.setting.toStandard(d));
         for (0..3) |j| px[j] = @intFromFloat(@round(255 * std.math.clamp(c[j], 0, 1)));
         px[3] = 255;
     }
@@ -784,7 +785,7 @@ export fn ze_overlap_fit(e: *Engine, target: [*]const f32, templates: [*]const f
 
 /// Results per map cell (row-major), by kind: 0 orientations (4 f32 per cell: w, x, y, z),
 /// 1 NCC, 2 NMI (f32), 3 phase (i32, −1: not indexed), 4 Bunge angles (3 f32, radians: those of
-/// the stored fitted quaternions, without crystal symmetry reduction),
+/// the stored fitted quaternions, already reduced under the master's measured symmetry),
 /// 5 the NMI's distance above chance (f32, standard deviations), 6 the sweep that found an
 /// accepted match (i32, −1: none). Returns the number of values written.
 export fn ze_results(e: *Engine, kind: u32, out: [*]u8, len: usize) i64 {
@@ -901,20 +902,20 @@ export fn ze_bunge(q: *const [4]f32, euler: *[3]f64) void {
 
 /// Explicit symmetry reduction: `q` is replaced by its representative in the
 /// phase's fundamental zone (the equivalent of the smallest rotation, among those the proper
-/// rotations of the phase's point group give), and `euler` receives that quaternion's Bunge
-/// angles, radians.
+/// rotations its master obeys give, about the master's own axes), and `euler` receives that
+/// quaternion's Bunge angles, radians.
 export fn ze_reduce(e: *Engine, phase: u32, q: *[4]f32, euler: *[3]f64) void {
-    const laue = if (phase < e.phases.items.len) e.phases.items[phase].master.rotation else sym.Laue.c1;
-    const r = sym.toFz(.{ q[0], q[1], q[2], q[3] }, laue);
+    const ops: []const rot.Quat = if (phase < e.phases.items.len) e.phases.items[phase].master.rotations() else sym.operators(.c1);
+    const r = sym.toFz(.{ q[0], q[1], q[2], q[3] }, ops);
     for (0..4) |k| q[k] = @floatCast(r[k]);
     euler.* = rot.toBunge(r);
 }
 
 /// Smallest rotation between two orientations under a phase's symmetry (the proper rotations
-/// of its point group), radians.
+/// its master obeys, about its own axes), radians.
 export fn ze_disorientation(e: *Engine, phase: u32, a: *const [4]f32, b: *const [4]f32) f64 {
-    const laue = if (phase < e.phases.items.len) e.phases.items[phase].master.rotation else sym.Laue.c1;
-    return sym.disorientation(.{ a[0], a[1], a[2], a[3] }, .{ b[0], b[1], b[2], b[3] }, laue);
+    const ops: []const rot.Quat = if (phase < e.phases.items.len) e.phases.items[phase].master.rotations() else sym.operators(.c1);
+    return sym.disorientation(.{ a[0], a[1], a[2], a[3] }, .{ b[0], b[1], b[2], b[3] }, ops);
 }
 
 // ── tests and profiling ──

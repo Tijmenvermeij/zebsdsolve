@@ -18,7 +18,7 @@ class ScanInfo(ctypes.Structure):
     _fields_ = [
         ("rows", U32), ("cols", U32), ("pat_h", U32), ("pat_w", U32),
         ("pixel", U32), ("has_background", U32), ("has_pc", U32), ("format", U32),
-        ("voltage_kv", F64), ("bytes", F64), ("has_px", U32), ("_pad", U32),
+        ("voltage_kv", F64), ("bytes", F64), ("has_px", U32), ("geometry_frame", U32),
     ]
 
 
@@ -51,6 +51,7 @@ class PlaneResult(ctypes.Structure):
         ("said_rot", F64 * 3), ("said_rot_se", F64 * 3), ("step", F64 * 2), ("step_se", F64 * 2), ("skew", F64), ("skew_se", F64),
         ("pc_se", F64 * 3), ("rmsd", F64 * 3), ("ncc", F64), ("start_ncc", F64),
         ("kind", U32), ("frame", U32), ("n_patterns", U32), ("n_used", U32), ("iterations", U32), ("blocks", U32),
+        ("model", U32), ("compared", U32), ("cv", F64 * 4), ("cv_se", F64 * 4), ("method", U32), ("_pad", U32),
     ]
 
 
@@ -144,8 +145,6 @@ _SIGS = {
     "ze_open_scan_configured": ([P, ctypes.c_char_p, SZ, ctypes.c_char_p, SZ, ctypes.c_char_p, SZ], I32),
     "ze_set_patterns": ([P, P, SZ, U32, U32, U32, U32, U32], I32),
     "ze_synthesize": ([P, f32p, ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_int32), SZ], I32),
-    "ze_chunk_index_status": ([P, ctypes.POINTER(U64)], None),
-    "ze_prepare_index_step": ([P, U32, U32], I32),
     "ze_close_scan": ([P], None),
     "ze_scan_info": ([P, ctypes.POINTER(ScanInfo)], None),
     "ze_scan_format": ([P, ctypes.c_char_p, SZ], SZ),
@@ -203,6 +202,7 @@ _SIGS = {
     "ze_overlap_fit": ([P, f32p, f32p, U32, U32, U32, U32, f32p, f32p, ctypes.POINTER(OverlapState)], I32),
     "ze_index_cells": ([P, u64p, SZ, f32p, SZ], I32),
     "ze_index_cells_by": ([P, u64p, SZ, U32, U32, U32, f32p, SZ], I32),
+    "ze_cell_under": ([P, ctypes.c_uint64, ctypes.POINTER(Geometry), U32, U32, f32p, SZ, f32p, SZ], I32),
     "ze_results": ([P, U32, P, SZ], I64),
     "ze_map": ([P, U32, u8p, SZ], I32),
     "ze_ipf_key": ([P, U32, U32, U32, u8p, SZ, f32p], I32),

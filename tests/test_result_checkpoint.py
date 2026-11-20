@@ -60,6 +60,7 @@ class ResultCheckpoint(unittest.TestCase):
     def test_exact_state_and_atomic_rejection(self):
         before = self.state()
         checkpoint = self.capture()
+        self.assertEqual(int.from_bytes(checkpoint[8:12], "little"), 2)
         # Both unvisited candidates are canonical zeros, never allocator bytes.
         n, phases = 6, 2
         candidates = checkpoint[112 + n * 37:]
@@ -76,7 +77,7 @@ class ResultCheckpoint(unittest.TestCase):
         self.assertEqual(self.restore(checkpoint), 0, self.s._error())
         self.assertEqual(self.state(), before)
         self.assertEqual(self.capture(), checkpoint)
-        for corrupted in [checkpoint[:-1], b'BADMAGIC'+checkpoint[8:], checkpoint[:150]+bytes([checkpoint[150]^1])+checkpoint[151:]]:
+        for corrupted in [checkpoint[:8]+(1).to_bytes(4, "little")+checkpoint[12:], checkpoint[:-1], b'BADMAGIC'+checkpoint[8:], checkpoint[:150]+bytes([checkpoint[150]^1])+checkpoint[151:]]:
             self.assertLess(self.restore(corrupted), 0)
             self.assertEqual(self.state(), before)
         # Even a checksummed payload cannot smuggle invalid indices into results.

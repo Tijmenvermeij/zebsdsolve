@@ -4,6 +4,7 @@ import json
 import os
 import tempfile
 import posixpath
+import re
 import warnings
 import numpy as np
 
@@ -124,7 +125,7 @@ def write_emsphinx(path, s):
         with h5py.File(temporary, 'w') as f:
             _string(f, 'Manufacturer', 'EMSphInx')  # Native reader's format discriminator.
             f.attrs['Producer'] = 'zebsdsolve'
-            _provenance(f, s, Frame='Same raw Bunge/raster conventions as ANG; MTEX setting 2',
+            _provenance(f, s, Frame='Same stored Bunge/raster conventions as ANG; MTEX setting 2',
                         Ranking='Scan 1 selected; later scans alternate phases ranked by ' + s['settings']['phase_by'])
             for rank, r in enumerate(_maps(s), 1):
                 ebsd = f.create_group(f'Scan {rank}/EBSD')
@@ -189,8 +190,12 @@ def _matches(group, phase, allow_laue=False):
 
 PATTERN_DATASETS = {'Processed Patterns', 'Unprocessed Patterns', 'Raw Patterns'}
 
+def _raw_signal(path):
+    return posixpath.basename(path) in PATTERN_DATASETS or re.search(r'(?:^|/)EDS\d*/Data/Spectrum$', path) is not None
+
+
 def _copy_without_patterns(source, target, omit_roots=()):
-    """Native HDF5 copies retain metadata; diffraction payloads are never read."""
+    """Retain metadata and maps without reading raw EBSD or EDS signal payloads."""
     h5py = _h5py()
     def identity(obj):
         return h5py.h5o.get_info(obj.id).addr
@@ -201,7 +206,7 @@ def _copy_without_patterns(source, target, omit_roots=()):
         base = h5py.check_dtype(vlen=dtype)
         if isinstance(base, np.dtype): return references(base)
         return False
-    omitted_ids, omitted, checked = set(), [], set()
+    omitted_ids, omitted, checked, omitted_edges = set(), [], set(), set()
     def preflight(g):
         key = identity(g)
         if key in checked or key in omitted_ids: return
@@ -217,7 +222,7 @@ def _copy_without_patterns(source, target, omit_roots=()):
             link = g.get(name, getlink=True)
             if isinstance(link,h5py.SoftLink) and '..' in link.path.split('/'):
                 raise ValueError('Oxford metadata export does not support literal .. in HDF5 soft links: '+g.name+'/'+name)
-            if name in PATTERN_DATASETS:
+            if _raw_signal(posixpath.join(g.name,name)):
                 if isinstance(link, h5py.ExternalLink):
                     omitted.append(posixpath.join(g.name,name)); continue
                 obj = local_target(posixpath.join(g.name,name))
@@ -262,6 +267,19 @@ def _copy_without_patterns(source, target, omit_roots=()):
     for path in omit_roots:
         obj = local_target(path)
         if obj is not None: omit_tree(obj)
+    # An earlier alias to an EDS Data group must not hide its canonical raw signal.
+    for scan_name in source:
+        scan = local_target('/'+scan_name)
+        if not isinstance(scan, h5py.Group): continue
+        for detector in scan:
+            if not re.fullmatch(r'EDS\d*', detector): continue
+            path = '/'+scan_name+'/'+detector+'/Data/Spectrum'
+            data = local_target(path.rsplit('/',1)[0])
+            if isinstance(data, h5py.Group) and data.get('Spectrum', getlink=True) is not None:
+                omitted_edges.add((identity(data), 'Spectrum')); omitted.append(path)
+            obj = local_target(path)
+            if isinstance(obj, h5py.Dataset):
+                omitted_ids.add(identity(obj))
     preflight(source)
     copied = {identity(source): target.name}
     def copy_attrs(a,b):
@@ -273,13 +291,17 @@ def _copy_without_patterns(source, target, omit_roots=()):
         for name in a:
             path = posixpath.join(a.name, name)
             if any(path == root or path.startswith(root+'/') for root in omit_roots): continue
+            if _raw_signal(path) or (identity(a), name) in omitted_edges:
+                omitted.append(path); continue
             link = a.get(name, getlink=True)
             if isinstance(link, h5py.ExternalLink):
-                if name in PATTERN_DATASETS: continue
+                if _raw_signal(path) or _raw_signal(link.path): continue
                 b[name] = link
                 continue
             if isinstance(link, h5py.SoftLink):
                 path = link.path if link.path.startswith('/') else posixpath.join(a.name,link.path)
+                if _raw_signal(path):
+                    omitted.append(posixpath.join(a.name,name)); continue
                 obj = local_target(path)
                 if any(path == root or path.startswith(root+'/') for root in omit_roots): continue
                 if obj is not None and identity(obj) in omitted_ids:
@@ -386,10 +408,13 @@ def write_oxford(path, reference, s, engine_to_cs1, frame_provenance, phase_id_m
     try:
         with h5py.File(reference, 'r') as source, h5py.File(temporary, 'w') as output:
             processing = name.rsplit('/',1)[0]+'/Data Processing'
-            omitted_patterns = _copy_without_patterns(source, output, (processing,))
+            omitted_signals = _copy_without_patterns(source, output, (processing,))
         with h5py.File(temporary, 'r+') as f:
             root = _provenance(f, s, Frame='Oxford CS1', EngineToCS1=q.tolist(), FrameProvenance=frame_provenance,
-                               PatternData='Omitted; metadata and map results only', OmittedPatternPaths=omitted_patterns)
+                               PatternData='Omitted; metadata and map results only',
+                               RawSignalData='EBSD patterns and EDS spectra omitted; metadata and stored maps retained',
+                               OmittedSignalPaths=omitted_signals,
+                               OmittedPatternPaths=[p for p in omitted_signals if posixpath.basename(p) in PATTERN_DATASETS])
             calibration = s.get('calibration', {})
             header = f[name+'/Header']
             for key, field, count in [('Detector Orientation Euler', 'effective_detector_euler_radians', 3),

@@ -162,7 +162,7 @@ try {
     await waitBatch(()=>document.getElementById('app').dataset.busy==='0' && document.getElementById('tab-index').getAttribute('aria-selected')==='true');
     require(JSON.stringify(ze.geometry.pc)===JSON.stringify(expected[1].geometry.pc),'Load did not restore fitted geometry');
     require(document.getElementById('bin-choices').value==='2' && !document.getElementById('pat-full-box').hidden,'Saved binning controls stale');
-    require(document.getElementById('sweep-readout').textContent.includes('one pass'),'Saved sweeps stale');
+    require(document.querySelector('#sweep-readout dd').textContent==='spherical '+expected[1].settings.bandwidth && ze.settings.sweeps===1,'Saved sweeps stale');
     document.getElementById('btn-geo-file').click();
     require(JSON.stringify(ze.geometry.pc)===JSON.stringify(fixtureBaseGeo.pc),'As-opened geometry became fitted geometry');
     document.getElementById('btn-batch-clear').click();await pause(100);
@@ -212,7 +212,8 @@ try {
     const add=ze.addPhase.bind(ze);let calls=0;ze.addPhase=async(...args)=>{if(++calls===2)throw Error('Test missing second master');return add(...args);};
     const row=document.querySelector('#batch-jobs tr');[...row.querySelectorAll('button')].find(b=>b.textContent==='Load').click();
     await waitBatch(()=>document.getElementById('status').textContent.includes('Test missing second master') && document.getElementById('app').dataset.busy==='0');ze.addPhase=add;
-    require(ze.phases.length===1 && document.querySelectorAll('#phases li').length===1,'Partial phase list stale');
+    const entries=[...document.querySelectorAll('#phases li')];
+    require(ze.phases.length===1 && entries.length===2 && entries.filter(li=>li.dataset.on==='1').length===1,'Partial phase list stale');
     require(document.getElementById('scan-meta').textContent.includes('other-acquisition.h5'),'Loaded source label stale');
     require([...document.querySelectorAll('.needs-results')].every(b=>b.disabled),'Previous results still exportable');
     document.getElementById('btn-batch-current').click();await waitBatch(()=>document.querySelectorAll('#batch-jobs tr').length===2);

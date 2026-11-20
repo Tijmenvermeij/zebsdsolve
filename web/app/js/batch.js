@@ -1,8 +1,8 @@
-import { isOxfordH5, OXFORD_SOURCE_PC_WARNING, geometryConvention, canRestoreGeometry } from "./oxford-export-policy.js";
+import { isOxfordH5, OXFORD_SOURCE_PC_WARNING, geometryConvention } from "./oxford-export-policy.js";
 import { BatchDownloads } from "./batch-downloads.js";
 // Batch indexing owns its engine and GPU device. It never borrows the interactive engine.
 const HINTS = ["map_rows", "map_cols", "pattern_height", "pattern_width"];
-const SCAN_FIELDS = ["rows", "cols", "patH", "patW", "dtype", "format"];
+const SCAN_FIELDS = ["rows", "cols", "patH", "patW", "dtype", "format", "geometryFrame"];
 const clone = (value) => structuredClone(value);
 const message = (error) => String(error?.message || error);
 const descriptor = (file) => ({ name: file.name, size: file.size, lastModified: file.lastModified ?? null });
@@ -237,7 +237,7 @@ export class BatchQueue {
   }
   _journalData(job, completing = false) {
     return { zebsdsolve: job.version, scan: job.sourceFiles[0].name,
-      geometry_convention: geometryConvention(job.scanInfo.format,job.detectorAttitudeVersion),
+      geometry_convention: geometryConvention(job.scanInfo),
       oxford_detector_attitude_version: job.detectorAttitudeVersion,
       geometry: job.geometry, settings: job.settings, source_files: job.sources, master_files: job.masters,
       phases: job.phases, opening_hints: job.openHints, acquisition_geometry: job.openGeometry, scan_info: job.scanInfo,
@@ -313,7 +313,6 @@ export class BatchQueue {
     const opened = await engine.openScan(job.sourceFiles);
     const actual = engine.scan || engine.scanInfo || opened;
     for (const key of SCAN_FIELDS) if (job.scanInfo[key] !== actual?.[key]) throw new Error(`Scan ${key} changed: expected ${job.scanInfo[key]}, got ${actual?.[key]}.`);
-    if(!canRestoreGeometry(geometryConvention(job.scanInfo.format,job.detectorAttitudeVersion),actual?.format,engine.detectorAttitudeVersion))throw new Error("Oxford camera convention changed; reopen the acquisition and recreate this batch job.");
     engine.configure(clone(job.settings));
     engine.setGeometry(clone(job.geometry));
     await engine.clearPhases();

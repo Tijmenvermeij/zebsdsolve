@@ -672,6 +672,7 @@ def main():
           f"chance NMI {med:.4f} ± {spread:.4f}: z {s.settings['accept_z']:g} is NMI {med + s.settings['accept_z'] * spread:.4f}; batches of 97 and 256 accept the same cells")
     acc = ra["sweep"] >= 0
     check("or an absolute mutual information", acc.mean() > 0.95 and (ra["nmi"][acc] >= 0.05).all() and not acc[ra["nmi"] < 0.05].any(), f"NMI ≥ 0.05 accepts {100 * acc.mean():.1f} %")
+    s.configure(ipf_colors="classic")  # (the default is the paper's key by direction)
     rgba = s.map("ipf_z")
     check("maps are images", rgba.shape == (55, 75, 4) and (rgba[..., 3] == 255).all() and s.map("ncc").shape == (55, 75, 4) and s.map("z").shape == (55, 75, 4) and s.map("sweep").shape == (55, 75, 4))
     key, box = s.ipf_key(0, 128)
@@ -733,6 +734,23 @@ def main():
           and np.array_equal(s.results()["quaternions"], r["quaternions"]),
           f"{len(some)} cells: median {np.median(near):.4f}° from what indexing stored; at bandwidth 32 as the setting would give")
 
+    # a cell under another pattern centre, the one in use staying: what setting that centre,
+    # indexing the cell and simulating it would give
+    before = s.geometry
+    pc0 = np.array(before["pc"])
+    s.set_geometry(plane_kind="affine", plane=[[0, 0, v] for v in pc0] + [[0, 0, 1]])
+    with_plane = s.geometry
+    other, cell = pc0 + [0.01, -0.01, 0.005], int(some[7])
+    u = s.cell_under(cell, pc=other)
+    kept = s.geometry == with_plane
+    s.set_geometry(pc=other)
+    v = s.index_cells([cell], method="spherical", bandwidth=s.settings["fit_bandwidth"])
+    sim_v = s.simulate(v["quaternions"][0, 0], cells=[cell], phase=0)
+    s.set_geometry(**before)
+    check("a cell can be indexed and simulated under another pattern centre, the fitted plane staying", kept and np.allclose(u["quaternion"], v["quaternions"][0, 0])
+          and abs(u["ncc"] - float(v["ncc"][0, 0])) < 1e-6 and np.abs(u["simulation"].ravel() - np.asarray(sim_v).ravel()).max() < 1e-6,
+          f"NCC {u['ncc']:.4f} there, as setting it gives")
+
     # tuning: the fastest batch size and cutting-up of the work for this machine, by a few
     # timed trials on a sample; the stored results stay as they are and the orientations do
     # not depend on it
@@ -793,8 +811,45 @@ def main():
     e = np.abs(np.array(p["pc"]) - pc_file)
     check("the fits recover the nickel scan's pattern centre", e.max() < 0.004,
           f"vote {np.round(p['start_pc'], 4)}, plane {np.round(p['pc'], 5)}, {np.round(e, 5)} from kikuchipy's, mean NCC {p['ncc']:.4f}")
+    # the automatic fit checks the simpler models as well and takes the simplest the map
+    # supports: over the whole map the plane; on a strip six columns wide, which says nothing
+    # across its columns, a tilt line (PCx the same everywhere, PCy and PCz along the rows)
+    s.configure(roi_x=34, roi_y=0, roi_w=6, roi_h=55, plane_kind="projective")
+    s.set_geometry(pc=pc_file)
+    t = s.fit_geometry()
+    P = np.array(s.geometry["plane"], dtype=np.float64).reshape(-1)
+    s.configure(roi_x=0, roi_y=0, roi_w=0, roi_h=0, plane_kind="affine")
+    e_line = np.abs(np.array(t["pc"]) - pc_file).max()
+    check("the automatic fit takes the simplest model the map supports: the plane, or on a narrow strip a tilt line",
+          p["model"] == "affine" and set(p["models"]) == {"centre", "line", "affine"} and t["model"] == "line" and t["kind"] == s.geometry["plane_kind"] == "affine"
+          and np.allclose(P[[0, 1, 3, 6]], 0) and not np.allclose(P[[4, 7]], 0) and e_line < 0.004,
+          "whole map: " + ", ".join(f"{m} ×{v['cv'] / min(x['cv'] for x in p['models'].values()):.2f}" for m, v in p["models"].items())
+          + "; strip: " + ", ".join(f"{m} ×{v['cv'] / min(x['cv'] for x in t['models'].values()):.2f}" for m, v in t["models"].items()) + f"; its centre {e_line:.4f} from kikuchipy's")
     ev = s.events()
     check("events are queued for the caller", any(x["kind"] == "pc" for x in ev) and any(x["kind"] == "progress" and x["stage"] == "plane" for x in ev))
+
+    # a projective plane through the source points of a 3 × 3 patch, which hardly move: they do
+    # not tell its slopes, which stay near zero, and the source at the map's middle near the
+    # affine plane's (it was 10⁵ away)
+    mid = {}
+    for kind in ("affine", "projective"):
+        s.set_geometry(pc=pc_file, plane_kind="none")
+        s.configure(roi_x=32, roi_y=20, roi_w=3, roi_h=3, plane_method="points", plane_kind=kind, plane_stride=1)
+        mid[kind] = np.array(s.fit_plane()["pc"])
+    w = np.array(s.geometry["plane"])[3]
+    swing = max(abs(w @ (c, r, 1) / (w @ (37, 27, 1)) - 1) for c in (0, 74) for r in (0, 54))
+    gap = np.abs(mid["projective"] - mid["affine"]).max()
+    check("a projective plane through points that hardly move keeps its slopes near zero", swing < 0.02 and gap < 0.003,
+          f"the denominator {swing:.4f} from the middle at the corners; the middle's source {gap:.5f} from the affine plane's")
+
+    # the joint projective fit from one pattern centre for every cell (no steps, no plane): the
+    # starting sources do not tell the projective row
+    s.configure(roi_x=32, roi_y=20, roi_w=3, roi_h=3, plane_method="joint", plane_kind="projective", plane_stride=1, plane_iters=15)
+    s.set_geometry(pc=(0.5, 0.25, 0.5), plane_kind="none", step_x_um=0, step_y_um=0)
+    joint = s.fit_plane()
+    check("the joint projective fit can start at a constant pattern centre",
+          joint["kind"] == "projective" and np.isfinite(joint["plane"]).all() and joint["ncc"] > joint["start_ncc"])
+
     s.close()
 
     # ── a master pattern simulated from a crystal ──
@@ -892,6 +947,87 @@ def main():
     check("a simulated phase exports with its lattice parameters", "3.47514587" in ang_cell and " 90.00000000" in ang_cell and "90.00000000;90.00000000;90.00000000" in ctf_cell,
           f"ANG: {ang_cell.split(None, 2)[-1].strip()}; CTF: {ctf_cell.split(chr(9))[0]} {ctf_cell.split(chr(9))[1] if chr(9) in ctf_cell else ''}")
     s.close()
+
+    # ── a master whose axes are not the tables': monoclinic with the unique axis b ──
+    # Its two-fold is about y. Reduced by the tables' 2 (about z), a pose would become another
+    # orientation with another pattern; every pose kept must be reduced by the master's own
+    # rotations, and so simulate the pattern it was fitted to (found by Tijmenvermeij, #3).
+    s = ze.Solver()
+    s.configure(master_smooth=0, static_background="none", dynamic_background="none", mask=False, clahe=False, bandwidth=32, refine_iters=8,
+                sim_halfw=32, sim_dmin_nm=0.12, sim_bin_kev=5, sim_c_weak=0,
+                toy_seed=17, toy_rows=3, toy_cols=4, toy_height=40, toy_width=40, toy_grains=12, toy_counts=0, toy_contrast=1, batch=12, sweeps=1)
+    s.set_crystal({"space_group": 10, "cell": [3.5, 4.5, 5.5, 90, 105, 90],
+                   "sites": [{"symbol": "Al", "xyz": [0.17, 0.23, 0.31], "b_iso": 0.5}, {"symbol": "Cu", "xyz": [0.29, 0.11, 0.43], "b_iso": 0.5}]})
+    s.simulate_master()
+    s.add_simulated_phase("C2/m unique b")
+    s.set_geometry(pc=(0.45, 0.3, 0.6), px_um=0)
+    s.synthesize()
+
+    def qmul(a, b):
+        a, b = np.asarray(a, np.float64), np.asarray(b, np.float64)
+        w1, x1, y1, z1 = np.moveaxis(a, -1, 0)
+        w2, x2, y2, z2 = np.moveaxis(b, -1, 0)
+        return np.stack([w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2, w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+                         w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2, w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2], -1)
+
+    def same_pattern(a, b):
+        """The least correlation, cell by cell, of two stacks of patterns."""
+        return min(float(np.corrcoef(x.ravel(), y.ravel())[0, 1]) for x, y in zip(a, b))
+
+    def pose_apart(a, b):
+        """Degrees between rotations, sign aside, no symmetry allowed (from the vector part of
+        a b⁻¹: an arc cosine near 1 loses half the digits of an f32 quaternion)."""
+        b = np.asarray(b, np.float64) * np.array([1, -1, -1, -1.0])
+        m = qmul(a, b)
+        return np.degrees(2 * np.arctan2(np.linalg.norm(m[..., 1:], axis=-1), np.abs(m[..., 0])))
+
+    raw = s.index_cells(np.arange(12))["quaternions"][0]
+    r = s.index()
+    q = r["quaternions"].reshape(-1, 4).astype(np.float64)
+    half_y, half_z = np.array([0, 0, 1, 0.0]), np.array([0, 0, 0, 1.0])
+    kept = same_pattern(s.simulate(q), s.simulate(raw))
+    by_y = same_pattern(s.simulate(qmul(half_y, q)), s.simulate(q))
+    by_z = max(float(np.corrcoef(a.ravel(), b.ravel())[0, 1]) for a, b in zip(s.simulate(qmul(half_z, q)), s.simulate(q)))
+    moved = pose_apart(q, raw)
+    check("a master with its unique axis b keeps the pose it was fitted with, reduced about b",
+          (r["phase"] == 0).all() and kept > 0.999 and by_y > 0.99 and by_z < 0.9
+          and all(m < 0.05 or abs(m - 180) < 0.05 or pose_apart(q[i], qmul(half_y, raw[i])) < 0.05 for i, m in enumerate(moved)),
+          f"stored and fitted poses simulate patterns correlating at least {kept:.4f}; a half turn about b leaves them {by_y:.4f}, about c {by_z:.2f} at most; "
+          f"{int((pose_apart(q, raw) > 1).sum())} of 12 stored as their equivalent about b")
+    qz, _ = s.reduce(q)
+    d_sym = np.degrees(s.disorientation(qmul(half_y, q), q))
+    d_c = np.degrees(s.disorientation(qmul(half_z, q), q))
+    check("its explicit reduction and disorientation are about b too",
+          pose_apart(qz, q).max() < 1e-3 and d_sym.max() < 1e-3 and d_c.min() > 1,
+          f"reduced as stored (to {pose_apart(qz, q).max():.1e}°); a half turn about b is {d_sym.max():.1e}° away, about c {d_c.min():.0f}°")
+    # the export's Bunge angles are those of the stored poses (the engine's convention, here in NumPy)
+    with tempfile.TemporaryDirectory() as d:
+        s.export(os.path.join(d, "x.ang"))
+        rows_ang = np.loadtxt(os.path.join(d, "x.ang"), comments="#", usecols=(0, 1, 2), ndmin=2)
+    p1, P, p2 = rows_ang.T
+    sig, dlt = 0.5 * (p1 + p2), 0.5 * (p1 - p2)
+    q_ang = np.stack([np.cos(P / 2) * np.cos(sig), -np.sin(P / 2) * np.cos(dlt), -np.sin(P / 2) * np.sin(dlt), -np.cos(P / 2) * np.sin(sig)], -1)
+    check("its ANG export writes the stored poses", rows_ang.shape == (12, 3) and pose_apart(q_ang, q).max() < 1e-3,
+          f"{rows_ang.shape[0]} rows, {pose_apart(q_ang, q).max():.1e}° from the stored poses")
+    # the pattern-centre vote and the plane fit keep poses that simulate their patterns
+    s.configure(fit_grid=4, fit_bandwidth=32, pc_steps=1, pc_steps_z=1, pc_levels=1, refine=False)
+    s.fit_pc()
+    cells, phases, qf, _ = s.fit_patterns()
+    vote = same_pattern(s.simulate(qf, cells=cells), s.simulate(s.index_cells(cells, bandwidth=32)["quaternions"][0], cells=cells))
+    s.configure(plane_stride=1, plane_iters=3, accept_z=0, accept_step_deg=180, refine=True)
+    s.fit_plane()
+    cells, phases, qp, _ = s.fit_patterns()
+    plane = same_pattern(s.simulate(qp, cells=cells), [s.pattern(int(c), processed=False) for c in cells])
+    check("its fits keep poses that simulate their patterns", (phases == 0).all() and vote > 0.999 and plane > 0.99,
+          f"the vote's poses against the search's: at least {vote:.4f}; the plane fit's against the patterns: at least {plane:.4f}")
+    s.close()
+
+    # a region of interest belongs to its scan: the next one opens on the whole map
+    with ze.Solver() as s2:
+        s2.configure(roi_x=3, roi_y=2, roi_w=5, roi_h=4)
+        s2.open(SCAN)
+        roi = [s2.settings[k] for k in ("roi_x", "roi_y", "roi_w", "roi_h")]
+    check("a scan opens on the whole map", roi == [0, 0, 0, 0], f"region after opening: {roi}")
 
     # ── the plain functions ──
     res = ze.index(SCAN, [NI], roi_x=0, roi_y=0, roi_w=30, roi_h=10, batch=128)

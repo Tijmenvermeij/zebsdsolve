@@ -1,15 +1,14 @@
-"""Validate saved browser ZIP artifacts with zipfile, h5py and native pyMTEX 1.0.0.
+"""Validate saved browser ZIP artifacts with zipfile, h5py, NumPy and Pillow.
 
 Usage: python web/tests/check-download-zips.py /path/printed/by/batch-downloads-browser.mjs
-ANG import: grid=False, setting=2; H5OINA uses its native importer/default frame.
-Units and frame conversion are delegated to the unchanged native export/import paths.
+Checks archive structure, serialized records, maps and project state.
+Independent scientific importer validation is private development work.
 """
-import io,json,sys,tempfile,zipfile
+import io,json,sys,zipfile
 from pathlib import Path
 import h5py
 import numpy as np
 from PIL import Image
-from mtex import loadEBSD
 folder=Path(sys.argv[1]);archives=sorted(folder.glob('*.zip'))
 assert archives,'No browser downloads found'
 for path in archives:
@@ -33,18 +32,19 @@ for path in archives:
                 key='IPFZ_RGBA' if suffix=='_IPF-Z.png' else 'NCC_RGBA'
                 np.testing.assert_array_equal(np.asarray(image),result['zebsdsolve/Maps/'+key][()])
         vendor_bytes=archive.read(f'{stem}/{stem}{vendor}')
-        with tempfile.TemporaryDirectory(prefix='zebsdsolve-downloaded-import-') as temporary:
-            vendor_path=Path(temporary)/('result'+vendor);vendor_path.write_bytes(vendor_bytes)
-            options={'grid':False}
-            if vendor=='.ang':options['setting']=2
-            ebsd=loadEBSD(str(vendor_path),**options)
-            assert len(ebsd.x)==rows*cols,(path,len(ebsd.x),rows*cols)
+        if vendor=='.ang':
+            records=np.loadtxt(io.BytesIO(vendor_bytes),ndmin=2)
+            assert records.shape[0]==rows*cols,(path,records.shape,rows*cols)
+            assert records.shape[1]>=10,(path,records.shape)
+            assert np.isfinite(records[:,:5]).all(),path
         if vendor=='.h5oina':
             reference=json.loads((folder/'p6-reference.json').read_text())
             with h5py.File(io.BytesIO(vendor_bytes)) as result:
                 root=next(group for group in result.values() if isinstance(group,h5py.Group) and 'EBSD' in group)
                 data=root['EBSD/Data']
+                assert data['Euler'].shape==(rows*cols,3)
+                assert data['Phase'].shape==(rows*cols,)
                 assert 'Processed Patterns' not in data and 'Unprocessed Patterns' not in data
                 np.testing.assert_allclose(data['Euler'][reference['cell']],reference['euler'],atol=1e-6,rtol=0)
-    print(path.name,': CRC, 5 matching members, native maps, JSON state and pyMTEX import passed')
-print('All browser ZIP exports passed independent Python zipfile/h5py and native pyMTEX validation.')
+    print(path.name,': CRC, 5 matching members, native maps, JSON state and serialized vendor records passed')
+print('All browser ZIP exports passed Python zipfile/h5py serialization validation.')

@@ -60,6 +60,10 @@ fn fingerprint(e: *const engine.Engine) [32]u8 {
         hashValue(&h, m.source_format_version);
         hashValue(&h, m.raw);
         hashValue(&h, m.ops);
+        hashValue(&h, m.setting.rotation);
+        hashValue(&h, m.setting.laue);
+        hashValue(&h, m.setting.frame);
+        hashValue(&h, m.setting.rotations());
     }
     return h.finalResult();
 }
@@ -104,7 +108,7 @@ pub fn write(e: *engine.Engine, destination: []u8) !void {
     @memset(bytes[0..header], 0);
     @memcpy(bytes[0..8], magic);
     var c: Codec = .{ .bytes = bytes, .pos = 8 };
-    c.put(@as(u32, 1));
+    c.put(@as(u32, 2));
     c.put(@as(u32, header));
     c.put(info.rows);
     c.put(info.cols);
@@ -141,7 +145,7 @@ pub fn restore(e: *engine.Engine, input: []const u8) !void {
     if (input.len < header or !std.mem.eql(u8, input[0..8], magic)) return error.InvalidResultCheckpoint;
     // Codec only reads; the ABI input remains const.
     var c: Codec = .{ .bytes = @constCast(input), .pos = 8 };
-    if (c.get(u32) != 1 or c.get(u32) != header) return error.InvalidResultCheckpoint;
+    if (c.get(u32) != 2 or c.get(u32) != header) return error.InvalidResultCheckpoint;
     const info = try e.info();
     if (c.get(u32) != info.rows or c.get(u32) != info.cols or c.get(u32) != info.pat_h or c.get(u32) != info.pat_w) return error.CheckpointShapeMismatch;
     const phases = c.get(u32);

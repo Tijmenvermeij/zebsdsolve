@@ -11,14 +11,16 @@ export function isOxfordH5(format) {
   return /^(?:Oxford h5oina|h5_oxford)$/i.test(format || "");
 }
 
-// Geometry residuals are meaningful only relative to the camera baseline used
-// while fitting them. Unversioned or v1 Oxford residuals cannot be reinterpreted.
-export function geometryConvention(format, detectorAttitudeVersion=null) {
-  if(!isOxfordH5(format))return "generic-v1";
-  return detectorAttitudeVersion===2?"oxford-calibrated-v2":detectorAttitudeVersion===0?"oxford-fallback-v1":"oxford-unversioned";
+// Saved fitted geometry is tied to the detector convention used during fitting.
+export function geometryConvention(scan) {
+  if (!isOxfordH5(scan?.format)) return "generic-v1";
+  if (scan.geometryFrame === 2) return "oxford-calibrated-v3";
+  if (scan.geometryFrame === 3) return "oxford-fallback-v1";
+  return "oxford-calibrated-v1";
 }
-export function canRestoreGeometry(convention, format, detectorAttitudeVersion=null) {
-  if(!isOxfordH5(format))return !(typeof convention==="string" && convention.startsWith("oxford-"));
-  const current=geometryConvention(format,detectorAttitudeVersion);
-  return current!=="oxford-unversioned" && convention===current;
+
+export function acceptsGeometryConvention(scan, saved) {
+  if (!isOxfordH5(scan?.format)) return !(typeof saved === "string" && saved.startsWith("oxford-"));
+  return saved === geometryConvention(scan) ||
+    (scan.geometryFrame === 3 && saved === "oxford-calibrated-v1");
 }

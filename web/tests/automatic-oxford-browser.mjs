@@ -92,7 +92,7 @@ try {
       require(cell === 83377, 'Expected P6 reference pixel');
       require(ox.results.phase[cell] === 0, 'Reference point must be indexed by the Ti master');
       const frame = ox.oxford_frame;
-      require(frame.automatic === true && frame.convention_version === 1, 'Automatic native Oxford frame missing');
+      require(frame.automatic === true && frame.convention_version === 2, 'Automatic native Oxford frame missing');
       const close = (a,b,t=1e-12) => a.length===b.length && a.every((v,i)=>Math.abs(v-b[i])<=t);
       require(close(frame.engine_to_cs1,[Math.SQRT1_2,0,0,Math.SQRT1_2]), 'Unexpected frozen sample basis');
       require(close(frame.phase_crystal_to_master[0],[Math.cos(Math.PI/12),0,0,Math.sin(Math.PI/12)]), 'Missing hexagonal crystal basis');

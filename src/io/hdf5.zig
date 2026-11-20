@@ -1,9 +1,10 @@
 //! A reader for the part of HDF5 that EBSD files use, written against the file format
 //! specification so the engine needs no HDF5 library (and so the browser reads a 100 GB file
 //! in place). It follows groups, reads dataset headers and reads datasets whole, by ranges of
-//! their first axis, or by a list of steps along it (the patterns of a preview lattice). A
-//! chunked dataset's index is read one tree level per round trip, and the chunks a request
-//! needs in one more.
+//! their first axis, or by a list of steps along it (the patterns of a preview lattice). Of a
+//! chunked dataset's index only the paths to the chunks a request needs are read, one tree
+//! level per round trip (the inner nodes are kept, so later requests mostly read leaves), and
+//! the chunks themselves in one more.
 //!
 //! Covered: superblock versions 0–3; object headers versions 1 and 2; groups stored as symbol
 //! tables (the default of every HDF5 writer) or as compact link messages; fixed-point, floating
@@ -64,15 +65,13 @@ pub const Dataset = struct {
     chunk: [MAX_RANK]u64 = @splat(1),
     filters: [4]Filter = undefined,
     n_filters: u8 = 0,
-    /// Chunk slots can be populated by targeted reads before the full tree is ready.
+    /// every chunk by its place in the chunk grid, row-major; a slot is filled once `known`
+    /// says so, when the leaf of the chunk tree that holds it (or would) has been read
     index: []Slot = &.{},
-    known: []bool = &.{},
-    index_ready: bool = false,
-    index_failed: bool = false,
-    frontier: std.ArrayList(u64) = .empty,
-    frontier_at: usize = 0,
-    warmed_nodes: u64 = 0,
-    nodes_seen: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    known: std.DynamicBitSetUnmanaged = .{},
+    /// the chunk tree's inner nodes read so far, by address: one for every 64 leaves or so
+    inner: std.AutoHashMapUnmanaged(u64, []u8) = .empty,
+    /// the bytes of a tree node: the default fan-out's, until a node says it holds more
     node_len: usize = 0,
     /// chunks along each axis
     grid: [MAX_RANK]u64 = @splat(1),
@@ -82,9 +81,10 @@ pub const Dataset = struct {
 
     pub fn deinit(self: *Dataset, gpa: Allocator) void {
         gpa.free(self.index);
-        gpa.free(self.known);
-        self.frontier.deinit(gpa);
-        self.nodes_seen.deinit(gpa);
+        self.known.deinit(gpa);
+        var it = self.inner.valueIterator();
+        while (it.next()) |b| gpa.free(b.*);
+        self.inner.deinit(gpa);
         gpa.free(self.cache);
         self.* = .{};
     }
@@ -603,251 +603,202 @@ pub const Hdf5 = struct {
         return self.readRows(ds, 0, if (ds.rank == 0) 1 else ds.dims[0], dst);
     }
 
+    /// The chunk grid and an index of unknown slots (an implicit index is known at once).
     fn initIndex(self: *Hdf5, ds: *Dataset) !void {
-        if (ds.index.len != 0 or ds.index_ready) return;
-        switch (ds.layout) {
-            .chunked, .implicit => {},
-            else => {
-                ds.index_ready = true;
-                return;
-            },
-        }
+        if (ds.index.len != 0) return;
         var n: u64 = 1;
         for (0..ds.rank) |d| {
             if (ds.chunk[d] == 0) return error.BadHdf5;
-            ds.grid[d] = ds.dims[d] / ds.chunk[d] + @intFromBool(ds.dims[d] % ds.chunk[d] != 0);
-            n = try std.math.mul(u64, n, ds.grid[d]);
+            ds.grid[d] = (ds.dims[d] + ds.chunk[d] - 1) / ds.chunk[d];
+            n = std.math.mul(u64, n, ds.grid[d]) catch return error.BadHdf5;
         }
-        errdefer {
-            ds.frontier.clearRetainingCapacity();
-            ds.nodes_seen.clearRetainingCapacity();
-        }
+        if (n == 0) return;
         const index = try self.gpa.alloc(Slot, std.math.cast(usize, n) orelse return error.BadHdf5);
         errdefer self.gpa.free(index);
-        const known = try self.gpa.alloc(bool, index.len);
-        errdefer self.gpa.free(known);
         @memset(index, .{});
-        @memset(known, false);
+        var known = try std.DynamicBitSetUnmanaged.initEmpty(self.gpa, index.len);
+        errdefer known.deinit(self.gpa);
         switch (ds.layout) {
-            .chunked => |c| {
-                if (c.btree != UNDEF) {
-                    try ds.nodes_seen.put(self.gpa, c.btree, {});
-                    try ds.frontier.append(self.gpa, c.btree);
-                } else {
-                    @memset(known, true);
-                    ds.index_ready = true;
-                }
-            },
+            .chunked => |c| if (c.btree == UNDEF) known.setAll(),
             .implicit => |c| {
-                const bytes = try std.math.mul(u64, ds.chunkElements(), ds.dtype.size);
-                for (index, 0..) |*slot, k| slot.* = .{ .addr = try std.math.add(u64, c.addr, try std.math.mul(u64, k, bytes)), .size = std.math.cast(u32, bytes) orelse return error.BadHdf5, .mask = 0xffffffff };
-                @memset(known, true);
-                ds.index_ready = true;
+                // unfiltered chunks back to back, in row-major order of the grid
+                const bytes = ds.chunkElements() * ds.dtype.size;
+                for (index, 0..) |*slot, k| slot.* = .{ .addr = c.addr + k * bytes, .size = @intCast(bytes), .mask = 0xffffffff };
+                known.setAll();
             },
-            else => ds.index_ready = true,
+            else => known.setAll(),
         }
+        // a node of the default fan-out (64 entries); a file written with a larger one shows
+        // in its nodes' counts, and the batch is read again whole
+        ds.node_len = treeHead(self) + 64 * treeEntry(self, ds) + treeKey(ds);
         ds.index = index;
         ds.known = known;
-        ds.node_len = 8 + 2 * @as(usize, self.so) + 64 * self.treeEntry(ds) + self.treeKey(ds);
     }
 
-    fn treeKey(_: *Hdf5, ds: *const Dataset) usize {
+    fn treeKey(ds: *const Dataset) usize {
         return 8 + 8 * (@as(usize, ds.rank) + 1);
     }
-    fn treeEntry(self: *Hdf5, ds: *const Dataset) usize {
-        return self.treeKey(ds) + self.so;
+    fn treeEntry(self: *const Hdf5, ds: *const Dataset) usize {
+        return treeKey(ds) + self.so;
     }
-    fn treeHead(self: *Hdf5) usize {
+    fn treeHead(self: *const Hdf5) usize {
         return 8 + 2 * @as(usize, self.so);
     }
 
-    fn nodeRange(self: *Hdf5, addr: u64, len: usize) !Range {
-        const at = try std.math.add(u64, addr, self.base);
-        if (at >= self.f.size) return error.BadHdf5;
-        return .{ .offset = at, .len = @intCast(@min(len, self.f.size - at)) };
+    /// The first slot whose chunk is at or past a key of the chunk tree. The tree orders chunks
+    /// by their origins, axis by axis and then by the element's byte (always 0 for a chunk),
+    /// which is the row-major order of the slots; a child of a node holds the chunks from its
+    /// key up to the next key. A key past the last chunk gives the slot count.
+    fn keySlot(ds: *const Dataset, key: []const u8) u64 {
+        const rank: usize = ds.rank;
+        var stride: [MAX_RANK]u64 = undefined;
+        var n: u64 = 1;
+        var d = rank;
+        while (d > 0) {
+            d -= 1;
+            stride[d] = n;
+            n *= ds.grid[d];
+        }
+        var slot: u64 = 0;
+        for (0..rank) |a| {
+            const o = std.mem.readInt(u64, key[8 + 8 * a ..][0..8], .little);
+            const g = o / ds.chunk[a];
+            const part = o % ds.chunk[a] != 0;
+            // past every origin with this prefix and coordinate: the next one up
+            if (part or g >= ds.grid[a]) return @min(slot + @min(g + @intFromBool(part), ds.grid[a]) * stride[a], n);
+            slot += g * stride[a];
+        }
+        const byte = std.mem.readInt(u64, key[8 + 8 * rank ..][0..8], .little);
+        return @min(slot + @intFromBool(byte != 0), n);
     }
 
-    /// Includes the terminal upper-bound key, needed for safe targeted descent.
-    fn nodeRequired(self: *Hdf5, ds: *Dataset, b: []const u8) !usize {
-        if (b.len < self.treeHead() or !std.mem.eql(u8, b[0..4], "TREE") or b[4] != 1) return error.BadHdf5;
+    const Span = struct { lo: u64, hi: u64 };
+
+    /// Whether any of `want` (ascending, apart) falls in [lo, hi).
+    fn wanted(want: []const Span, lo: u64, hi: u64) bool {
+        var a: usize = 0;
+        var b = want.len;
+        while (a < b) {
+            const m = (a + b) / 2;
+            if (want[m].hi <= lo) a = m + 1 else b = m;
+        }
+        return a < want.len and want[a].lo < hi;
+    }
+
+    /// A node of the chunk tree to read: its address, the slots it holds and its level (the
+    /// root's is whatever it says).
+    const Node = struct { addr: u64, lo: u64, hi: u64, depth: ?u8 };
+
+    /// Read the part of the version 1 B-tree of chunks that holds the slots of `want`
+    /// (ascending spans, none known), breadth-first: of each level only the nodes on the way to
+    /// a wanted slot, those not read before in one round trip. A preview of a few patterns of a
+    /// scan of a million one-pattern chunks reads a path of three or four nodes, not its tens of
+    /// thousands of leaves; a request for every chunk reads the whole tree. Inner nodes are
+    /// kept. A leaf fills its chunks' slots and makes every slot between its keys known,
+    /// written or not.
+    fn resolve(self: *Hdf5, ds: *Dataset, want: []const Span) !void {
+        if (want.len == 0) return;
+        const gpa = self.gpa;
+        var level: std.ArrayList(Node) = .empty;
+        defer level.deinit(gpa);
+        var next: std.ArrayList(Node) = .empty;
+        defer next.deinit(gpa);
+        var fresh: std.ArrayList(Node) = .empty;
+        defer fresh.deinit(gpa);
+        var ranges: std.ArrayList(Range) = .empty;
+        defer ranges.deinit(gpa);
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(gpa);
+        try level.append(gpa, .{ .addr = ds.layout.chunked.btree, .lo = 0, .hi = ds.index.len, .depth = null });
+        while (level.items.len != 0) {
+            next.clearRetainingCapacity();
+            fresh.clearRetainingCapacity();
+            for (level.items) |nd| {
+                if (ds.inner.get(nd.addr)) |b| try self.chunkNode(ds, nd, b, want, &next) else try fresh.append(gpa, nd);
+            }
+            var done: usize = 0;
+            while (done < fresh.items.len) {
+                const nb = @min(fresh.items.len - done, 2048);
+                ranges.clearRetainingCapacity();
+                var total: usize = 0;
+                for (fresh.items[done..][0..nb]) |nd| {
+                    const at = std.math.add(u64, nd.addr, self.base) catch return error.BadHdf5;
+                    if (at >= self.f.size) return error.BadHdf5;
+                    const len: usize = @intCast(@min(ds.node_len, self.f.size - at));
+                    try ranges.append(gpa, .{ .offset = at, .len = len });
+                    total += len;
+                }
+                try buf.resize(gpa, total);
+                try self.f.readv(ranges.items, buf.items);
+                var off: usize = 0;
+                var need: usize = 0;
+                for (ranges.items) |r| {
+                    const len = try self.nodeLen(ds, buf.items[off..][0..r.len]);
+                    off += r.len;
+                    if (len > r.len) need = @max(need, len);
+                }
+                if (need != 0) {
+                    if (need <= ds.node_len) return error.BadHdf5;
+                    ds.node_len = need;
+                    continue;
+                }
+                off = 0;
+                for (ranges.items, fresh.items[done..][0..nb]) |r, nd| {
+                    const b = buf.items[off..][0..try self.nodeLen(ds, buf.items[off..][0..r.len])];
+                    off += r.len;
+                    try self.chunkNode(ds, nd, b, want, &next);
+                    if (b[5] != 0) {
+                        const kept = try gpa.dupe(u8, b);
+                        errdefer gpa.free(kept);
+                        try ds.inner.put(gpa, nd.addr, kept);
+                    }
+                }
+                done += nb;
+            }
+            std.mem.swap(std.ArrayList(Node), &level, &next);
+        }
+    }
+
+    /// The bytes a tree node takes, from its own count of entries (it may be more than read).
+    fn nodeLen(self: *const Hdf5, ds: *const Dataset, b: []const u8) !usize {
+        if (b.len < treeHead(self) or !std.mem.eql(u8, b[0..4], "TREE") or b[4] != 1) return error.BadHdf5;
         const used: usize = std.mem.readInt(u16, b[6..8], .little);
-        return self.treeHead() + used * self.treeEntry(ds) + self.treeKey(ds);
+        return treeHead(self) + used * treeEntry(self, ds) + treeKey(ds);
     }
 
-    fn chunkChild(self: *Hdf5, ds: *Dataset, p: []const u8) u64 {
-        const key = self.treeKey(ds);
-        const addr = if (self.so == 8) std.mem.readInt(u64, p[key..][0..8], .little) else std.mem.readInt(u32, p[key..][0..4], .little);
-        return if (self.so == 4 and addr == 0xffffffff) UNDEF else addr;
-    }
-
-    fn leaf(self: *Hdf5, ds: *Dataset, b: []const u8) !void {
+    /// One node: a leaf's chunks into their slots, or the children of an inner node that hold
+    /// wanted slots onto `next`. Each level is one below its parent's, so a damaged tree cannot
+    /// loop.
+    fn chunkNode(self: *Hdf5, ds: *Dataset, nd: Node, b: []const u8, want: []const Span, next: *std.ArrayList(Node)) !void {
+        const depth = b[5];
+        if (nd.depth) |d| if (depth != d) return error.BadHdf5;
         const used: usize = std.mem.readInt(u16, b[6..8], .little);
+        const head = treeHead(self);
+        const entry = treeEntry(self, ds);
+        const key = treeKey(ds);
         for (0..used) |i| {
-            const p = b[self.treeHead() + i * self.treeEntry(ds) ..];
+            const p = b[head + i * entry ..];
+            var kid: u64 = if (self.so == 8) std.mem.readInt(u64, p[key..][0..8], .little) else std.mem.readInt(u32, p[key..][0..4], .little);
+            if (self.so == 4 and kid == 0xffffffff) kid = UNDEF;
+            if (depth > 0) {
+                const lo = @max(keySlot(ds, p), nd.lo);
+                const hi = @min(keySlot(ds, p[entry..]), nd.hi);
+                if (lo >= hi or !wanted(want, lo, hi)) continue;
+                if (kid == UNDEF) return error.BadHdf5;
+                try next.append(self.gpa, .{ .addr = kid, .lo = lo, .hi = hi, .depth = depth - 1 });
+                continue;
+            }
+            // the chunk's place in the grid from its origin, which its parent's keys bound
             var slot: u64 = 0;
             for (0..ds.rank) |d| {
                 const o = std.mem.readInt(u64, p[8 + 8 * d ..][0..8], .little);
                 if (o >= ds.dims[d] or o % ds.chunk[d] != 0) return error.BadHdf5;
                 slot = slot * ds.grid[d] + o / ds.chunk[d];
             }
-            ds.index[@intCast(slot)] = .{ .addr = self.chunkChild(ds, p), .size = std.mem.readInt(u32, p[0..4], .little), .mask = std.mem.readInt(u32, p[4..8], .little) };
-            ds.known[@intCast(slot)] = true;
+            if (slot < nd.lo or slot >= nd.hi) return error.BadHdf5;
+            ds.index[@intCast(slot)] = .{ .addr = kid, .size = std.mem.readInt(u32, p[0..4], .little), .mask = std.mem.readInt(u32, p[4..8], .little) };
         }
-    }
-
-    /// Warm a bounded tree batch. Exactly one backend readv per call; an oversized
-    /// node updates the next call's range instead of performing an unbounded retry.
-    pub fn prepareIndexStep(self: *Hdf5, ds: *Dataset, max_nodes: usize, max_bytes: usize) !bool {
-        try self.initIndex(ds);
-        if (ds.index_failed) return error.ChunkIndexFailed;
-        if (ds.index_ready) return true;
-        if (max_nodes == 0 or max_bytes == 0) return error.BadLength;
-        var ranges: std.ArrayList(Range) = .empty;
-        defer ranges.deinit(self.gpa);
-        var total: usize = 0;
-        const left = ds.frontier.items.len - ds.frontier_at;
-        for (ds.frontier.items[ds.frontier_at..][0..@min(left, max_nodes)]) |addr| {
-            const range = try self.nodeRange(addr, ds.node_len);
-            if (range.len > max_bytes) return error.ChunkIndexBudgetTooSmall;
-            if (total + range.len > max_bytes) break;
-            try ranges.append(self.gpa, range);
-            total += range.len;
-        }
-        const buf = try self.gpa.alloc(u8, total);
-        defer self.gpa.free(buf);
-        errdefer ds.index_failed = true;
-        try self.f.readv(ranges.items, buf);
-        var off: usize = 0;
-        var need: usize = 0;
-        for (ranges.items) |range| {
-            const b = buf[off..][0..range.len];
-            off += range.len;
-            const required = try self.nodeRequired(ds, b);
-            if (required > b.len) need = @max(need, required);
-        }
-        if (need != 0) {
-            if (need <= ds.node_len) return error.BadHdf5;
-            ds.node_len = need;
-            return false;
-        }
-        off = 0;
-        for (ranges.items) |range| {
-            const b = buf[off..][0..range.len];
-            off += range.len;
-            if (b[5] == 0) try self.leaf(ds, b) else {
-                const used: usize = std.mem.readInt(u16, b[6..8], .little);
-                for (0..used) |i| {
-                    const addr = self.chunkChild(ds, b[self.treeHead() + i * self.treeEntry(ds) ..]);
-                    if (addr == UNDEF) return error.BadHdf5;
-                    const seen = try ds.nodes_seen.getOrPut(self.gpa, addr);
-                    if (seen.found_existing) return error.BadHdf5;
-                    try ds.frontier.append(self.gpa, addr);
-                }
-            }
-        }
-        ds.warmed_nodes += ranges.items.len;
-        ds.frontier_at += ranges.items.len;
-        if (ds.frontier_at == ds.frontier.items.len) {
-            @memset(ds.known, true);
-            ds.index_ready = true;
-            ds.frontier.clearAndFree(self.gpa);
-            ds.nodes_seen.clearAndFree(self.gpa);
-            ds.frontier_at = 0;
-        }
-        return ds.index_ready;
-    }
-
-    fn compareOrigin(ds: *const Dataset, slot: usize, key: []const u8) std.math.Order {
-        var origin: [MAX_RANK]u64 = @splat(0);
-        var rem = slot;
-        var d: usize = ds.rank;
-        while (d > 0) {
-            d -= 1;
-            origin[d] = (rem % ds.grid[d]) * ds.chunk[d];
-            rem /= @intCast(ds.grid[d]);
-        }
-        for (origin[0..ds.rank], 0..) |o, k| {
-            const boundary = std.mem.readInt(u64, key[8 + 8 * k ..][0..8], .little);
-            if (o != boundary) return std.math.order(o, boundary);
-        }
-        return .eq;
-    }
-
-    /// Resolve only requested slots, batching requests that share B-tree nodes.
-    /// Unknown slots become missing only after a verified path/leaf has excluded them.
-    fn lookupSlots(self: *Hdf5, ds: *Dataset, slots: []const usize) !void {
-        if (ds.index_ready) return;
-        if (ds.index_failed) return error.ChunkIndexFailed;
-        errdefer ds.index_failed = true;
-        const Query = struct { addr: u64, slot: usize, depth: u16 = 0 };
-        var queries: std.ArrayList(Query) = .empty;
-        defer queries.deinit(self.gpa);
-        for (slots) |slot| if (!ds.known[slot]) {
-            try queries.append(self.gpa, .{ .addr = ds.layout.chunked.btree, .slot = slot });
-        };
-        while (queries.items.len != 0) {
-            std.mem.sort(Query, queries.items, {}, struct {
-                fn lt(_: void, a: Query, b: Query) bool {
-                    return a.addr < b.addr;
-                }
-            }.lt);
-            var next: std.ArrayList(Query) = .empty;
-            errdefer next.deinit(self.gpa);
-            var ranges: std.ArrayList(Range) = .empty;
-            defer ranges.deinit(self.gpa);
-            var last = UNDEF;
-            var total: usize = 0;
-            for (queries.items) |q| if (q.addr != last) {
-                const range = try self.nodeRange(q.addr, ds.node_len);
-                try ranges.append(self.gpa, range);
-                total += range.len;
-                last = q.addr;
-            };
-            const buf = try self.gpa.alloc(u8, total);
-            defer self.gpa.free(buf);
-            if (ranges.items.len == 1) try self.f.read(ranges.items[0].offset, buf) else try self.f.readv(ranges.items, buf);
-            var off: usize = 0;
-            var need: usize = 0;
-            for (ranges.items) |range| {
-                const required = try self.nodeRequired(ds, buf[off..][0..range.len]);
-                if (required > range.len) need = @max(need, required);
-                off += range.len;
-            }
-            if (need != 0) {
-                if (need <= ds.node_len) return error.BadHdf5;
-                ds.node_len = need;
-                continue;
-            }
-            off = 0;
-            var qi: usize = 0;
-            for (ranges.items) |range| {
-                const b = buf[off..][0..range.len];
-                off += range.len;
-                const addr = queries.items[qi].addr;
-                const used: usize = std.mem.readInt(u16, b[6..8], .little);
-                if (b[5] == 0) try self.leaf(ds, b);
-                while (qi < queries.items.len and queries.items[qi].addr == addr) : (qi += 1) {
-                    const q = queries.items[qi];
-                    if (ds.known[q.slot]) continue;
-                    if (q.depth >= 64) return error.BadHdf5;
-                    var found = false;
-                    if (b[5] != 0) for (0..used) |j| {
-                        const p = b[self.treeHead() + j * self.treeEntry(ds) ..];
-                        const upper = b[self.treeHead() + (j + 1) * self.treeEntry(ds) ..];
-                        if (compareOrigin(ds, q.slot, p) != .lt and compareOrigin(ds, q.slot, upper) == .lt) {
-                            const kid = self.chunkChild(ds, p);
-                            if (kid == UNDEF) return error.BadHdf5;
-                            try next.append(self.gpa, .{ .addr = kid, .slot = q.slot, .depth = q.depth + 1 });
-                            found = true;
-                            break;
-                        }
-                    };
-                    if (!found) ds.known[q.slot] = true;
-                }
-            }
-            queries.deinit(self.gpa);
-            queries = next;
-        }
+        if (depth == 0) ds.known.setRangeValue(.{ .start = @intCast(nd.lo), .end = @intCast(nd.hi) }, true);
     }
 
     /// Undo a chunk's filters: `stored` as read from the file → the chunk's `out_len` bytes
@@ -934,17 +885,25 @@ pub const Hdf5 = struct {
         const c0 = ds.chunk[0];
         // chunks in one slab of the grid's first axis
         const slab_len: usize = @intCast(ds.index.len / ds.grid[0]);
-        if (!ds.index_ready) {
-            var slots: std.ArrayList(usize) = .empty;
-            defer slots.deinit(gpa);
-            var last_slab: u64 = UNDEF;
+        // the slots of the slabs the rows touch that the tree has not given yet, in one walk
+        {
+            var want: std.ArrayList(Span) = .empty;
+            defer want.deinit(gpa);
+            var last: u64 = UNDEF;
             for (rows) |r| {
                 const slab = r / c0;
-                if (slab == last_slab) continue;
-                last_slab = slab;
-                for (0..slab_len) |k| try slots.append(gpa, @as(usize, @intCast(slab)) * slab_len + k);
+                if (slab == last) continue;
+                last = slab;
+                var k: usize = @intCast(slab * slab_len);
+                const end = k + slab_len;
+                while (k < end) : (k += 1) {
+                    if (ds.known.isSet(k)) continue;
+                    if (want.items.len != 0 and want.items[want.items.len - 1].hi == k) {
+                        want.items[want.items.len - 1].hi += 1;
+                    } else try want.append(gpa, .{ .lo = k, .hi = k + 1 });
+                }
             }
-            try self.lookupSlots(ds, slots.items);
+            try self.resolve(ds, want.items);
         }
 
         var want: std.ArrayList(Want) = .empty;
@@ -1218,54 +1177,4 @@ test "read the nickel scan like h5py" {
     var pcx: [4125]f64 = undefined;
     try std.testing.expectEqual(@as(usize, 4125), try h.numbers((try h.find("Scan 1/EBSD/Header/pcx")).?, &pcx));
     try std.testing.expectApproxEqAbs(@as(f64, 0.42771687591335866), pcx[0], 1e-15);
-}
-
-// A synthetic version-1 leaf exercises fan-outs larger than the initial read,
-// missing slots, the terminal key and recovery from a too-small warm budget.
-test "oversized chunk node retries in a later bounded turn" {
-    const gpa = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const head = 24;
-    const key = 24;
-    const entry = 32;
-    const count = 100;
-    const required = head + count * entry + key;
-    var raw: [required + count]u8 = @splat(0);
-    @memcpy(raw[0..4], "TREE");
-    raw[4] = 1;
-    std.mem.writeInt(u16, raw[6..8], count, .little);
-    @memset(raw[8..24], 0xff);
-    for (0..count) |i| {
-        const p = raw[head + i * entry ..];
-        std.mem.writeInt(u32, p[0..4], 1, .little);
-        std.mem.writeInt(u32, p[4..8], 0xffffffff, .little);
-        std.mem.writeInt(u64, p[8..16], i, .little);
-        std.mem.writeInt(u64, p[key..][0..8], required + i, .little);
-        raw[required + i] = @intCast(i);
-    }
-    std.mem.writeInt(u64, raw[head + count * entry + 8 ..][0..8], 120, .little);
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "tree.bin", .data = &raw });
-    const path = try tmp.dir.realPathFileAlloc(std.testing.io, "tree.bin", gpa);
-    defer gpa.free(path);
-    var f = try File.open(gpa, path);
-    defer f.close();
-    var h: Hdf5 = .{ .gpa = gpa, .f = &f };
-    var ds: Dataset = .{ .rank = 1, .dtype = .{ .class = .uint, .size = 1 }, .layout = .{ .chunked = .{ .btree = 0 } } };
-    ds.dims[0] = 120;
-    defer ds.deinit(gpa);
-    try std.testing.expect(!try h.prepareIndexStep(&ds, 1, 4096));
-    try std.testing.expectEqual(@as(u64, 1), f.reads);
-    try std.testing.expect(!ds.index_ready);
-    try std.testing.expectError(error.ChunkIndexBudgetTooSmall, h.prepareIndexStep(&ds, 1, 2048));
-    try std.testing.expect(!ds.index_failed);
-    var out: [4]u8 = undefined;
-    try h.readRowList(&ds, &.{ 0, 99, 100, 119 }, &out);
-    try std.testing.expectEqualSlices(u8, &.{ 0, 99, 0, 0 }, &out);
-    try std.testing.expect(!ds.index_ready);
-    const reads = f.reads;
-    try std.testing.expect(try h.prepareIndexStep(&ds, 1, 4096));
-    try std.testing.expectEqual(reads + 1, f.reads);
-    try h.readRowList(&ds, &.{ 0, 99, 100, 119 }, &out);
-    try std.testing.expectEqualSlices(u8, &.{ 0, 99, 0, 0 }, &out);
 }

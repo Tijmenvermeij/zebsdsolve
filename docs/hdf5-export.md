@@ -4,7 +4,7 @@
 
 The browser's `.h5` button and Python `solver.export("results.h5")` write:
 
-- `Scan 1/EBSD`: the selected result, using the same raw Bunge angles, raster
+- `Scan 1/EBSD`: the selected result, using the same stored Bunge angles, raster
   order and phase metadata as ANG. Native MTEX default imports agree with ANG
   setting 2. Euler angles are radians; map steps are micrometres; lattice
   lengths are angstroms and lattice angles are degrees.
@@ -56,8 +56,9 @@ excluded from that compatibility check.
 ## Oxford `.h5oina`
 
 Oxford export creates a new file with the original acquisition's metadata,
-images, map datasets and phase definitions. Diffraction patterns are omitted
-by default, including hard/soft aliases to their datasets. Static backgrounds
+images, map datasets and phase definitions. Raw EBSD patterns and EDS spectra
+(including EDS1/EDS2 detector groups and hard/soft aliases) are omitted. Their
+paths are recorded under `zebsdsolve/OmittedSignalPaths`. Static backgrounds
 are retained. The original file is never changed.
 All map rows are replaced from solver results. Pixels without a computed
 solver solution have phase 0 and empty orientations; no original acquisition
@@ -83,12 +84,14 @@ No frame JSON or MTEX runtime is needed. Python HDF5 export requires
 The native importer retains the complete original detector Euler calibration
 and tilt. Indexing uses this baseline plus any small detector-pose refinement.
 The engine-to-CS1 basis stays frozen at import; refinement changes effective
-calibration without changing that basis. Export uses the native conversion
+calibration without changing that basis. The detector chain uses Oxford CS3-to-microscope
+Euler rotations with detector rows toward −Y3; scan rotation changes scan travel
+signs, not CS1 Euler orientations. Export uses the native conversion
 `Q_oxford = inverse(C_phase) * Q_engine * inverse(B)`, where `B` is the fixed
 engine-to-CS1 rotation and `C_phase` converts Oxford crystal axes to the
 master axes. Selected results and every retained phase candidate receive the
 same native conversion. Python and JavaScript only serialize these values.
-Raw snapshots, ANG and EMSphInx-compatible H5 retain their existing conventions.
+Snapshots, ANG and EMSphInx-compatible H5 retain their existing conventions. Selected orientations are the native symmetry-reduced stored poses; alternate candidates retain their native search poses. Phase headers derive the declared Laue class from the existing point/space-group metadata, so file importers do not downgrade a declared phase when native indexing measures lower symmetry. This header preservation does not establish a crystal-axis setting.
 
 The importer records crystal-frame provenance per master, separately from the
 producer/container name. Verified EMsoft masters and recognized ebsdsim
@@ -99,7 +102,8 @@ their producer name alone does not authorize a conversion.
 The native per-phase conversion is identity for supported orthogonal lattices
 and a 30° crystal-axis conversion for supported hexagonal lattices. Unknown
 master provenance and unsupported crystal frames fail explicitly. Automatic
-export initially requires source Tilt Axis and Scanning Rotation both zero,
+export requires source Tilt Axis zero and Scanning Rotation zero or 180°
+(modulo 360°),
 complete original detector calibration, and `px_um=0`; unverified scan
 translation and axis configurations fail with a native error.
 
@@ -132,27 +136,28 @@ select only computed solver results.
 Unsupported HDF5 references fail explicitly; Python supports more metadata
 datatypes than the browser writer.
 
-Validation uses native MTEX/pyMTEX importers and rotations, without a runtime
-MTEX dependency. It checks candidate conversion, phase IDs, empty uncomputed pixels,
-pattern omission, original metadata and source integrity. Sparse Oxford phase
-IDs and some partial multiphase maps also need raw file-ID checks because the
-installed pyMTEX 1.0.0 importer has phase-numbering limitations.
+Private development validation uses external native MTEX/pyMTEX importers and
+rotations to check frame conversion and importer compatibility. Those scientific
+oracles are maintained outside the repository. Repository tests check native
+snapshot serialization, candidate records, phase IDs, empty uncomputed pixels,
+pattern omission, original metadata and source integrity. Neither runtime nor
+repository tests require MTEX. Private checks also inspect raw file IDs because
+pyMTEX 1.0.0 has phase-numbering limitations on sparse and partial multiphase maps.
 
 Reopen the original Oxford acquisition and reindex after upgrading. Old
 Oxford project geometry used a different baseline convention; it is not
-silently restored. New supported Oxford projects record `geometry_convention=oxford-calibrated-v2`
-and camera-attitude convention version 2. Earlier v1 fitted local rotations
-may have compensated for the old camera baseline and are not restored. The
-Oxford CS1 / crystal-basis convention remains version 1; it is independent of
-the corrected detector attitude. Unsupported source calibration uses the
-explicit `oxford-fallback-v1` project marker.
+silently restored. New supported Oxford projects record
+`geometry_convention=oxford-calibrated-v3`. Camera-attitude convention version 2
+is independent of Oxford CS1 / crystal-basis convention version 1. Unsupported
+source calibration uses the `oxford-fallback-v1` project marker.
 
 The earlier P6 hexagonal reference-point diagnostic found a 29.88878°
 original/export difference caused by omitted crystal-basis conversion.
 The native per-phase conversion now addresses that omission. Actual automatic
 P6 exports at pixels 83377, 57094 and 94780, without frame or detector-rotation
 overrides, differ from the original Oxford orientations by 0.904°, 0.805°
-and 1.187°. Serialization error is below 0.000011°. The earlier diagnostic
+and 1.187° in the earlier detector convention. With corrected CS3 calibration,
+fresh comparisons give 0.601°, 0.706° and 0.699°, with serialization below 0.000015°. The earlier diagnostic
 correct-basis comparison was about 0.90324°, with serialization error about
 0.00000397°. That point comparison does not validate every detector geometry
 or scan translation configuration. The ten fixed-orientation forward checks
@@ -160,7 +165,7 @@ used `px_um=0`; source/master c lengths differed (4.729 versus 4.684 angstroms).
 The preservation check retained all 144 non-pattern datasets and attributes,
 reducing a 2,457,095,971-byte source to about 62 MB.
 
-The same P6 check with the supplied ebsdsim version-3 Ti NPZ master produced
+An earlier check, before the CS3 correction, with the supplied ebsdsim version-3 Ti NPZ master produced
 native original/export differences of 0.976°, 0.766° and 1.196°. An actual
 browser-produced H5OINA file using that NPZ was reimported with native MTEX
 and differed by 0.965° at pixel 83377. The master is recognized through its
@@ -193,3 +198,9 @@ export. Orientations and effective detector attitude use the frozen indexing
 context and the existing native Oxford frame conversion; no extra rotation is
 introduced. The standard Oxford PCs therefore describe the acquisition rather
 than the fitted geometry used for these results.
+
+S05 ferrite validation uses native MTEX import of the original and exported
+Oxford files. At three well-indexed points, fresh solver/source differences are
+0.624°, 0.429° and 0.584°; export serialization is below 0.000015°. The source
+records a 180° scanning rotation. Old Oxford fitted projects and checkpoints
+require reindexing after this calibration change.

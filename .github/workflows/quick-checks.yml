@@ -28,5 +28,5 @@ jobs:
       - name: Export and scheduling regressions
         run: |
           node web/tests/export-hdf5.mjs
-          node web/tests/chunk-index-scheduler.mjs
+          node web/tests/scan-lifecycle.mjs
           node web/tests/gpu-loss.mjs

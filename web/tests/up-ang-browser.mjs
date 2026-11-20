@@ -32,6 +32,8 @@ const up1=makeUP("map.up1"),up2=makeUP("map.up2",true),ang=join(fixtures,"map.an
 const angHeader="# HEADER: Start\n# VERSION 7\n# x-star 0.43\n# y-star 0.72\n# z-star 0.61\n# CameraElevationAngle 10\n# GRID: SqrGrid\n# XSTEP: 0.025\n# YSTEP: 0.05\n# NCOLS_ODD: 3\n# NCOLS_EVEN: 3\n# NROWS: 2\n";
 const points=Array.from({length:6},(_,i)=>`0 0 0 ${(i%3)*.025} ${Math.floor(i/3)*.05} ${(i+1)*10} .8 1 1 .2`).join("\n")+"\n";
 writeFileSync(ang,angHeader+points);writeFileSync(bad,angHeader.replace("NROWS: 2","NROWS: 3")+points);
+const firstScan=join(fixtures,'first.h5oina'),secondScan=join(fixtures,'second.h5oina');
+writeFileSync(firstScan,'');writeFileSync(secondScan,'');
 const profile = mkdtempSync(join(tmpdir(), "up-ang-chrome-"));
 let chrome, ws;
 const wallTimeout = setTimeout(() => {
@@ -114,7 +116,10 @@ try {
   console.error('UP1 + ANG: second chooser, grid, scan steps and stored IQ passed');
   await evaluate(`ze.configure({roi_x:1,roi_y:1,roi_w:1,roi_h:1});`);
   await inputFiles('#file-scan',[up2]);
-  await evaluate(`await waitFor(()=>document.querySelector('#scan-info-dialog')?.open);document.querySelector('#scan-info-dialog button:not(.primary)').click();await pause(50);require(ze.scan.dtype==='uint8' && ze.scan.rows===2,'Cancel replaced scan');require(ze.settings.roi_w===1 && ze.settings.roi_x===1,'Cancel changed prior ROI');`);
+  await evaluate(`await waitFor(()=>document.querySelector('#scan-info-dialog')?.open);[...document.querySelectorAll('#scan-info-dialog button')].find(b=>b.textContent==='Cancel').click();await pause(50);require(ze.scan.dtype==='uint8' && ze.scan.rows===2,'Cancel replaced scan');require(ze.settings.roi_w===1 && ze.settings.roi_x===1,'Cancel changed prior ROI');`);
+  await evaluate(`window.scanBeforeRejectedSelection=ze._scanGeneration;`);
+  await inputFiles('#file-scan',[firstScan,secondScan]);
+  await evaluate(`await waitFor(()=>document.getElementById('status').textContent.includes('Multiple independent scans'));require(ze._scanGeneration===scanBeforeRejectedSelection,'Multiple scans replaced the open scan');require(ze.settings.roi_x===1 && ze.settings.roi_w===1,'Multiple scans changed the ROI');require(!document.querySelector('#scan-info-dialog'),'Multiple scans opened a companion prompt');`);
   await inputFiles('#file-scan',[bad,up2]);
   await evaluate(`await waitFor(()=>document.getElementById('status').classList.contains('err'));require(!document.querySelector('#scan-info-dialog'),'Already-paired selection prompted');require(ze.settings.roi_w===1,'Rejected scan changed prior ROI');`);
   await inputFiles('#file-scan',[ang,up2]);
@@ -167,7 +172,7 @@ try {
     await waitFor(()=>document.getElementById('app').dataset.busy==='0' && document.getElementById('status').classList.contains('err'));
     require(JSON.stringify(ze.settings)===beforeRejectedOpen.settings,'Rejected native open changed settings');
     require(JSON.stringify(ze.geometry)===beforeRejectedOpen.geometry,'Rejected native open changed geometry');
-    require(ze._scanGeneration===beforeRejectedOpen.generation,'Rejected open invalidated prior scan warmup');
+    require(ze._scanGeneration===beforeRejectedOpen.generation,'Rejected open changed the scan generation');
     require(ze.scan.dtype==='uint16' && (await ze.storedOverview()).values[5]===60,'Rejected native open replaced source');
     require(document.getElementById('overview-source').textContent.toLowerCase().includes('image quality'),'Rejected open lost old map');
   `);

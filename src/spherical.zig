@@ -494,7 +494,7 @@ pub const Spherical = struct {
     /// exact ordinary SI peak. Extra ranks are normalized quotient-grid local
     /// maxima, refined with the ordinary interpolation, separated under the
     /// phase's proper LEFT rotation group. Missing ranks have score -2 and q=0.
-    pub fn candidatePeaks(self: *Spherical, ph: *const PhaseGpu, n_items: u32, rden: Bind, rden_div: u32, group: sym.Laue, keep_n: u32, out: [][8]f32) !void {
+    pub fn candidatePeaks(self: *Spherical, ph: *const PhaseGpu, n_items: u32, rden: Bind, rden_div: u32, ops: []const rot.Quat, keep_n: u32, out: [][8]f32) !void {
         if (keep_n == 0 or keep_n > 8 or out.len != @as(usize, n_items) * keep_n) return error.BadCandidateCount;
         const g = self.g;
         const t = self.t;
@@ -568,7 +568,7 @@ pub const Spherical = struct {
                     after = key;
                     var distinct = true;
                     for (0..count) |rank| {
-                        if (sym.disorientation(peakQuat(peak), peakQuat(out[rank * n_items + item]), group) <= spacing) {
+                        if (sym.disorientation(peakQuat(peak), peakQuat(out[rank * n_items + item]), ops) <= spacing) {
                             distinct = false;
                             break;
                         }

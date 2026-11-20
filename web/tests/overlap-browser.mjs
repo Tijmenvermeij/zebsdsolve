@@ -83,9 +83,10 @@ try {
     document.getElementById('pat-live').checked=false;
     document.getElementById('btn-example').click();
     await waitFor(()=>document.getElementById('app').dataset.busy==='0' && ze.scan.rows===55,'example');console.log('example ready');
+    await waitFor(()=>document.getElementById('log').textContent.includes('overview: 4,125 patterns'),'scan overview');
     window.configureUI=async(settings)=>{
       ze.configure(settings);
-      const label=[...document.querySelectorAll('.field')].find(el=>el.querySelector('span')?.textContent==='bandwidth L');
+      const label=document.querySelector('.field[data-key="bandwidth"]');
       const input=label.querySelector('input');input.value=String(ze.settings.bandwidth);input.dispatchEvent(new Event('change',{bubbles:true}));
       await ze._queue;await pause(10);
     };

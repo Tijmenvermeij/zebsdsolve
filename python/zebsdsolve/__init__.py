@@ -28,7 +28,7 @@ import numpy as np
 
 from . import _native as _n
 
-__version__ = "0.2.0"
+__version__ = "0.2.2"
 
 _lib = None
 _wgpu = None
@@ -36,6 +36,7 @@ _wgpu = None
 LAUE = {1: "-1", 2: "2/m", 3: "mmm", 4: "4/m", 5: "4/mmm", 6: "-3", 7: "-3m", 8: "6/m", 9: "6/mmm", 10: "m-3", 11: "m-3m"}
 # What the geometry's plane of source points is (`fit_plane`).
 PLANE_KINDS = ("none", "affine", "projective")
+PLANE_MODELS = ("centre", "line", "affine", "projective")
 METHODS = ("spherical", "dictionary", "pca")
 MAPS = {"ipf_x": 0, "ipf_y": 1, "ipf_z": 2, "ncc": 3, "nmi": 4, "phase": 5, "z": 6, "sweep": 7}
 
@@ -178,9 +179,8 @@ class Solver:
             "plane_kind": PLANE_KINDS[g.plane_kind], "plane": [list(g.plane[3 * k:3 * k + 3]) for k in range(4)],
         }
 
-    def set_geometry(self, **fields):
-        """Set any of the geometry's fields, e.g. ``set_geometry(pc=(0.5, 0.2, 0.5), px_um=70)``.
-        ``px_um=0`` puts the pixel size back to the scan's own, or the one its detector's width gives."""
+    def _geometry_with(self, fields):
+        """The geometry in use with the given fields changed, as the native struct."""
         g = _n.Geometry()
         self._lib.ze_get_geometry(self._e, ctypes.byref(g))
         for k, v in fields.items():
@@ -194,36 +194,38 @@ class Solver:
                 setattr(g, k, float(v))
             else:
                 raise Error(f"geometry has no field {k!r}")
+        return g
+
+    def set_geometry(self, **fields):
+        """Set any of the geometry's fields, e.g. ``set_geometry(pc=(0.5, 0.2, 0.5), px_um=70)``.
+        ``px_um=0`` puts the pixel size back to the scan's own, or the one its detector's width gives."""
+        g = self._geometry_with(fields)
         self._lib.ze_set_geometry(self._e, ctypes.byref(g))
         return self
 
+    def cell_under(self, cell, bandwidth=None, full=False, **fields):
+        """Index one map cell and simulate it under another geometry than the one in use, which
+        stays as it is: the fields given change it as for `set_geometry`, e.g.
+        ``cell_under(c, pc=file_pc)`` to set two pattern centres side by side. The spherical
+        correlation at `bandwidth` (the pattern-centre fit's, `fit_bandwidth`, unless given), then
+        the refinement. Returns the best phase's {phase, quaternion, ncc, nmi, simulation}."""
+        g = self._geometry_with(fields)
+        n_ph = self._lib.ze_phase_count(self._e)
+        recs = np.empty(n_ph * 8, np.float32)
+        h, w = self.shape(full)
+        sim = np.empty(h * w, np.float32)
+        bw = int(bandwidth or self.settings["fit_bandwidth"])
+        p = self._check(self._lib.ze_cell_under(self._e, int(cell), ctypes.byref(g), bw, 1 if full else 0, _ptr(recs, _n.f32p), recs.size, _ptr(sim, _n.f32p), sim.size), "cell_under")
+        r = recs.reshape(n_ph, 8)[p]
+        return {"phase": int(p), "quaternion": r[:4].copy(), "ncc": float(r[4]), "nmi": float(r[5]), "simulation": sim.reshape(h, w)}
+
     # ── scan ──
-
-    @property
-    def index_preparation(self):
-        """Chunk lookup readiness and cumulative pattern-file IO counters."""
-        out = (ctypes.c_uint64 * 6)()
-        self._lib.ze_chunk_index_status(self._e, out)
-        return dict(zip(('ready', 'failed', 'visited', 'pending', 'reads', 'bytes'), map(int, out)))
-
-    def prepare_index_step(self, max_nodes=8, max_bytes=65536):
-        """Prepare one bounded chunk-lookup batch; return True only when complete.
-
-        Pattern previews work immediately using targeted lookups. Call this between
-        foreground operations; a Solver must not be used concurrently from threads.
-        """
-        if not 0 < max_nodes <= 0xffffffff or not 0 < max_bytes <= 0xffffffff:
-            raise ValueError("Chunk index budgets must be positive uint32 values")
-        return bool(self._check(self._lib.ze_prepare_index_step(self._e, max_nodes, max_bytes), "prepare_index"))
-
-    def prepare_index(self):
-        """Finish the full chunk lookup. Later previews/indexing use it automatically."""
-        while not self.prepare_index_step(max_bytes=8*1024*1024):
-            pass
 
     def open(self, *paths):
         """Open a scan file, and any side files it needs after it. NORDIF's Pattern.dat needs its
-        Setting.txt, which is picked up from beside it when not given."""
+        Setting.txt, which is picked up from beside it when not given; an EDAX .up1 / .up2 can take
+        its scan's .ang (the map's shape, the steps, image quality and the pattern centre). The
+        region of interest goes back to the whole map."""
         paths = [str(p) for p in paths]
         if len(paths) == 1 and paths[0].lower().endswith(".dat"):
             side = os.path.join(os.path.dirname(paths[0]), "Setting.txt")
@@ -291,7 +293,7 @@ class Solver:
         fmt = buf.raw[:n].decode()
         return {
             "rows": s.rows, "cols": s.cols, "pattern_shape": (s.pat_h, s.pat_w), "dtype": ["uint8", "uint16", "float32"][s.pixel],
-            "format": fmt, "has_background": bool(s.has_background), "has_pc": bool(s.has_pc), "has_px": bool(s.has_px),
+            "format": fmt, "has_background": bool(s.has_background), "has_pc": bool(s.has_pc), "has_px": bool(s.has_px), "geometry_frame": s.geometry_frame,
             "voltage_kv": s.voltage_kv or None, "bytes": int(s.bytes),
         }
 
@@ -497,7 +499,8 @@ class Solver:
         the detector, six unknowns a pattern, from the geometry as it stands (a source may
         move `plane_trust` pattern heights). Then the transformation of the scan's indices
         that passes through those points is fitted by least squares: `plane_kind` "affine"
-        (nine numbers) or "projective" (eleven). `plane_weights` "information" weighs each
+        (nine numbers) or "projective" (eleven, its two slopes held near zero unless the
+        points tell them). `plane_weights` "information" weighs each
         point by how sharply its own pattern tells it, which is what lets thousands of small
         patterns stand in for a few large calibration patterns; "equal" weighs them alike, as
         kikuchipy does. Points further than `plane_outlier` robust standard deviations from
@@ -528,9 +531,13 @@ class Solver:
     def fit_geometry(self):
         """The automatic fit, from the geometry as it was given (by the scan or by
         `set_geometry`; what earlier fits left is not used, so the same scan and settings give
-        the same fit): the vote for the pattern centre (`fit_pc`), then the plane of source
-        points from there (`fit_plane`). Returns the dict `fit_plane` does; its start_pc is the
-        vote's pattern centre."""
+        the same fit): the vote for the pattern centre (`fit_pc`), then the fit patterns' own
+        source points from there, and of the ways they may move over the scan the simplest the
+        map supports: one centre (the vote's geometry stays), a tilt line (PCx the same
+        everywhere, PCy and PCz along the rows) or the plane (`plane_kind`). Each is asked where
+        a block of the map stands from the others; `models` gives each one's error so (`cv`,
+        and `cv_se`, the standard error of its difference from the best), `model` the one taken.
+        Otherwise the dict `fit_plane` returns; its start_pc is the vote's pattern centre."""
         r = _n.PlaneResult()
         self._check(self._lib.ze_fit_auto(self._e, ctypes.byref(r)), "fit_geometry")
         return self._plane_result(r)
@@ -539,6 +546,8 @@ class Solver:
         inferred_tilt = not self.has_acquisition_calibration
         return {
             "plane": np.array(r.plane, dtype=np.float64).reshape(4, 3), "kind": PLANE_KINDS[r.kind], "frame": ("nominal", "follow")[r.frame],
+            "model": PLANE_MODELS[r.model], "method": ("joint", "points")[r.method],
+            "models": {m: {"cv": r.cv[i], "cv_se": r.cv_se[i]} for i, m in enumerate(PLANE_MODELS) if r.compared and r.cv[i] > 0},
             "pc": list(r.pc), "pc_se": list(r.pc_se), "start_pc": list(r.start_pc), "rot": list(r.rot),
             "n_patterns": r.n_patterns, "n_used": r.n_used, "rmsd": list(r.rmsd), "ncc": r.ncc, "start_ncc": r.start_ncc, "iterations": r.iterations,
             "said": {
@@ -1319,7 +1328,7 @@ class Solver:
     def reduce(self, quaternions, phase=0):
         """Explicit symmetry reduction: (quaternions, euler), each quaternion's
         representative in the phase's fundamental zone and its Bunge angles (radians). The zone
-        is that of the proper rotations of the phase's point group (for GaN, 6mm, the six about
+        uses the native proper rotations in the master's own axes (for GaN, 6mm, the six about
         c: not its Laue class's twelve, half of which turn the polar axis over)."""
         q = _f32(quaternions).reshape(-1, 4).copy()
         euler = np.empty((len(q), 3), np.float64)

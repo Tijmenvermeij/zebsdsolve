@@ -1,13 +1,23 @@
 import assert from 'node:assert/strict';
-import {geometryConvention,canRestoreGeometry} from '../app/js/oxford-export-policy.js';
-for(const format of ['Oxford h5oina','h5_oxford']){
- assert.equal(geometryConvention(format,2),'oxford-calibrated-v2');
- assert.ok(canRestoreGeometry('oxford-calibrated-v2',format,2));
- for(const old of [undefined,'oxford-calibrated-v1','generic-v1','oxford-fallback-v1'])assert.ok(!canRestoreGeometry(old,format,2));
- assert.equal(geometryConvention(format,0),'oxford-fallback-v1');assert.ok(canRestoreGeometry('oxford-fallback-v1',format,0));
- assert.ok(!canRestoreGeometry('oxford-calibrated-v2',format,0));
- assert.equal(geometryConvention(format),'oxford-unversioned');assert.ok(!canRestoreGeometry('oxford-unversioned',format));
+import {geometryConvention, acceptsGeometryConvention} from '../app/js/oxford-export-policy.js';
+
+for (const format of ['Oxford h5oina', 'h5_oxford']) {
+  const calibrated = {format, geometryFrame:2};
+  assert.equal(geometryConvention(calibrated), 'oxford-calibrated-v3');
+  assert.ok(acceptsGeometryConvention(calibrated, 'oxford-calibrated-v3'));
+  for (const old of [undefined, 'oxford-calibrated-v1', 'oxford-calibrated-v2', 'generic-v1', 'oxford-fallback-v1']) {
+    assert.ok(!acceptsGeometryConvention(calibrated, old));
+  }
+  const fallback = {format, geometryFrame:3};
+  assert.equal(geometryConvention(fallback), 'oxford-fallback-v1');
+  assert.ok(acceptsGeometryConvention(fallback, 'oxford-fallback-v1'));
+  assert.ok(acceptsGeometryConvention(fallback, 'oxford-calibrated-v1'));
+  assert.ok(!acceptsGeometryConvention(fallback, 'oxford-calibrated-v3'));
 }
-for(const oxford of ['oxford-calibrated-v1','oxford-calibrated-v2','oxford-unversioned','oxford-fallback-v1'])assert.ok(!canRestoreGeometry(oxford,'EMsoft H5',0));
-assert.equal(geometryConvention('EMsoft H5',2),'generic-v1');assert.ok(canRestoreGeometry(undefined,'EMsoft H5',2));
-console.log('geometry persistence: supported v2, explicit fallback, old fitted residuals blocked, generic unaffected');
+const generic = {format:'EMsoft H5', geometryFrame:0};
+assert.equal(geometryConvention(generic), 'generic-v1');
+assert.ok(acceptsGeometryConvention(generic, undefined));
+for (const saved of ['oxford-calibrated-v1','oxford-calibrated-v2','oxford-calibrated-v3','oxford-unversioned','oxford-fallback-v1']) {
+  assert.ok(!acceptsGeometryConvention(generic, saved));
+}
+console.log('Published Oxford geometry markers, fallback migration, and cross-format guards pass');

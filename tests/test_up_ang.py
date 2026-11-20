@@ -1,8 +1,8 @@
-"""UP stream + ANG scalar/grid adapter; native pyMTEX ANG import is the metadata oracle.
+"""UP stream + ANG scalar/grid adapter, checked against explicit fixture values.
 
 ANG uses EDAX micrometres, x-fast/y-next increasing raster order. No ANG orientations,
 phases or acquisition calibration enter the engine. Pattern centre is a scalar-only,
-producer-specific detector normalization, independent of MTEX orientation import. All temporary fixtures are local.
+producer-specific detector normalization. All temporary fixtures are local.
 """
 from pathlib import Path
 import struct
@@ -12,7 +12,6 @@ import sys
 import tempfile
 import unittest
 import numpy as np
-from mtex import loadEBSD
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT/'python'))
 from zebsdsolve import Solver, Error
@@ -46,13 +45,8 @@ class UpAng(unittest.TestCase):
                        for r in range(rows) for c in range(cols)]
         path.write_text('\r\n'.join(head+[' '.join(str(v) for v in row) for row in records]))
         return path, np.asarray(records)
-    def test_version_pixel_matrix_and_native_mtex_metadata_oracle(self):
+    def test_version_pixel_matrix_and_scalar_metadata(self):
         ang, records = self.ang(extra_cols=3)
-        oracle = loadEBSD(str(ang), grid=False, setting=0)
-        self.assertEqual(str(oracle.scanUnit), 'um')
-        np.testing.assert_allclose(oracle.x, records[:,3])
-        np.testing.assert_allclose(oracle.y, records[:,4])
-        np.testing.assert_allclose(oracle.prop['iq'], records[:,5])
         for version in [1,3,4]:
             for bits in [8,16]:
                 with self.subTest(version=version,bits=bits), Solver() as s:
@@ -65,18 +59,12 @@ class UpAng(unittest.TestCase):
                     self.assertFalse(s.scan['has_pc'])
                     self.assertFalse(s.has_acquisition_calibration)
                     self.assertEqual(s.phases, [])
-                    stats = s.index_preparation
-                    self.assertEqual(stats['bytes'],24 if version == 1 else 50)
-                    self.assertEqual(stats['reads'],2 if version == 1 else 3)
                     overview = s.stored_overview()
                     self.assertEqual(overview['kind'],2)
                     self.assertEqual(overview['label'],'Image quality')
                     np.testing.assert_array_equal(overview['values'], records[:,5].reshape(2,3))
-                    self.assertEqual(s.index_preparation,stats)
                     for cell in [0,4,5]:
                         np.testing.assert_array_equal(s.pattern(cell,processed=False,full=True),patterns[cell])
-                    self.assertGreater(s.index_preparation['bytes'],stats['bytes'])
-                    self.assertGreater(s.index_preparation['reads'],stats['reads'])
     def test_standalone_raw_and_embedded_geometry(self):
         for version in [1,3,4]:
             with self.subTest(version=version), Solver() as s:
@@ -113,6 +101,13 @@ class UpAng(unittest.TestCase):
         with Solver() as s:
             s.open(up)
             self.assertEqual((s.scan['rows'],s.scan['cols']), (1,6))
+    def test_up_step_drift_accumulates_across_wide_scan(self):
+        up, _ = self.up(version=3, cols=4096, dx=.025004)
+        ang, _ = self.ang(cols=4096, dx=.025)
+        with Solver() as s:
+            with self.assertRaisesRegex(Error, "UPANGStepMismatch"):
+                s.open(up, ang)
+
     def test_duplicate_sidecar_and_hint_conflicts(self):
         ang,_ = self.ang();up,_ = self.up()
         with Solver() as s:
@@ -141,6 +136,23 @@ class UpAng(unittest.TestCase):
             with self.subTest(options=options),Solver() as s:
                 ang,_=self.ang(**options)
                 with self.assertRaisesRegex(Error,error):s.open(up,ang)
+    def test_header_boundaries_and_duplicate_grid_metadata(self):
+        up, _ = self.up()
+        ang, _ = self.ang()
+        original = ang.read_text()
+        with Solver() as s:
+            ang.write_text("# OPERATOR: Giacomo\n" + original)
+            s.open(up, ang)
+            for prefix, suffix, error in [
+                ("# File created from (ACOM) data\n", "", "UnsupportedANGConvention"),
+                ("# NROWS: 2\n", "", "DuplicateANGMetadata"),
+                ("", "\n# XSTEP: .025\n", "InvalidANGRecord"),
+            ]:
+                with self.subTest(error=error):
+                    ang.write_text(prefix + original + suffix)
+                    with self.assertRaisesRegex(Error, error):
+                        s.open(up, ang)
+
     def test_explicit_columns_units_and_missing_iq_values(self):
         up,_=self.up(); _,standard=self.ang()
         reordered=standard[:,[0,1,2,6,5,4,3,7,8,9]]
@@ -169,8 +181,6 @@ class UpAng(unittest.TestCase):
                 positions = np.float32(origin) + np.arange(1000, dtype=np.float32)*np.float32(step)
                 records[:,3] = np.tile(np.round(positions.astype(float),5),2)
                 ang,_ = self.ang(rows=2, cols=1000, dx=step, records=records)
-                oracle = loadEBSD(str(ang), grid=False, setting=0)
-                np.testing.assert_array_equal(oracle.x, records[:,3])
                 with Solver() as s:
                     s.open(up,ang)
                     np.testing.assert_array_equal(s.stored_overview()['values'],records[:,5].reshape(2,1000))
@@ -181,10 +191,12 @@ class UpAng(unittest.TestCase):
     def test_ambiguous_coordinate_precision_is_rejected(self):
         up,_ = self.up()
         _, records = self.ang()
-        records[:,3] = np.float32(1e9) + (records[:,3]-10).astype('f4')
-        ang,_ = self.ang(records=records)
-        with Solver() as s:
-            with self.assertRaisesRegex(Error,'ANGCoordinatePrecisionInsufficient'):s.open(up,ang)
+        for origin in (1e9, 1e20):
+            records[:, 3] = origin
+            ang, _ = self.ang(records=records)
+            with self.subTest(origin=origin), Solver() as s:
+                with self.assertRaisesRegex(Error, "ANGCoordinatePrecisionInsufficient"):
+                    s.open(up, ang)
         # Double precision positions with the same large origin remain identifiable.
         records[:,3] = 1e9 + np.tile(np.arange(3)*.025,2)
         ang,_ = self.ang(records=records)
@@ -194,14 +206,18 @@ class UpAng(unittest.TestCase):
         ang,records=self.ang()
         text=ang.read_text()
         if producer == 'edax': text='# HEADER: Start\n'+text
-        elif producer == 'zebsdsolve': pass # explicit marker below wins over inherited VERSION
+        elif producer in ('zebsdsolve', 'zebsdsolve_edax'): pass # explicit marker wins over inherited VERSION
         elif producer == 'legacy':
             text=text.replace('# VERSION 7\n','').replace('# MaterialName Nickel','# MaterialName')
             text=text.replace('# LatticeConstants', '# NumberFamilies 0\n# LatticeConstants')
             text=text.replace('# GRID:', ('# ElasticConstants 0 0 0 0 0 0\n'*6)+'# Categories\n# OPERATOR: unknown\n# SAMPLEID:\n# SCANID:\n# GRID:')
         elif producer == 'unknown': text=text.replace('# VERSION 7\n','')
         elif producer != 'overlap': raise AssertionError(producer)
-        marker={'zebsdsolve':'# SOFTWARE: zebsdsolve 0.2.0','overlap':'# VERSION Overlap-GUI positive phase IDs'}.get(producer,'')
+        marker = {
+            "zebsdsolve": "# SOFTWARE: zebsdsolve 0.2.0",
+            "zebsdsolve_edax": "# SOFTWARE: zebsdsolve 0.2.2 (EDAX pattern centre)",
+            "overlap": "# VERSION Overlap-GUI positive phase IDs",
+        }.get(producer, "")
         # Keep all metadata before records; the scalar parser never reads Euler columns.
         lines=text.splitlines();first=next(i for i,line in enumerate(lines) if not line.startswith('#'))
         lines[first:first]=([marker] if marker else [])+pc_lines
@@ -210,18 +226,15 @@ class UpAng(unittest.TestCase):
     def test_ang_pc_producer_normalizations_use_stored_detector_shape(self):
         raw=np.array([.43,.27,.61])
         headers=[f'# {axis}-star: {value}' for axis,value in zip('xyz',raw)]
-        for producer in ['edax','zebsdsolve','overlap','legacy']:
+        for producer in ['edax','zebsdsolve_edax','zebsdsolve','overlap','legacy']:
             for width,height in [(16,8),(8,16),(8,8)]:
                 with self.subTest(producer=producer,width=width,height=height),Solver() as s:
                     up,_=self.up(pat_w=width,pat_h=height)
                     ang,records=self.pc_ang(headers,producer)
-                    # pyMTEX exposes the original stars, but has no typed PC conversion.
-                    oracle=loadEBSD(str(ang),grid=False,setting=0)
-                    np.testing.assert_array_equal([oracle.meta['header'][axis+'_star'] for axis in 'xyz'],raw)
                     s.configure(binning=2)
                     s.set_geometry(sample_tilt_deg=-20,detector_tilt_deg=4)
                     s.open(up,ang)
-                    expected=[raw[0],1-raw[1],raw[2]*min(width,height)/height] if producer=='edax' else [raw[0],1-raw[1]*width/height,raw[2]*width/height]
+                    expected=[raw[0],1-raw[1],raw[2]*min(width,height)/height] if producer in ('edax', 'zebsdsolve_edax') else [raw[0],1-raw[1]*width/height,raw[2]*width/height]
                     np.testing.assert_allclose(s.geometry['pc'],expected,atol=1e-14,rtol=0)
                     self.assertTrue(s.scan['has_pc'])
                     self.assertFalse(s.has_acquisition_calibration)
@@ -230,6 +243,22 @@ class UpAng(unittest.TestCase):
                     self.assertEqual(s.phases,[])
                     np.testing.assert_array_equal(s.stored_overview()['values'],records[:,5].reshape(2,3))
                     self.assertTrue(any('Imported ANG pattern centre:' in event.get('text','') for event in s.events()))
+    def test_edax_hdf5_pattern_centre_matches_ang_convention(self):
+        path = self.root / "scan.h5"
+        for width, height in [(16, 8), (8, 16)]:
+            with self.subTest(width=width, height=height), Solver() as s:
+                with h5py.File(path, "w") as f:
+                    header = f.create_group("1/EBSD/Header")
+                    header["nRows"] = [2]
+                    header["nColumns"] = [3]
+                    pc = header.create_group("Pattern Center Calibration")
+                    pc["x-star"], pc["y-star"], pc["z-star"] = [.43], [.27], [.61]
+                    f["1/EBSD/Data/Pattern"] = np.zeros((6, height, width), dtype="u1")
+                s.open(path)
+                self.assertTrue(s.scan["has_pc"])
+                expected = [.43, .73, .61 * min(width, height) / height]
+                np.testing.assert_allclose(s.geometry["pc"], expected, atol=1e-14, rtol=0)
+
     def test_ang_pc_explicit_producers_outrank_structural_hints(self):
         raw=[.43,.27,.61]
         pc=[f'# {axis}-star {value}' for axis,value in zip('xyz',raw)]
@@ -336,14 +365,12 @@ class UpAng(unittest.TestCase):
             s.index()
             before=s.export_snapshot()
             settings=s.settings;geometry=s.geometry;scan=s.scan;overview=s.stored_overview()['values'].copy()
-            stats=s.index_preparation
             patch={'bandwidth':32,'mask':False,'roi_x':2,'roi_w':1,'static_background':'average'}
             with self.assertRaisesRegex(Error,'ScanShapeMismatch'):
                 self.configured_open(s,[up,ang],patch,{'map_rows':3,'map_cols':2})
             self.assertEqual(s.settings,settings);self.assertEqual(s.geometry,geometry);self.assertEqual(s.scan,scan)
             self.assertEqual(s.export_snapshot(),before)
             np.testing.assert_array_equal(s.stored_overview()['values'],overview)
-            self.assertEqual(s.index_preparation,stats)
             # A bad settings patch must fail before even attempting a missing input.
             with self.assertRaisesRegex(Error,'BadSetting'):
                 self.configured_open(s,[self.root/'missing.up1'],{'bandwidth':3})
@@ -356,7 +383,6 @@ class UpAng(unittest.TestCase):
             # Ordinary open shares the staged path and must preserve the same live state.
             with self.assertRaisesRegex(Error,'ANGCoordinatesNotRowMajor'):s.open(up,ang)
             self.assertEqual(s.export_snapshot(),before);self.assertEqual(s.settings,settings)
-            self.assertEqual(s.index_preparation,stats)
             # No failed full-settings restore may have made the automatic mask explicit.
             s.open(self.oxford_fixture())
             self.assertFalse(s.settings['mask'])
@@ -387,9 +413,7 @@ class UpAng(unittest.TestCase):
         self.assertGreater(ang.stat().st_size,65536)
         with Solver() as s:
             s.open(up,ang)
-            stats=s.index_preparation
             np.testing.assert_array_equal(s.stored_overview()['values'],records[:,5].reshape(rows,cols))
-            self.assertEqual(s.index_preparation,stats)
             s.open(up)
             self.assertIsNone(s.stored_overview())
             s.set_patterns(np.zeros((1,1,8,10),dtype='u1'))

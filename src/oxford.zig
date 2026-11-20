@@ -33,8 +33,16 @@ pub const Calibration = struct {
         if (!std.math.isFinite(m.tilt_axis)) return .unknown_tilt_axis;
         if (@abs(m.tilt_axis) > 1e-6) return .unsupported_tilt_axis;
         if (!std.math.isFinite(m.scanning_rotation)) return .unknown_scan_rotation;
-        if (@abs(m.scanning_rotation) > 1e-6) return .unsupported_scan_rotation;
+        if (scanDirection(m.scanning_rotation) == null) return .unsupported_scan_rotation;
         return .supported;
+    }
+
+    /// Settings signs describe the zero-angle raster basis. Oxford's scan
+    /// rotation changes beam travel, not the detector pose or CS1 orientations.
+    /// Apply the acquisition half turn once, retaining both caller preferences.
+    pub fn scanSigns(self: Calibration, x: i32, y: i32) [2]i32 {
+        const direction = if (self.status() == .supported) scanDirection(self.metadata.?.scanning_rotation).? else 1;
+        return .{ direction * x, direction * y };
     }
 
     pub fn requireSupported(self: Calibration) !void {
@@ -57,11 +65,11 @@ pub const Calibration = struct {
         if (self.status() != .supported) return g.nominal();
         const m = self.metadata.?;
         const tilt = std.math.degreesToRadians(g.sample_tilt_deg);
-        // D maps detector gnomonic axes to Oxford microscope axes. fromBunge
-        // gives the passive matrix, so transpose it once for this direction.
-        const detector_to_microscope = rot.transpose(rot.toMat(rot.fromBunge(m.detector_euler)));
-        const untilt = rot.toMat(rot.so3Exp(.{ -tilt, 0, 0 }));
-        const base = rot.matMul(rot.matMul(rot.matMul(rot.transpose(rot.toMat(sampleBasis())), untilt), detector_to_microscope), gnomonicBasis());
+        // Oxford D maps detector CS3 to the microscope frame. fromBunge
+        // is passive, so transpose it to obtain the source-defined active D.
+        const detector = rot.transpose(rot.toMat(rot.fromBunge(m.detector_euler)));
+        const a = rot.toMat(rot.so3Exp(.{ -tilt, 0, 0 }));
+        const base = rot.matMul(rot.matMul(rot.matMul(rot.transpose(rot.toMat(sampleBasis())), a), detector), rasterBasis());
         return rot.matMul(base, rot.toMat(rot.so3Exp(.{ 0, std.math.degreesToRadians(g.detector_tilt_deg), 0 })));
     }
 
@@ -77,9 +85,9 @@ pub const Calibration = struct {
     /// This includes fitted residuals without changing the fixed sample basis.
     pub fn effectiveDetectorEuler(self: Calibration, g: *const Geometry) !rot.Vec3 {
         try self.requireSupported();
-        const tilt = rot.toMat(rot.so3Exp(.{ std.math.degreesToRadians(g.sample_tilt_deg), 0, 0 }));
-        const detector_to_microscope = rot.matMul(rot.matMul(rot.matMul(tilt, rot.toMat(sampleBasis())), self.rotation(g)), rot.transpose(gnomonicBasis()));
-        return rot.toBunge(rot.fromMat(rot.transpose(detector_to_microscope)));
+        const a = rot.toMat(rot.so3Exp(.{ std.math.degreesToRadians(g.sample_tilt_deg), 0, 0 }));
+        const detector = rot.matMul(rot.matMul(rot.matMul(a, rot.toMat(sampleBasis())), self.rotation(g)), rot.transpose(rasterBasis()));
+        return rot.toBunge(rot.fromMat(rot.transpose(detector)));
     }
 
     pub fn eql(a: Calibration, b: Calibration) bool {
@@ -98,8 +106,7 @@ pub const Calibration = struct {
     /// Oxford attitude change identity when its interpretation changes.
     pub fn hashDetectorAttitude(self: Calibration, h: anytype) void {
         if (self.detectorAttitudeVersion() != 0) {
-            h.update(detector_attitude_convention);
-            h.update(&.{detector_attitude_convention_version});
+            h.update("oxford-detector-cs3-v2");
         }
     }
 
@@ -116,6 +123,19 @@ pub const Calibration = struct {
     }
 };
 
+/// Only zero and a half turn, modulo one full turn, have validated raster
+/// geometry. Oxford stores radians in float32; tolerate that rounding only.
+fn scanDirection(angle: f64) ?i32 {
+    if (!std.math.isFinite(angle)) return null;
+    // Preserve the complete previously supported interval at its exact edges.
+    if (@abs(angle) <= 1e-6) return 1;
+    const full = 2 * std.math.pi;
+    const wrapped = @mod(angle, full);
+    if (@min(wrapped, full - wrapped) <= 1e-6) return 1;
+    if (@abs(wrapped - std.math.pi) <= 1e-6) return -1;
+    return null;
+}
+
 fn same(a: f64, b: f64) bool {
     return a == b or (std.math.isNan(a) and std.math.isNan(b));
 }
@@ -125,9 +145,9 @@ pub fn sampleBasis() rot.Quat {
     return rot.so3Exp(.{ 0, 0, std.math.pi / 2.0 });
 }
 
-/// Engine (row down, column right, depth out) to Oxford detector gnomonic
-/// (right, up, out): (column, -row, depth).
-fn gnomonicBasis() rot.Mat3 {
+/// Engine detector row/column/ray-depth -> Oxford CS3: (column,-row,depth).
+/// Oxford x points right, y up from the bottom-left origin, z into the screen.
+pub fn rasterBasis() rot.Mat3 {
     return .{ 0, 1, 0, -1, 0, 0, 0, 0, 1 };
 }
 
@@ -250,31 +270,88 @@ test "only supported Oxford calibrations acquire the corrected detector attitude
 
 test "Oxford per-cell positions and plane frame use the calibrated baseline" {
     const c: Calibration = .{ .metadata = .{ .detector_euler = .{ 0.00722032, 1.5679878, 0.00296268 }, .specimen_euler = .{ 0, 0, 0 }, .tilt_axis = 0, .scanning_rotation = 0, .original_tilt = -std.math.pi / 9.0 } };
-    var g: Geometry = .{ .pc = .{ 0.42, 0.21, 0.5 }, .sample_tilt_deg = -20, .rot = .{ 0.02, -0.03, 0.04 }, .px_um = 70, .step_x_um = 2, .step_y_um = 3 };
-    const R = c.rotation(&g);
-    const t = g.positionForRotation(R, 4, 6, 3, 5, -1, -1, 2.5, 24.4, 32.4);
-    const want = rot.sub(c.translation(&g, 24.4, 32.4), g.scanOffset(4, 6, 3, 5, -1, -1, 2.5));
-    for (t, want) |a, b| try std.testing.expectApproxEqAbs(a, b, 1e-12);
-    // Construct an affine plane from calibrated step-model PCs. Fitting and decoding it
-    // must recover the same residual relative to Oxford's full nominal attitude.
-    const plane = @import("plane.zig");
-    const rows = 30;
-    const cols = 40;
-    const fr = plane.Frame.of(rows, cols, 1.25);
-    var points: [30]plane.Point = undefined;
-    for (0..30) |k| {
-        const row: f64 = @floatFromInt((k * 7) % rows);
-        const col: f64 = @floatFromInt((k * 11) % cols);
-        const p = g.positionForRotation(R, row, col, fr.r0, fr.c0, -1, -1, 1, 60, 75);
-        const pc = Geometry.pcOf(R, p, 60, 75);
-        points[k] = .{ .col = col, .row = row, .y = .{ pc[0] * fr.aspect, pc[1], pc[2] } };
+    for ([_]f64{ 0, std.math.pi }) |angle| {
+        var calibrated = c;
+        calibrated.metadata.?.scanning_rotation = angle;
+        const signs = calibrated.scanSigns(-1, 1);
+        var g: Geometry = .{ .pc = .{ 0.42, 0.21, 0.5 }, .sample_tilt_deg = -20, .rot = .{ 0.02, -0.03, 0.04 }, .px_um = 70, .step_x_um = 2, .step_y_um = 3 };
+        const R = calibrated.rotation(&g);
+        const t = g.positionForRotation(R, 4, 6, 3, 5, signs[0], signs[1], 2.5, 24.4, 32.4);
+        const want = rot.sub(calibrated.translation(&g, 24.4, 32.4), g.scanOffset(4, 6, 3, 5, signs[0], signs[1], 2.5));
+        for (t, want) |a, b| try std.testing.expectApproxEqAbs(a, b, 1e-12);
+        // Construct an affine plane from calibrated step-model PCs. Fitting and decoding it
+        // must recover the same residual relative to Oxford's full nominal attitude.
+        const plane = @import("plane.zig");
+        const rows = 30;
+        const cols = 40;
+        const fr = plane.Frame.of(rows, cols, 1.25);
+        var points: [30]plane.Point = undefined;
+        for (0..30) |k| {
+            const row: f64 = @floatFromInt((k * 7) % rows);
+            const col: f64 = @floatFromInt((k * 11) % cols);
+            const p = g.positionForRotation(R, row, col, fr.r0, fr.c0, signs[0], signs[1], 1, 60, 75);
+            const pc = Geometry.pcOf(R, p, 60, 75);
+            points[k] = .{ .col = col, .row = row, .y = .{ pc[0] * fr.aspect, pc[1], pc[2] } };
+        }
+        g.plane = plane.fit(.affine, &points, fr).?;
+        g.plane_kind = 1;
+        const pc = plane.at(g.plane, 4, 6);
+        const got = Geometry.pcOf(R, g.positionForRotation(R, 4, 6, fr.r0, fr.c0, signs[0], signs[1], 2.5, 24.4, 30.5), 24.4, 30.5);
+        for (pc, got) |a, b| try std.testing.expectApproxEqAbs(a, b, 1e-12);
+        const said = plane.saidWithNominal(g.plane, &g, calibrated.nominal(&g), rows, cols, 1.25, 60, signs[0], signs[1]);
+        for (g.rot, said.rot) |a, b| try std.testing.expectApproxEqAbs(a, b, 1e-9);
+        for (said.step) |step| try std.testing.expectApproxEqAbs(@as(f64, 1), step, 1e-9);
     }
-    g.plane = plane.fit(.affine, &points, fr).?;
-    g.plane_kind = 1;
-    const pc = plane.at(g.plane, 4, 6);
-    const got = Geometry.pcOf(R, g.positionForRotation(R, 4, 6, fr.r0, fr.c0, -1, -1, 2.5, 24.4, 30.5), 24.4, 30.5);
-    for (pc, got) |a, b| try std.testing.expectApproxEqAbs(a, b, 1e-12);
-    const said = plane.saidWithNominal(g.plane, &g, c.nominal(&g), rows, cols, 1.25, 60, -1, -1);
-    for (g.rot, said.rot) |a, b| try std.testing.expectApproxEqAbs(a, b, 1e-9);
-    for (said.step) |step| try std.testing.expectApproxEqAbs(@as(f64, 1), step, 1e-9);
+}
+
+test "Oxford zero and half-turn scan rotations preserve pose and caller signs" {
+    const base: Calibration = .{ .metadata = .{ .detector_euler = .{ 6.252466, 1.594263, 6.263398 }, .specimen_euler = .{ 0, 0, 0 }, .tilt_axis = 0, .scanning_rotation = 0, .original_tilt = 1.2217305 } };
+    const g: Geometry = .{ .sample_tilt_deg = 70, .px_um = 70, .step_x_um = 2, .step_y_um = 3 };
+    // Fixed expectations do not derive their answer from scanDirection.
+    try std.testing.expectEqual([2]i32{ -1, -1 }, base.scanSigns(-1, -1));
+    var half = base;
+    half.metadata.?.scanning_rotation = @as(f64, @as(f32, std.math.pi));
+    try std.testing.expectEqual([2]i32{ 1, 1 }, half.scanSigns(-1, -1));
+    try std.testing.expectEqual([2]i32{ 1, -1 }, half.scanSigns(-1, 1));
+    const signed = half.scanSigns(-1, 1);
+    const offset = g.scanOffset(4, 6, 3, 5, signed[0], signed[1], 1);
+    for (offset, [_]f64{ -3.0 / 70.0, 2.0 / 70.0, 0 }) |a, expected| try std.testing.expectApproxEqAbs(expected, a, 1e-12);
+    for ([_]f64{ 0, -1e-6, 1e-6, 2 * std.math.pi, -4 * std.math.pi, @as(f64, @as(f32, 4 * std.math.pi)), std.math.pi, -std.math.pi, @as(f64, @as(f32, std.math.pi)) }) |angle| {
+        var c = base;
+        c.metadata.?.scanning_rotation = angle;
+        try std.testing.expectEqual(Status.supported, c.status());
+        for (c.nominal(&g), base.nominal(&g)) |a, b| try std.testing.expectApproxEqAbs(a, b, 1e-12);
+        for (try c.effectiveDetectorEuler(&g), try base.effectiveDetectorEuler(&g)) |a, b| try std.testing.expectApproxEqAbs(a, b, 1e-12);
+        for ([_]i32{ -1, 1 }) |x| for ([_]i32{ -1, 1 }) |y| {
+            const signs = c.scanSigns(x, y);
+            const is_half = scanDirection(angle).? == -1;
+            try std.testing.expectEqual(if (is_half) -x else x, signs[0]);
+            try std.testing.expectEqual(if (is_half) -y else y, signs[1]);
+            const turned_offset = g.scanOffset(4, 6, 3, 5, signs[0], signs[1], 1);
+            const zero = g.scanOffset(4, 6, 3, 5, x, y, 1);
+            for (turned_offset, zero) |a, b| try std.testing.expectApproxEqAbs(if (is_half) -b else b, a, 1e-12);
+        };
+    }
+    for ([_]f64{ std.math.pi / 2.0, std.math.pi + 2e-6, 2 * std.math.pi + 2e-6 }) |angle| {
+        var c = base;
+        c.metadata.?.scanning_rotation = angle;
+        try std.testing.expectEqual(Status.unsupported_scan_rotation, c.status());
+        try std.testing.expectEqual([2]i32{ -1, 1 }, c.scanSigns(-1, 1));
+    }
+}
+
+test "Oxford nonideal detector rays follow source CS3 to microscope calibration" {
+    // Independent native MTEX matrix columns are H*(-y), H*x, H*z,
+    // where H=B.inv()*Rx(-tilt)*D uses S05's float32 header.
+    // No production helper supplies the expected columns.
+    const c: Calibration = .{ .metadata = .{ .detector_euler = .{ 6.252466201782227, 1.594262957572937, 6.263398170471191 }, .specimen_euler = .{ 0, 0, 0 }, .tilt_axis = 0, .scanning_rotation = 3.1415927410125732, .original_tilt = 1.2217304706573486 } };
+    const g: Geometry = .{ .sample_tilt_deg = 69.99999967119774 };
+    const expected: rot.Mat3 = .{
+        -0.9310221761103453, -0.0289316252125052, -0.3638140578005752,
+        0.0190559573659648,  -0.9993467982882921, 0.0307058176866571,
+        -0.3644647830444304, 0.0216549720272926,  0.9309653506478496,
+    };
+    for (c.nominal(&g), expected) |actual, want| try std.testing.expectApproxEqAbs(want, actual, 1e-12);
+    const effective = try c.effectiveDetectorEuler(&g);
+    for (rot.toMat(rot.fromBunge(effective)), rot.toMat(rot.fromBunge(c.metadata.?.detector_euler))) |actual, want| try std.testing.expectApproxEqAbs(want, actual, 1e-12);
 }
