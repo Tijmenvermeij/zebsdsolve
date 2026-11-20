@@ -5,6 +5,11 @@ const std = @import("std");
 const rot = @import("rot.zig");
 const Geometry = @import("geometry.zig").Geometry;
 
+/// Oxford H5OINA camera attitude. This version is independent of the CS1
+/// orientation-export convention. Version 2 uses detector gnomonic axes.
+pub const detector_attitude_convention = "oxford_detector_euler_gnomonic";
+pub const detector_attitude_convention_version: u8 = 2;
+
 pub const Metadata = struct {
     detector_euler: [3]f64 = @splat(std.math.nan(f64)),
     specimen_euler: [3]f64 = @splat(std.math.nan(f64)),
@@ -52,10 +57,11 @@ pub const Calibration = struct {
         if (self.status() != .supported) return g.nominal();
         const m = self.metadata.?;
         const tilt = std.math.degreesToRadians(g.sample_tilt_deg);
-        // fromBunge is passive: this is exactly native MTEX D.inv().
-        const dinv = rot.toMat(rot.fromBunge(m.detector_euler));
-        const a = rot.toMat(rot.so3Exp(.{ -tilt, 0, 0 }));
-        const base = rot.matMul(rot.matMul(rot.matMul(rot.transpose(rot.toMat(sampleBasis())), a), dinv), rasterBasis());
+        // D maps detector gnomonic axes to Oxford microscope axes. fromBunge
+        // gives the passive matrix, so transpose it once for this direction.
+        const detector_to_microscope = rot.transpose(rot.toMat(rot.fromBunge(m.detector_euler)));
+        const untilt = rot.toMat(rot.so3Exp(.{ -tilt, 0, 0 }));
+        const base = rot.matMul(rot.matMul(rot.matMul(rot.transpose(rot.toMat(sampleBasis())), untilt), detector_to_microscope), gnomonicBasis());
         return rot.matMul(base, rot.toMat(rot.so3Exp(.{ 0, std.math.degreesToRadians(g.detector_tilt_deg), 0 })));
     }
 
@@ -71,9 +77,9 @@ pub const Calibration = struct {
     /// This includes fitted residuals without changing the fixed sample basis.
     pub fn effectiveDetectorEuler(self: Calibration, g: *const Geometry) !rot.Vec3 {
         try self.requireSupported();
-        const a = rot.toMat(rot.so3Exp(.{ std.math.degreesToRadians(g.sample_tilt_deg), 0, 0 }));
-        const dinv = rot.matMul(rot.matMul(rot.matMul(a, rot.toMat(sampleBasis())), self.rotation(g)), rot.transpose(rasterBasis()));
-        return rot.toBunge(rot.fromMat(dinv));
+        const tilt = rot.toMat(rot.so3Exp(.{ std.math.degreesToRadians(g.sample_tilt_deg), 0, 0 }));
+        const detector_to_microscope = rot.matMul(rot.matMul(rot.matMul(tilt, rot.toMat(sampleBasis())), self.rotation(g)), rot.transpose(gnomonicBasis()));
+        return rot.toBunge(rot.fromMat(rot.transpose(detector_to_microscope)));
     }
 
     pub fn eql(a: Calibration, b: Calibration) bool {
@@ -84,8 +90,22 @@ pub const Calibration = struct {
         return same(x.tilt_axis, y.tilt_axis) and same(x.scanning_rotation, y.scanning_rotation) and same(x.original_tilt, y.original_tilt);
     }
 
+    pub fn detectorAttitudeVersion(self: Calibration) u32 {
+        return if (self.status() == .supported) detector_attitude_convention_version else 0;
+    }
+
+    /// Only checkpoints and geometry-dependent caches that actually used the
+    /// Oxford attitude change identity when its interpretation changes.
+    pub fn hashDetectorAttitude(self: Calibration, h: anytype) void {
+        if (self.detectorAttitudeVersion() != 0) {
+            h.update(detector_attitude_convention);
+            h.update(&.{detector_attitude_convention_version});
+        }
+    }
+
     pub fn hash(self: Calibration, h: anytype) void {
         h.update(@tagName(self.status()));
+        self.hashDetectorAttitude(h);
         if (self.metadata) |m| {
             h.update(std.mem.asBytes(&m.detector_euler));
             h.update(std.mem.asBytes(&m.specimen_euler));
@@ -105,9 +125,10 @@ pub fn sampleBasis() rot.Quat {
     return rot.so3Exp(.{ 0, 0, std.math.pi / 2.0 });
 }
 
-/// Engine detector row/column/ray-depth -> Oxford CS3 components.
-pub fn rasterBasis() rot.Mat3 {
-    return .{ 0, 1, 0, 1, 0, 0, 0, 0, -1 };
+/// Engine (row down, column right, depth out) to Oxford detector gnomonic
+/// (right, up, out): (column, -row, depth).
+fn gnomonicBasis() rot.Mat3 {
+    return .{ 0, 1, 0, -1, 0, 0, 0, 0, 1 };
 }
 
 /// Oxford crystal -> master crystal. Only source-verified Cartesian conventions
@@ -128,13 +149,19 @@ test "Oxford residual pose and detector Euler roundtrip keep sample basis fixed"
     var g: Geometry = .{ .sample_tilt_deg = -20, .rot = .{ 0, 0, 0 } };
     const d = try c.effectiveDetectorEuler(&g);
     for (rot.toMat(rot.fromBunge(d)), rot.toMat(rot.fromBunge(c.metadata.?.detector_euler))) |a, b| try std.testing.expectApproxEqAbs(a, b, 1e-12);
+    g.sample_tilt_deg = 38;
+    g.detector_tilt_deg = -4.3;
     g.rot = .{ 0.01, -0.02, 0.005 };
     const changed = try c.effectiveDetectorEuler(&g);
-    var copy = c;
-    copy.metadata.?.detector_euler = changed;
-    var baseline = g;
-    baseline.rot = .{ 0, 0, 0 };
-    for (copy.rotation(&baseline), c.rotation(&g)) |a, b| try std.testing.expectApproxEqAbs(a, b, 1e-12);
+    var reopened = c;
+    reopened.metadata.?.detector_euler = changed;
+    reopened.metadata.?.original_tilt = std.math.degreesToRadians(g.sample_tilt_deg);
+    // Native export writes the full attitude into Detector Orientation Euler.
+    // On opening that acquisition adoptInfo resets both local refinements.
+    const baseline: Geometry = .{ .sample_tilt_deg = std.math.radiansToDegrees(reopened.metadata.?.original_tilt) };
+    for (reopened.rotation(&baseline), c.rotation(&g)) |a, b| try std.testing.expectApproxEqAbs(a, b, 1e-12);
+    for (rot.toMat(rot.fromBunge(try reopened.effectiveDetectorEuler(&baseline))), rot.toMat(rot.fromBunge(changed))) |a, b|
+        try std.testing.expectApproxEqAbs(a, b, 1e-12);
 }
 
 test "Oxford crystal conversion is per convention and cell setting" {
@@ -147,24 +174,78 @@ test "Oxford crystal conversion is per convention and cell setting" {
     try std.testing.expectError(error.UnsupportedMasterCrystalSetting, crystalBasis(.x_a_z_cstar, .{ 2.95, 3.0, 4.68, 90, 105, 90 }));
 }
 
-test "Oxford calibrated detector matrices agree with independent native MTEX cases" {
-    const c: Calibration = .{ .metadata = .{ .detector_euler = .{ 0.00722032, 1.5679878, 0.00296268 }, .specimen_euler = .{ 0, 0, 0 }, .tilt_axis = 0, .scanning_rotation = 0, .original_tilt = -std.math.pi / 9.0 } };
-    // Generated with pyMTEX 1.0.0 by native byEuler/byAxisAngle compositions,
-    // independently of this implementation. Rows/columns are detector raster axes.
-    const negative: rot.Mat3 = .{
-        0.3446288460628502,  -0.0052724508239519, -0.9387242192058842,
-        -0.0072285461023605, -0.9999694849061044, 0.0029626639813385,
-        -0.9387111944483426, 0.0057645918267715,  -0.3446564418351069,
+test "Oxford camera axes and cropped detector rays match kikuchipy 0.14.2" {
+    // Independent oracle: the OxfordH5EBSDReader and get_detector_angles in
+    // released kikuchipy 0.14.2, followed by its detector direction cosines.
+    // Their sample basis is mapped by diag(-1,-1,1). No fitted alignment.
+    // Real HSR6 site 774 file has 128 rows by 156 columns. At bin 8 the
+    // raster drops four right columns; PC fractions refer to the full extent.
+    // The reader converts the original sample tilt through f32 degrees.
+    const Ray = struct { bin: f64, row: f64, col: f64, expected: rot.Vec3 };
+    const Case = struct { euler: rot.Vec3, tilt: f64, pc: rot.Vec3, matrix: rot.Mat3, rays: [6]Ray };
+    const cases = [_]Case{
+        // HSR6/site774
+        .{ .euler = .{ 0.007220315281301737, 1.606059074401855, 0.002962682629004121 }, .tilt = 69.99999967119774, .pc = .{ 0.4875591695308685, 0.6206509126350284, 1.102802725508809 }, .matrix = .{ -0.9270392544621672, 0.00521601468329036, -0.374928011592963, -0.002708049004768343, -0.9999702991694756, -0.007215763957993809, -0.3749545134503879, -0.005673973011339428, 0.9270258458497528 }, .rays = .{
+            .{ .bin = 1, .row = 0, .col = 0, .expected = .{ 0.1112805288152942, 0.4187483793422502, 0.9012582530578167 } },
+            .{ .bin = 1, .row = 64, .col = 78, .expected = .{ -0.2751215876650284, -0.02408138603775137, 0.9611077977246751 } },
+            .{ .bin = 1, .row = 127, .col = 155, .expected = .{ -0.5744722488419919, -0.4769715101110011, 0.6651915617721376 } },
+            .{ .bin = 4, .row = 31, .col = 38, .expected = .{ -0.5700751450245706, -0.4711997598691662, 0.6730416891429941 } },
+            .{ .bin = 8, .row = 0, .col = 18, .expected = .{ 0.09909885681342888, -0.414595483247895, 0.9045938325285641 } },
+            .{ .bin = 8, .row = 15, .col = 0, .expected = .{ -0.5746522646628668, 0.4307665275668941, 0.6958555693862043 } },
+        } },
+        // nontrivial_negative_tilt
+        .{ .euler = .{ 0.173, 1.641, -0.089 }, .tilt = -20.0, .pc = .{ 0.47, -0.32, 0.74 }, .matrix = .{ 0.3901246956251316, 0.1972129504946318, -0.899394114957731, 0.09958281133707025, -0.980100738532462, -0.1717143151118387, -0.915361123027193, -0.02257419955002304, -0.4020005223442774 }, .rays = .{
+            .{ .bin = 1, .row = 0, .col = 0, .expected = .{ -0.6592864001358774, 0.4683869171801582, -0.5881795120627233 } },
+            .{ .bin = 1, .row = 64, .col = 78, .expected = .{ -0.3033306977654711, -0.07641833574831822, -0.9498161536605755 } },
+            .{ .bin = 1, .row = 127, .col = 155, .expected = .{ -0.01553851715180198, -0.3810948818403861, -0.9244053469770636 } },
+            .{ .bin = 4, .row = 31, .col = 38, .expected = .{ -0.01990295130593279, -0.3780225690760772, -0.9255824165348194 } },
+            .{ .bin = 8, .row = 0, .col = 18, .expected = .{ -0.4111270620547584, -0.6601732487354621, -0.6286062523553901 } },
+            .{ .bin = 8, .row = 15, .col = 0, .expected = .{ -0.1704381576226368, 0.3363820274896678, -0.9261738314205069 } },
+        } },
+        // nominal_axes
+        .{ .euler = .{ 0, 1.570796326794897, 0 }, .tilt = 70.0, .pc = .{ 0.5, 0.5, 0.65 }, .matrix = .{ -0.9396926207859086, -1.561251128379126e-16, -0.3420201433256685, 2.081668171172169e-16, -1, -1.387778780781446e-16, -0.3420201433256685, -1.942890293094024e-16, 0.9396926207859088 }, .rays = .{
+            .{ .bin = 1, .row = 0, .col = 0, .expected = .{ 0.2396804820608705, 0.5950854121686913, 0.7670897071028183 } },
+            .{ .bin = 1, .row = 64, .col = 78, .expected = .{ -0.3476547790648707, -0.006009398356246112, 0.9376033498898946 } },
+            .{ .bin = 1, .row = 127, .col = 155, .expected = .{ -0.6766816606505753, -0.5950854121686916, 0.4335611633474541 } },
+            .{ .bin = 4, .row = 31, .col = 38, .expected = .{ -0.6742286117560236, -0.5909033247564554, 0.4430000450127655 } },
+            .{ .bin = 8, .row = 0, .col = 18, .expected = .{ 0.2248676279417733, -0.5636692085684755, 0.7948028517913286 } },
+            .{ .bin = 8, .row = 15, .col = 0, .expected = .{ -0.6707372718667522, 0.5850535459611201, 0.45587702342525 } },
+        } },
     };
-    const positive: rot.Mat3 = .{
-        -0.9387111944483427, 0.0057645918267715,  -0.3446564418351067,
-        -0.0072285461023606, -0.9999694849061044, 0.0029626639813387,
-        -0.3446288460628500, 0.0052724508239522,  0.9387242192058836,
-    };
-    for ([_]f64{ -20, 70 }, [_]rot.Mat3{ negative, positive }) |tilt, expected| {
-        const g: Geometry = .{ .sample_tilt_deg = tilt };
-        for (c.rotation(&g), expected) |a, b| try std.testing.expectApproxEqAbs(a, b, 1e-12);
+    for (cases) |case| {
+        const cal: Calibration = .{ .metadata = .{
+            .detector_euler = case.euler,
+            .specimen_euler = .{ 0, 0, 0 },
+            .original_tilt = std.math.degreesToRadians(case.tilt),
+            .tilt_axis = 0,
+            .scanning_rotation = 0,
+        } };
+        const geo: Geometry = .{ .sample_tilt_deg = case.tilt, .pc = case.pc };
+        const R = cal.rotation(&geo);
+        for (R, case.matrix) |actual, expected| try std.testing.expectApproxEqAbs(expected, actual, 2e-7);
+        for (case.rays) |ray| {
+            const origin = cal.translation(&geo, 128 / ray.bin, 156 / ray.bin);
+            const direction = rot.normalize(rot.add(origin, rot.matVec(R, .{ ray.row, ray.col, 0 })));
+            for (direction, ray.expected) |actual, expected| try std.testing.expectApproxEqAbs(expected, actual, 3e-7);
+        }
     }
+}
+
+test "only supported Oxford calibrations acquire the corrected detector attitude fingerprint" {
+    const Sha = std.crypto.hash.sha2.Sha256;
+    const valid: Calibration = .{ .metadata = .{ .detector_euler = .{ 0, 1, 0 }, .specimen_euler = .{ 0, 0, 0 }, .tilt_axis = 0, .scanning_rotation = 0, .original_tilt = 0 } };
+    const unsupported: Calibration = .{ .metadata = .{} };
+    var corrected = Sha.init(.{});
+    valid.hashDetectorAttitude(&corrected);
+    var legacy = Sha.init(.{});
+    (Calibration{}).hashDetectorAttitude(&legacy);
+    unsupported.hashDetectorAttitude(&legacy);
+    var empty = Sha.init(.{});
+    try std.testing.expectEqual(@as(u32, 2), valid.detectorAttitudeVersion());
+    try std.testing.expectEqual(@as(u32, 0), unsupported.detectorAttitudeVersion());
+    const unchanged = empty.finalResult();
+    try std.testing.expectEqual(unchanged, legacy.finalResult());
+    try std.testing.expect(!std.mem.eql(u8, &unchanged, &corrected.finalResult()));
 }
 
 test "Oxford per-cell positions and plane frame use the calibrated baseline" {

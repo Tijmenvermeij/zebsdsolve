@@ -60,7 +60,7 @@ export fn ze_events(e: *Engine, buf: [*]u8, cap: usize) usize {
 
 /// Ask the running fit or indexing to stop at its next step (it keeps what it has).
 export fn ze_cancel(e: *Engine) void {
-    e.cancel = true;
+    e.cancel.set(true);
 }
 
 // ── scan ──
@@ -106,7 +106,7 @@ export fn ze_set_patterns(e: *Engine, data: [*]const u8, len: usize, pixel: u32,
 /// (4 f32 per cell), `phase` (i32 per cell; −1: a blank cell) and `grain` (i32 per cell); n is
 /// toy_rows · toy_cols.
 export fn ze_synthesize(e: *Engine, quats: [*]f32, phase: [*]i32, grain: [*]i32, n: usize) i32 {
-    e.cancel = false;
+    e.cancel.set(false);
     e.synthesize(quats[0 .. 4 * n], phase[0..n], grain[0..n]) catch |err| return failed(e, "synthesize", err);
     e.geo_given = e.geo;
     return 0;
@@ -155,6 +155,11 @@ export fn ze_scan_format(e: *Engine, buf: [*]u8, cap: usize) usize {
     const n = @min(s.len, cap);
     @memcpy(buf[0..n], s[0..n]);
     return n;
+}
+
+/// Returns the Oxford detector-attitude interpretation applied to this acquisition.
+export fn ze_oxford_detector_attitude_version(e: *Engine) u32 {
+    return e.calibration.detectorAttitudeVersion();
 }
 
 /// Whether the current source context retains acquisition calibration metadata.
@@ -404,6 +409,27 @@ export fn ze_sim_npz(e: *Engine, out: ?[*]u8, cap: usize) i64 {
 
 export fn ze_clear_phases(e: *Engine) void {
     e.clearPhases();
+}
+
+/// One byte per row-major cell, 1 when the current engine can reuse its stored primary.
+export fn ze_stored_primary_validity(e: *Engine, first: usize, out: [*]u8, len: usize) i32 {
+    const n = e.res.phase.len;
+    if (first > n or len > n - first) return failed(e, "stored_primary_validity", error.BadCell);
+    const current = e.storedPrimaryContextCurrent();
+    for (out[0..len], first..) |*valid, cell| valid.* = @intFromBool(e.storedPrimaryStatus(cell, current) == .valid);
+    return 0;
+}
+
+/// Anchor ROI of the current native seed-conditioning cohort, for provenance.
+export fn ze_seed_source_roi(e: *Engine, out: *[4]u32) u32 {
+    const context = e.res.seed_context orelse return 0;
+    out.* = .{ context.settings.roi_x, context.settings.roi_y, context.settings.roi_w, context.settings.roi_h };
+    return 1;
+}
+
+/// Cheap asset epoch; does not consume queued GPU errors or allocate/read pixels.
+export fn ze_phase_generation(e: *Engine) u64 {
+    return e.phase_generation;
 }
 
 export fn ze_phase_count(e: *Engine) u32 {
@@ -708,6 +734,54 @@ export fn ze_index_cells_by(e: *Engine, cells: [*]const u64, n: usize, method: u
     return 0;
 }
 
+/// Fixed prepared-domain overlap candidates (cell-major component axis, currently 1..2).
+/// States are 16 f32 per cell; components are 32 bytes. No stored results are replaced.
+export fn ze_overlap_cells(e: *Engine, cells: [*]const u64, n: usize, k: u32, out: [*]engine.overlap.Component, len: usize, states: [*]engine.overlap.State, state_len: usize) i32 {
+    e.overlapCells(cells[0..n], k, out[0..len], states[0..state_len]) catch |err| return failed(e, "overlap_cells", err);
+    return 0;
+}
+
+/// V2 keeps Component/State ABI and adds 32-byte per-cell Progress.
+export fn ze_overlap_cells_v2(e: *Engine, cells: [*]const u64, n: usize, k: u32, primary: u32, out: [*]engine.overlap.Component, len: usize, states: [*]engine.overlap.State, state_len: usize, progress: [*]engine.overlap.Progress, progress_len: usize) i32 {
+    if (primary > 1) return failed(e, "overlap_cells", error.BadPrimaryMode);
+    e.overlapCellsV2(cells[0..n], k, primary == 1, out[0..len], states[0..state_len], progress[0..progress_len]) catch |err| return failed(e, "overlap_cells", err);
+    return 0;
+}
+export fn ze_overlap_inspect(e: *Engine, cell: u64, components: [*]const engine.overlap.Component, n: usize, selected: u32, out: [*]f32, len: usize) i32 {
+    e.overlapInspect(cell, components[0..n], selected, out[0..len]) catch |err| return failed(e, "overlap_inspect", err);
+    return 0;
+}
+/// Native IPF colors for arbitrary fitted poses, exactly the stored-map key path.
+export fn ze_orientation_colors(e: *Engine, q: [*]const f32, phases: [*]const i32, n: usize, direction: u32, out: [*]u8, len: usize) i32 {
+    if (direction > 2 or len != n * 4) return failed(e, "orientation_colors", error.BadLength);
+    for (0..n) |i| {
+        const px = out[4 * i ..][0..4];
+        px.* = .{ 0, 0, 0, 0 };
+        const phase = phases[i];
+        if (phase < 0) continue;
+        if (phase >= e.phases.items.len) return failed(e, "orientation_colors", error.NoSuchPhase);
+        const quat = q[4 * i ..][0..4].*;
+        var norm: f32 = 0;
+        for (quat) |v| norm += v * v;
+        if (!std.math.isFinite(norm) or @abs(norm - 1) > 0.01) return failed(e, "orientation_colors", error.BadQuaternion);
+        var v: rot.Vec3 = .{ 0, 0, 0 };
+        v[direction] = 1;
+        const key = e.ipfKeyOf(@intCast(phase));
+        const c = key.color(rot.normalize(rot.qapply(.{ quat[0], quat[1], quat[2], quat[3] }, v)));
+        for (0..3) |j| px[j] = @intFromFloat(@round(255 * std.math.clamp(c[j], 0, 1)));
+        px[3] = 255;
+    }
+    return 0;
+}
+
+/// Numerical seam: normalize supplied target/templates on the GPU and solve NNLS.
+export fn ze_overlap_fit(e: *Engine, target: [*]const f32, templates: [*]const f32, n: u32, k: u32, h: u32, w: u32, amplitudes: [*]f32, residual: [*]f32, states: [*]engine.overlap.State) i32 {
+    if (n == 0 or k == 0 or k > 4 or h == 0 or w == 0) return failed(e, "overlap_fit", error.BadLength);
+    const px = @as(usize, h) * w;
+    e.fitOverlapProjections(target[0 .. n * px], templates[0 .. k * n * px], n, k, h, w, amplitudes[0 .. n * k], residual[0 .. n * px], states[0..n]) catch |err| return failed(e, "overlap_fit", err);
+    return 0;
+}
+
 /// Results per map cell (row-major), by kind: 0 orientations (4 f32 per cell: w, x, y, z),
 /// 1 NCC, 2 NMI (f32), 3 phase (i32, −1: not indexed), 4 Bunge angles (3 f32, radians: those of
 /// the stored fitted quaternions, without crystal symmetry reduction),
@@ -895,4 +969,123 @@ export fn ze_profile(e: *Engine, on: u32) i32 {
 /// GPU time per pipeline since the last call, slowest first, as text; returns its length.
 export fn ze_profile_report(e: *Engine, buf: [*]u8, cap: usize) usize {
     return e.g.profileReport(buf[0..cap]);
+}
+
+/// Optimizer semantics are independent of the stable V3 fit/inspection ABI.
+export fn ze_overlap_optimizer_version() u32 {
+    return 2;
+}
+
+/// V3 opt-in shared nuisance fitting. Theta is cell-major, seven f32 values.
+export fn ze_overlap_cells_v3(e: *Engine, cells: [*]const u64, n: usize, k: u32, primary: u32, out: [*]engine.overlap.Component, len: usize, states: [*]engine.overlap.State, state_len: usize, progress: [*]engine.overlap.Progress, progress_len: usize, theta: [*]engine.overlap_nuisance.Theta, theta_len: usize) i32 {
+    if (primary > 1) return failed(e, "overlap_cells", error.BadPrimaryMode);
+    e.overlapCellsV3(cells[0..n], k, primary == 1, out[0..len], states[0..state_len], progress[0..progress_len], theta[0..theta_len]) catch |err| return failed(e, "overlap_cells", err);
+    return 0;
+}
+export fn ze_overlap_inspect_v3(e: *Engine, cell: u64, components: [*]const engine.overlap.Component, n: usize, selected: u32, theta: [*]const f32, theta_len: usize, out: [*]f32, len: usize) i32 {
+    if (theta_len != 7) return failed(e, "overlap_inspect", error.BadLength);
+    const lo = [_]f32{ 0, -1.386295, 0.25, 0.6, 0.6, -0.15, -0.15 };
+    const hi = [_]f32{ 5, 1.386295, 8, 1.4, 1.4, 0.15, 0.15 };
+    for (theta[0..7], lo, hi) |v, l, h| if (!std.math.isFinite(v) or v < l or v > h) return failed(e, "overlap_inspect", error.BadNuisanceParameters);
+    e.overlapInspectV3(cell, components[0..n], selected, theta[0..7].*, out[0..len]) catch |err| return failed(e, "overlap_inspect", err);
+    return 0;
+}
+export fn ze_overlap_fit_v3(e: *Engine, target: [*]const f32, templates: [*]const f32, n: u32, k: u32, h: u32, w: u32, amplitudes: [*]f32, residual: [*]f32, states: [*]engine.overlap.State, theta: [*]engine.overlap_nuisance.Theta, mask: [*]const f32) i32 {
+    if (n == 0 or k == 0 or k > 4 or h == 0 or w == 0) return failed(e, "overlap_fit", error.BadLength);
+    const px = @as(usize, h) * w;
+    e.fitOverlapProjectionsV3(target[0 .. n * px], templates[0 .. k * n * px], n, k, h, w, amplitudes[0 .. n * k], residual[0 .. n * px], states[0..n], theta[0..n], mask[0..3].*) catch |err| return failed(e, "overlap_fit", err);
+    return 0;
+}
+
+/// Affine scalars actually used by the current-level nuisance projection. No GPU read.
+/// Rows: source mean, source SD, bake mean, bake SD, effective projected DC.
+export fn ze_overlap_phase_moments(e: *Engine, out: [*]f64, len: usize) i32 {
+    if (len != e.phases.items.len * 5) return failed(e, "overlap_phase_moments", error.BadLength);
+    const lv = e.levelOf(.search);
+    const level = @intFromEnum(lv);
+    for (e.phases.items, 0..) |*phase, i| {
+        const values = [_]f64{ phase.master.source_mean, phase.master.source_sd, phase.bake_mean[level], phase.bake_sd[level], e.overlapDC(phase, lv) };
+        @memcpy(out[i * 5 ..][0..5], &values);
+    }
+    return 0;
+}
+
+/// Explicit V4 contrast transfer. V3 remains the source-DC model for frozen replay.
+export fn ze_overlap_cells_v4(e: *Engine, cells: [*]const u64, n: usize, k: u32, primary: u32, optimize: u32, out: [*]engine.overlap.Component, len: usize, states: [*]engine.overlap.State, state_len: usize, progress: [*]engine.overlap.Progress, progress_len: usize, theta: [*]engine.overlap_nuisance.Theta, theta_len: usize, norms: [*]f32, norms_len: usize) i32 {
+    if (primary > 1 or optimize > 1 or k == 0 or k > 4) return failed(e, "overlap_cells_v4", error.BadFlags);
+    const nk = std.math.mul(usize, n, k) catch return failed(e, "overlap_cells_v4", error.BadLength);
+    if (len != nk or state_len != n or progress_len != n or theta_len != n or norms_len != nk) return failed(e, "overlap_cells_v4", error.BadLength);
+    e.overlapCellsV4(cells[0..n], k, primary == 1, out[0..len], states[0..state_len], progress[0..progress_len], theta[0..theta_len], optimize == 1, norms[0..norms_len]) catch |err| return failed(e, "overlap_cells_v4", err);
+    return 0;
+}
+export fn ze_overlap_inspect_v4(e: *Engine, cell: u64, components: [*]const engine.overlap.Component, n: usize, selected: u32, theta: [*]const f32, theta_len: usize, out: [*]f32, len: usize) i32 {
+    if (theta_len != 7 or n == 0 or n > 4 or selected >= n) return failed(e, "overlap_inspect_v4", error.BadLength);
+    const lo = [_]f32{ 0, -1.386295, 0.25, 0.6, 0.6, -0.15, -0.15 };
+    const hi = [_]f32{ 5, 1.386295, 8, 1.4, 1.4, 0.15, 0.15 };
+    for (theta[0..7], lo, hi) |v, l, h| if (!std.math.isFinite(v) or v < l or v > h) return failed(e, "overlap_inspect_v4", error.BadNuisanceParameters);
+    e.overlapInspectV4(cell, components[0..n], selected, theta[0..7].*, out[0..len]) catch |err| return failed(e, "overlap_inspect_v4", err);
+    return 0;
+}
+export fn ze_overlap_fit_v4(e: *Engine, target: [*]const f32, templates: [*]const f32, n: u32, k: u32, h: u32, w: u32, amplitudes: [*]f32, residual: [*]f32, states: [*]engine.overlap.State, theta: [*]engine.overlap_nuisance.Theta, theta_len: usize, mask: [*]const f32, mask_len: usize, optimize: u32, norms: [*]f32, norms_len: usize) i32 {
+    if (n == 0 or k == 0 or k > 4 or h == 0 or w == 0 or optimize > 1) return failed(e, "overlap_fit_v4", error.BadFlags);
+    const px = std.math.mul(usize, h, w) catch return failed(e, "overlap_fit_v4", error.BadLength);
+    const np = std.math.mul(usize, n, px) catch return failed(e, "overlap_fit_v4", error.BadLength);
+    const knp = std.math.mul(usize, k, np) catch return failed(e, "overlap_fit_v4", error.BadLength);
+    const nk = std.math.mul(usize, n, k) catch return failed(e, "overlap_fit_v4", error.BadLength);
+    if (theta_len != n or norms_len != nk or mask_len != 3 or px > 131072) return failed(e, "overlap_fit_v4", error.BadLength);
+    for (mask[0..3]) |v| if (!std.math.isFinite(v)) return failed(e, "overlap_fit_v4", error.BadMask);
+    if (mask[2] < 0) return failed(e, "overlap_fit_v4", error.BadMask);
+    e.fitOverlapProjectionsV4(target[0..np], templates[0..knp], n, k, h, w, amplitudes[0..nk], residual[0..np], states[0..n], theta[0..theta_len], mask[0..3].*, optimize == 1, norms[0..norms_len]) catch |err| return failed(e, "overlap_fit_v4", err);
+    return 0;
+}
+
+/// V5: keep_n candidates per phase for each residual order, separate winner rank.
+export fn ze_overlap_cells_v5(e: *Engine, cells: [*]const u64, n: usize, k: u32, primary: u32, optimize: u32, keep_n: u32, out: [*]engine.overlap.Component, len: usize, states: [*]engine.overlap.State, state_len: usize, progress: [*]engine.overlap.Progress, progress_len: usize, theta: [*]engine.overlap_nuisance.Theta, theta_len: usize, norms: [*]f32, norms_len: usize, winner_ranks: [*]i32, rank_len: usize) i32 {
+    if (primary > 1 or optimize > 1 or k == 0 or k > 4 or keep_n < 1 or keep_n > 8) return failed(e, "overlap_cells_v5", error.BadFlags);
+    const nk = std.math.mul(usize, n, k) catch return failed(e, "overlap_cells_v5", error.BadLength);
+    if (len != nk or state_len != n or progress_len != n or theta_len != n or norms_len != nk or rank_len != nk) return failed(e, "overlap_cells_v5", error.BadLength);
+    e.overlapCellsV5(cells[0..n], k, primary == 1, out[0..len], states[0..state_len], progress[0..progress_len], theta[0..theta_len], optimize == 1, norms[0..norms_len], keep_n, winner_ranks[0..rank_len]) catch |err| return failed(e, "overlap_cells_v5", err);
+    return 0;
+}
+
+/// Versioned host-only provenance in V5 progress._pad for keep_n>1,K>=3.
+export fn ze_overlap_trajectory_version() u32 {
+    return 1;
+}
+
+/// V6 overlap-private profiled model competition. All sizes are element counts,
+/// including source_q (one four-float quaternion per output component) and
+/// events (one 64-byte Event per slot). A failing call publishes zero events.
+export fn ze_overlap_profile_version() u32 {
+    return 1;
+}
+
+export fn ze_overlap_profile_selection_version() u32 {
+    return 2;
+}
+
+export fn ze_overlap_stage_gate_version() u32 {
+    return 1;
+}
+
+export fn ze_overlap_profile_trace_capacity(e: *Engine, n: usize, k: u32, keep_n: u32) usize {
+    return engine.overlap_profile.traceCapacity(n, e.phases.items.len, k, keep_n) catch 0;
+}
+
+/// Explicit opt-in. At least one of the two Options flags must be set.
+/// Call V4/V5 for the legacy fixed-pose, unscreened overlap trajectory.
+export fn ze_overlap_cells_v6(e: *Engine, cells: [*]const u64, n: usize, k: u32, primary: u32, optimize: u32, keep_n: u32, out: [*]engine.overlap.Component, len: usize, states: [*]engine.overlap.State, state_len: usize, progress: [*]engine.overlap.Progress, progress_len: usize, theta: [*]engine.overlap_nuisance.Theta, theta_len: usize, norms: [*]f32, norms_len: usize, winner_ranks: [*]i32, rank_len: usize, options: *const engine.overlap_profile.WireOptions, source_q: [*][4]f32, source_len: usize, events: [*]engine.overlap_profile.Event, event_capacity: usize, event_count: *usize) i32 {
+    event_count.* = 0;
+    if (primary > 1 or optimize > 1 or k == 0 or k > 4 or keep_n == 0 or keep_n > 8) return failed(e, "overlap_cells_v6", error.BadFlags);
+    if (options.size != @sizeOf(engine.overlap_profile.WireOptions) and options.size != @sizeOf(engine.overlap_profile.WireStageOptions)) return failed(e, "overlap_cells_v6", error.BadProfileOptions);
+    const decoded = engine.overlap_profile.Options.decode(options, k) orelse return failed(e, "overlap_cells_v6", error.BadProfileOptions);
+    event_count.* = e.overlapCellsV6(cells[0..n], k, primary == 1, .{
+        .components = out[0..len],
+        .states = states[0..state_len],
+        .progress = progress[0..progress_len],
+        .theta = theta[0..theta_len],
+        .norms = norms[0..norms_len],
+        .ranks = winner_ranks[0..rank_len],
+    }, optimize == 1, keep_n, decoded, source_q[0..source_len], events[0..event_capacity]) catch |err| return failed(e, "overlap_cells_v6", err);
+    return 0;
 }

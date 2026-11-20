@@ -140,7 +140,12 @@ installed pyMTEX 1.0.0 importer has phase-numbering limitations.
 
 Reopen the original Oxford acquisition and reindex after upgrading. Old
 Oxford project geometry used a different baseline convention; it is not
-silently restored. New projects record `geometry_convention=oxford-calibrated-v1`.
+silently restored. New supported Oxford projects record `geometry_convention=oxford-calibrated-v2`
+and camera-attitude convention version 2. Earlier v1 fitted local rotations
+may have compensated for the old camera baseline and are not restored. The
+Oxford CS1 / crystal-basis convention remains version 1; it is independent of
+the corrected detector attitude. Unsupported source calibration uses the
+explicit `oxford-fallback-v1` project marker.
 
 The earlier P6 hexagonal reference-point diagnostic found a 29.88878°
 original/export difference caused by omitted crystal-basis conversion.

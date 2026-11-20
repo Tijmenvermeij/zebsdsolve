@@ -297,7 +297,7 @@ pub fn run(e: *Engine) !Result {
     clearHistory(e);
     const g = &e.g;
     const s = &e.set;
-    e.cancel = false;
+    e.cancel.set(false);
     // (the vote moves one pattern centre, the scan's steps saying how the beam went from it:
     // a plane fitted before goes)
     e.geo.plane_kind = 0;
@@ -375,7 +375,7 @@ pub fn run(e: *Engine) !Result {
         var c0: u32 = 0;
         var since_wait: u32 = 0;
         while (c0 < n_c) : (c0 += cand_per_tile) {
-            if (e.cancel) return error.Cancelled;
+            if (e.cancel.get()) return error.Cancelled;
             const k = @min(cand_per_tile, n_c - c0);
             for (0..k) |j| {
                 const c = c0 + @as(u32, @intCast(j));

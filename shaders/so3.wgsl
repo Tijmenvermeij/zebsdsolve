@@ -388,3 +388,32 @@ fn peak_finish(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_
     peaks[o + 6u] = bb;
     peaks[o + 7u] = c;
 }
+
+// Overlap-only slab output; ordinary a_peak/a_volume remain unchanged. The
+// spectrum stays in its native item/j/m'/c layout, while only selected j rows
+// of one item are transformed and written. pad0=item, pad1=first j, pad2=rows.
+fn a_load_slab(tid:u32,line0:u32,lpw:u32) {
+    let h=fp.n;let shift=32u-fp.log2n;let L=so.bw;let tws=fp.tw_len/(2u*h);
+    for(var e=tid;e<lpw*h;e+=FFT_WG) {
+        let q=e&(h-1u);let line=line0+(e>>fp.log2n);var z=vec2<f32>(0.0);
+        if(line<fp.n_lines) {
+            let j=so.pad1+(line>>so.log2nc);let iq=line&(so.nc-1u);
+            let base=((so.pad0*so.nb+j)*L)*so.nc+iq;
+            var x=vec2<f32>(0.0);var y=vec2<f32>(0.0);
+            if(q<L){x=spec[base+q*so.nc];}
+            if(q==0u){x.y=0.0;}else if(h-q<L){let v=spec[base+(h-q)*so.nc];y=vec2<f32>(v.x,-v.y);}
+            let w=ftw[q*tws];let d=x-y;
+            z=x+y+vec2<f32>(-(w.x*d.y+w.y*d.x),w.x*d.x-w.y*d.y);
+        }
+        fs[(e-q)+(reverseBits(q)>>shift)]=z;
+    }
+}
+@compute @workgroup_size(FFT_WG)
+fn a_volume_slab(@builtin(workgroup_id) wid:vec3<u32>,@builtin(local_invocation_index) tid:u32) {
+    let h=fp.n;let lpw=FFT_MAX/h;let line0=(wid.y*fp.grid_x+wid.x)*lpw;
+    a_load_slab(tid,line0,lpw);workgroupBarrier();fft_core(tid,lpw);
+    for(var e=tid;e<lpw*h;e+=FFT_WG) {
+        let p=e&(h-1u);let line=line0+(e>>fp.log2n);
+        if(line<fp.n_lines){let z=fs[e];vol[line*so.n+2u*p]=z.x;vol[line*so.n+2u*p+1u]=z.y;}
+    }
+}

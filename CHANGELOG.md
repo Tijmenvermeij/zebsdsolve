@@ -4,6 +4,47 @@ What changed in each release, newest first. Work lands under an **Unreleased** h
 heading to the version and date, and the release workflow publishes the section as the release's
 notes.
 
+## Unreleased
+
+### Overlap indexing
+
+- Correct the Oxford detector Euler-to-ray conversion and effective-camera
+  writeback. Version calibration provenance and checkpoints; reindex and refit
+  geometry for pre-fix Oxford results and projects.
+
+- Add opt-in gain-aware orientation profiling at fixed geometry and a separate
+  computational residual-NCC screen. Retain proposal poses and rejected events,
+  compare lower-order replacements before additions, and preserve legacy defaults.
+
+- Retain 1–8 residual-search candidates per phase with native spherical or
+  dictionary indexing. Refine each against the same signed residual before
+  comparing joint fits to the original pattern.
+- For three or four components, compare pooled and single-candidate histories
+  and return the complete lower-error fit. Prepare the input and primary once;
+  export the selected history and candidate ranks.
+- Make competing overlap fits independent of phase iteration order and make
+  native cancellation thread-safe.
+- Add one-through-four-component native, Python and browser candidate discovery
+  using existing spherical and dictionary searches, signed GPU residuals and
+  original-pattern nonnegative projection fitting. Preserve stable component slots
+  and support compatible stored-primary reuse.
+- Add an Overlap tab with normal primary indexing, component maps, native IPF
+  colors, regenerated pattern inspection and versioned result export. Cancelled
+  tiles cannot replace completed results; input changes invalidate inspection.
+- Add optional GPU fitting of one shared Gaussian blur and positive spatial gain
+  for all retained components. Apply gain to simulated contrast after blur, fit
+  amplitudes jointly against the once-prepared target, and regenerate inspection
+  images from frozen fit parameters. Keep the legacy source-DC model explicit.
+- Report model weights after undoing per-template numerical normalization; retain
+  original contrast shares for compatibility and label the reference basis.
+- Add primary/residual search NCC and mixture NCC maps, focused map choices,
+  hover explanations and display-only minimum filters that preserve all results.
+- Expose fit diagnostics and a supplied-projection numerical API. Outputs remain
+  prepared-pattern candidates; physical overlap acceptance is not implemented.
+- Add a reproducible Map 1 baseline tool and local GPU numerical/regression checks,
+  including the Cu report's 347 four-supported-component pixels.
+- Add reproducible virtual master-pattern mixtures with counting noise and background/gain profiles, evaluated with both searches and preprocessing policies.
+
 ## 0.2.0 — 2026-11-10
 
 ### Geometry

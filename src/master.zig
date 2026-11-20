@@ -42,6 +42,8 @@ pub const Master = struct {
     side: u32,
     /// [north | south], side · side each, as loaded (normalized)
     raw: []f32,
+    source_mean: f64 = 0,
+    source_sd: f64 = 1,
     /// crystallographic point group (1–32), 0 when the file does not say
     point_group: u32 = 0,
     space_group: u32 = 0,
@@ -137,7 +139,7 @@ pub const Master = struct {
 };
 
 /// Zero mean, unit variance over both sheets (the Lambert map is equal-area).
-fn normalize(sheets: []f32) void {
+fn normalize(sheets: []f32) [2]f64 {
     var s: f64 = 0;
     for (sheets) |v| s += v;
     const mean = s / @as(f64, @floatFromInt(sheets.len));
@@ -146,6 +148,7 @@ fn normalize(sheets: []f32) void {
     const sd = @sqrt(ss / @as(f64, @floatFromInt(sheets.len)));
     const k: f64 = if (sd > 0) 1 / sd else 1;
     for (sheets) |*v| v.* = @floatCast((v.* - mean) * k);
+    return .{ mean, sd };
 }
 
 fn baseName(gpa: Allocator, path: []const u8) ![]u8 {
@@ -492,13 +495,15 @@ fn fromSectorBy(gpa: Allocator, vals: []const f64, kij: []const [3]i32, hw: usiz
         for (grid[0..n_grid]) |g| at = @min(at, g.pixel(hemi, row, col, side - 1));
         if (at != here) sheets[here] = sheets[at];
     };
-    normalize(sheets);
+    const source_moments = normalize(sheets);
 
     var m: Master = .{
         .gpa = gpa,
         .name = try gpa.dupe(u8, ""),
         .side = @intCast(side),
         .raw = sheets,
+        .source_mean = source_moments[0],
+        .source_sd = source_moments[1],
         .source = info.source,
         .crystal_frame = info.crystal_frame,
         .source_format_version = info.source_format_version,
@@ -658,13 +663,15 @@ fn loadEmsoft(gpa: Allocator, f: *File) !Master {
         };
         for (0..plane) |i| sheets[hemi * plane + i] = @floatCast(acc[i]);
     }
-    normalize(sheets);
+    const source_moments = normalize(sheets);
 
     var m: Master = .{
         .gpa = gpa,
         .name = try gpa.dupe(u8, ""),
         .side = @intCast(side),
         .raw = sheets,
+        .source_mean = source_moments[0],
+        .source_sd = source_moments[1],
         .source = "emsoft",
         .crystal_frame = .x_a_z_cstar,
     };

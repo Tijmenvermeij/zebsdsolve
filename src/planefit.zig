@@ -211,7 +211,7 @@ const Fit = struct {
     fn open(e: *Engine, every: u32, most: u32) !*Fit {
         const gpa = e.gpa;
         const s = &e.set;
-        e.cancel = false;
+        e.cancel.set(false);
         // the fit is a refinement: it works where refinement does
         const lv = e.levelOf(.refine);
         const sz = try e.sizeOf(lv);
@@ -476,7 +476,7 @@ const Fit = struct {
         @memset(self.lam, 1e-3);
         var it: u32 = 0;
         while (it < most) : (it += 1) {
-            if (self.e.cancel) return error.Cancelled;
+            if (self.e.cancel.get()) return error.Cancelled;
             for (0..n) |b| {
                 self.q_t[b] = self.q[b];
                 self.shift_t[b] = self.shift[b];
@@ -755,7 +755,7 @@ pub fn auto(e: *Engine) !PlaneResult {
     errdefer e.geo = before;
     e.geo = e.geo_given;
     _ = try pcfit.run(e);
-    if (e.cancel) return error.Cancelled;
+    if (e.cancel.get()) return error.Cancelled;
     return plane(e);
 }
 

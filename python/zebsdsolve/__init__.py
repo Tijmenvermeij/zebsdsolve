@@ -40,6 +40,9 @@ METHODS = ("spherical", "dictionary", "pca")
 MAPS = {"ipf_x": 0, "ipf_y": 1, "ipf_z": 2, "ncc": 3, "nmi": 4, "phase": 5, "z": 6, "sweep": 7}
 
 
+OVERLAP_STOP_REASONS = ("running", "component_limit", "flat_residual", "no_proposal", "unresolved_addition", "boundary", "missing_primary", "flat_target", "attempt_limit", "invalid_target", "stale_primary", "residual_screen", "replacement_limit", "stage_improvement")
+
+
 class Error(RuntimeError):
     """An engine call failed; the message says which and why."""
 
@@ -675,6 +678,444 @@ class Solver:
                                                     _ptr(out, _n.f32p), out.size), "index_cells")
         r = out.reshape(n_ph, len(c), 8)
         return {"quaternions": r[..., :4].copy(), "ncc": r[..., 4].copy(), "nmi": r[..., 5].copy(), "step": r[..., 6].copy(), "z": r[..., 7].copy()}
+
+    @staticmethod
+    def _overlap_diagnostics(states, amplitudes):
+        """Describe the numerical candidate fit; no physical acceptance is assessed."""
+        n, k = amplitudes.shape
+        raw = np.ctypeslib.as_array(ctypes.cast(states, _n.f32p), shape=(n * 16,)).reshape(n, 16).copy()
+        flags = raw[:, 3].astype(np.uint32)
+        sums = amplitudes.sum(axis=1, keepdims=True)
+        fractions = np.divide(amplitudes, sums, out=np.full_like(amplitudes, np.nan), where=sums > 1e-12)
+        # Full normalized Gram conditioning uses the exact K2 ratio and native
+        # bounded symmetric Jacobi for K3/4, with fail-closed assessment flags.
+        fractions[(flags & 1) != 0] = np.nan
+        conditioning_assessed = ((flags & (2|4)) == 0) & np.isfinite(raw[:,13])
+        unresolved = (flags & 8) != 0
+        skipped = (flags & 16) != 0
+        status = np.where(unresolved, "numerically_unresolved",
+                          np.where((flags & 2) != 0, "flat_target",
+                                   np.where(skipped, "unresolved_candidate_skipped",
+                                            np.where((flags & 4) != 0, "conditioning_unassessed",
+                                                     np.where((flags & 1) != 0, "ill_conditioned", "solved")))))
+        return {"amplitudes": amplitudes, "prepared_fractions": fractions,
+                "sse": raw[:, 0], "initial_sse": raw[:, 1],
+                "residual_norm": np.sqrt(np.maximum(raw[:, 0], 0)),
+                "mixture_ncc": np.sqrt(np.clip(1 - np.divide(raw[:, 0], raw[:, 1], out=np.full(n,np.nan,np.float32), where=np.isfinite(raw[:,1]) & (raw[:,1]>1e-12) & np.any(amplitudes>0,axis=1)), 0, 1)),
+                "single_sse": raw[:, 8:8 + k], "best_single_sse": raw[:, 14],
+                "improvement_over_best_single": np.maximum(raw[:, 14] - raw[:, 0], 0),
+                "component_correlation": raw[:, 12],
+                "relative_gram_condition": np.where(conditioning_assessed, raw[:, 13], np.nan).astype(np.float32),
+                "conditioning_assessed": conditioning_assessed,
+                "residual_flat": raw[:, 0] <= 1e-8 * np.maximum(raw[:, 1], 1e-30),
+                "solve_status": status,
+                "objective_valid": ~unresolved,
+                "attribution_unresolved": unresolved,
+                "unresolved_candidate_skipped": skipped,
+                "design_rank_reliable": ~unresolved & ((flags & 2) == 0),
+                "flags": flags, "conditioned": (flags & 1) != 0, "flat": (flags & 2) != 0,
+                "assessment": "unassessed_candidates", "model": "fixed_prepared_projection_nnls",
+                "domain": "zero_mean_unit_norm_prepared_pattern",
+                "physical_fractions": False, "blur_gain_parity": False}
+
+    def overlap_cells(self, cells, max_components=2, primary="search", blur_gain=False, gain_domain="contrast", keep_n=1, polish=False, min_residual_ncc=None, polish_radius_deg=1.0, min_stage_improvement=None):
+        """Discover one through four candidate components with the configured spherical,
+        dictionary or PCA search, followed by GPU joint nonnegative projection fitting.
+
+        Arrays are cell-major, with a component axis (n, K[, 4]). Amplitudes and
+        fractions describe the fixed, once-prepared pattern domain; they are not
+        physical phase fractions or the legacy GUI blur/gain objective. Correlated
+        templates (|rho| >= .995) retain identities but have NaN fractions. Proposal
+        NCC/NMI are search diagnostics; chance-z is deliberately absent. Results are
+        unassessed candidates, including for singleton/noise inputs. Stored primary
+        results and original acquisition patterns are preserved.
+
+        V4 defaults to gain_domain='contrast': blur the full baked reference,
+        center it over the mask, apply shared spatial gain, then masked-center and
+        normalize for KKT-checked NNLS. blur_gain=False evaluates identity theta
+        through the same contrast transform and NNLS solver. component_norms undo numerical column normalization when forming
+        contrast_basis_weights, relative to the globally standardized baked-master
+        basis; these are not calibrated raw-intensity or physical volume fractions.
+        gain_domain='source_dc' explicitly selects legacy V3. Frozen inspection
+        follows fit_model, preserving legacy results. No target or residual receives
+        another background filter.
+
+        polish=True enables bounded gain-aware orientation/profile refinement at
+        fixed detector geometry. min_residual_ncc optionally screens EACH refined
+        residual proposal before fitting; it is separate from display filtering and
+        is not a calibrated confidence threshold. Rejected proposals are retained
+        in profile_events. Both controls are off by default, preserving V4/V5.
+
+        All stages must use the same resolution: binning=1, full_resolution='none',
+        or full_resolution='all'. Residuals stay signed and bypass all nonlinear
+        preprocessing. Start with small batches: the GPU moment solver is provisional.
+        """
+        profile = bool(polish) or min_residual_ncc is not None
+        if not isinstance(polish, (bool, np.bool_)):
+            raise ValueError("polish must be a boolean")
+        if isinstance(polish_radius_deg, (bool, np.bool_)) or not np.isfinite(polish_radius_deg) or not 0 < polish_radius_deg <= 5:
+            raise ValueError("polish_radius_deg must be finite, greater than zero and at most 5 degrees")
+        if min_residual_ncc is not None and (isinstance(min_residual_ncc, (bool, np.bool_)) or not np.isfinite(min_residual_ncc) or not -1 <= min_residual_ncc <= 1):
+            raise ValueError("min_residual_ncc must be None or finite in [-1, 1]")
+        staged = min_stage_improvement is not None
+        if staged:
+            if min_residual_ncc is None:
+                raise ValueError("stage improvement requires residual NCC screening")
+            if isinstance(max_components, (bool, np.bool_)) or max_components not in (2, 3, 4):
+                raise ValueError("stage improvement requires two to four components")
+            try:
+                stage_requested = list(min_stage_improvement)
+            except TypeError:
+                raise ValueError("min_stage_improvement must be a three-element sequence") from None
+            numerical = (int, float, np.integer, np.floating)
+            if len(stage_requested) != 3 or any(
+                (v is not None) if i >= max_components - 1 else
+                (isinstance(v, (bool, np.bool_)) or not isinstance(v, numerical) or not np.isfinite(v) or not 0 <= v <= 1)
+                for i, v in enumerate(stage_requested)
+            ):
+                raise ValueError("enter a ΔSSE minimum in [0, 1] for each requested addition, with None for unused stages")
+            stage_requested = [None if v is None else float(v) for v in stage_requested]
+            stage_minimum = [None if v is None else float(np.float32(v)) for v in stage_requested]
+            if not hasattr(self._lib, "ze_overlap_stage_gate_version") or self._lib.ze_overlap_stage_gate_version() != 1:
+                raise Error("stage improvement requires a current native overlap library")
+        requested_min_residual_ncc = min_residual_ncc
+        if min_residual_ncc is not None:
+            min_residual_ncc = float(np.float32(min_residual_ncc))
+        polish_radius_deg = float(np.float32(polish_radius_deg))
+        if profile:
+            if gain_domain != "contrast":
+                raise ValueError("overlap profiling requires gain_domain='contrast'")
+            if not all(hasattr(self._lib, name) for name in ("ze_overlap_cells_v6", "ze_overlap_profile_version", "ze_overlap_profile_trace_capacity")):
+                raise Error("overlap profiling requires native V6 support; load a current library")
+            if int(self._lib.ze_overlap_profile_version()) != 1:
+                raise Error("unsupported overlap profile version")
+            selection_version = int(self._lib.ze_overlap_profile_selection_version()) if hasattr(self._lib, "ze_overlap_profile_selection_version") else 1
+            if selection_version not in (1, 2):
+                raise Error("unsupported overlap selection version")
+            event_flag_mask = 4095 if staged else 1023 if selection_version == 2 else 255
+        if isinstance(keep_n, bool) or not isinstance(keep_n, (int, np.integer)) or not 1 <= keep_n <= 8:
+            raise ValueError("keep_n must be an integer from 1 through 8")
+        if keep_n > 1 and max_components > 1:
+            if gain_domain != "contrast":
+                raise ValueError("keep_n > 1 requires gain_domain='contrast'")
+            if self.settings["method"] == "pca":
+                raise ValueError("keep_n > 1 does not support PCA proposals")
+            if not hasattr(self._lib, "ze_overlap_cells_v5"):
+                raise Error("keep_n > 1 requires native V5 overlap support; load a current library")
+        if gain_domain not in ("contrast","source_dc"):
+            raise ValueError("gain_domain must be 'contrast' or 'source_dc'")
+        contrast=gain_domain=="contrast"
+        if contrast and not hasattr(self._lib,"ze_overlap_cells_v4"):
+            raise Error("contrast gain requires native V4 overlap support; load a current library or explicitly use gain_domain='source_dc'")
+        if isinstance(max_components, bool) or max_components not in (1, 2, 3, 4):
+            raise ValueError("max_components must be 1 through 4")
+        if primary not in ("search","stored"):
+            raise ValueError("primary must be 'search' or 'stored'")
+        source = np.asarray(cells)
+        if source.size and (not np.issubdtype(source.dtype, np.integer) or np.any(source < 0)):
+            raise ValueError("cells must be nonnegative integer map-cell IDs")
+        c = np.ascontiguousarray(source, dtype=np.uint64).reshape(-1)
+        n, k = len(c), int(max_components)
+        components = (_n.OverlapComponent * (n * k))()
+        states = (_n.OverlapState * n)()
+        progress = (_n.OverlapProgress * n)()
+        theta=np.empty((n,7),np.float32)
+        norms=np.empty((n,k),np.float32)
+        winner_ranks=np.full((n,k),-1,np.int32)
+        trajectory_version = int(self._lib.ze_overlap_trajectory_version()) if keep_n > 1 and k >= 3 and hasattr(self._lib, "ze_overlap_trajectory_version") else 0
+        if trajectory_version not in (0, 1):
+            raise Error(f"unsupported overlap trajectory version {trajectory_version}")
+        source_q = np.zeros((n,k,4),np.float32)
+        profile_events = []
+        if profile:
+            capacity = int(self._lib.ze_overlap_profile_trace_capacity(self._e,n,k,int(keep_n)))
+            if n and capacity <= 0:
+                raise Error("invalid V6 overlap trace capacity")
+            events = (_n.OverlapProfileEvent * capacity)()
+            count = _n.SZ()
+            options = _n.OverlapProfileOptions(16, int(polish) | (2 if min_residual_ncc is not None else 0) | (4 if selection_version == 2 else 0), float(polish_radius_deg), float(min_residual_ncc or 0))
+            if staged:
+                options.size = ctypes.sizeof(_n.OverlapStageOptions)
+                stage_options = _n.OverlapStageOptions(options, (ctypes.c_float * 3)(*(v or 0 for v in stage_minimum)))
+                options_pointer = ctypes.cast(ctypes.byref(stage_options), ctypes.POINTER(_n.OverlapProfileOptions))
+            else:
+                options_pointer = ctypes.byref(options)
+            self._check(self._lib.ze_overlap_cells_v6(self._e,_ptr(c,_n.u64p),n,k,int(primary=="stored"),int(blur_gain),int(keep_n),components,n*k,states,n,progress,n,_ptr(theta,_n.f32p),n,_ptr(norms,_n.f32p),n*k,_ptr(winner_ranks,_n.i32p),n*k,options_pointer,_ptr(source_q,_n.f32p),n*k,events,capacity,ctypes.byref(count)),"overlap_cells_v6")
+            if count.value > capacity:
+                raise Error("V6 overlap trace exceeds allocated capacity")
+            for event in events[:count.value]:
+                if event.cell_index >= n or event.branch not in (0,1) or event.flags & ~event_flag_mask:
+                    raise Error("invalid V6 overlap event")
+                row = {name: list(event.source_q) if name == "source_q" else getattr(event,name) for name,_ in _n.OverlapProfileEvent._fields_}
+                row["cell"] = int(c[event.cell_index])
+                profile_events.append(row)
+        elif contrast and keep_n > 1 and k > 1:
+            self._check(self._lib.ze_overlap_cells_v5(self._e,_ptr(c,_n.u64p),n,k,int(primary=="stored"),int(blur_gain),int(keep_n),components,n*k,states,n,progress,n,_ptr(theta,_n.f32p),n,_ptr(norms,_n.f32p),n*k,_ptr(winner_ranks,_n.i32p),n*k),"overlap_cells_v5")
+        elif contrast:
+            self._check(self._lib.ze_overlap_cells_v4(self._e,_ptr(c,_n.u64p),n,k,int(primary=="stored"),int(blur_gain),components,n*k,states,n,progress,n,_ptr(theta,_n.f32p),n,_ptr(norms,_n.f32p),n*k),"overlap_cells_v4")
+        elif blur_gain:
+            self._check(self._lib.ze_overlap_cells_v3(self._e,_ptr(c,_n.u64p),n,k,int(primary=="stored"),components,n*k,states,n,progress,n,_ptr(theta,_n.f32p),n),"overlap_cells")
+        else:
+            self._check(self._lib.ze_overlap_cells_v2(self._e, _ptr(c, _n.u64p), n, k, int(primary=="stored"), components, n*k, states,n,progress,n), "overlap_cells")
+        quats = np.empty((n, k, 4), np.float32)
+        phase = np.empty((n, k), np.int32)
+        amp = np.empty((n, k), np.float32)
+        ncc = np.empty_like(amp)
+        nmi = np.empty_like(amp)
+        for b in range(n):
+            for j in range(k):
+                record = components[b * k + j]
+                quats[b, j], phase[b, j], amp[b, j] = record.q, record.phase, record.amplitude
+                ncc[b, j], nmi[b, j] = record.proposal_ncc, record.proposal_nmi
+        ncc[phase<0]=np.nan;nmi[phase<0]=np.nan
+        if not profile and (keep_n == 1 or k == 1):
+            winner_ranks[:] = np.where(phase >= 0, np.where(np.arange(k)[None] == 0, 0, 1), -1)
+        diagnostics = self._overlap_diagnostics(states, amp)
+        diagnostics.update(cells=c.copy(), quaternions=quats, phase=phase,
+                           proposal_ncc=ncc, proposal_nmi=nmi,
+                           candidate_count=(phase >= 0).sum(axis=1).astype(np.uint32),
+                           fitted_count=(amp > 1e-6).sum(axis=1).astype(np.uint32),
+                           geometry=self.geometry, settings=self.settings, phases=self.phases,
+                           oxford_detector_attitude_version=self.detector_attitude_version)
+        for key in ("retained_order","proposed_count","active_count","stop_reason"):
+            diagnostics[key] = np.array([getattr(m,key) for m in progress],np.uint32)
+        for key in ("previous_sse","incremental_improvement"):
+            diagnostics[key] = np.array([getattr(m,key) for m in progress],np.float32)
+        diagnostics["stop_reason_name"] = np.array([OVERLAP_STOP_REASONS[int(v)] for v in diagnostics["stop_reason"]])
+        diagnostics["addition_unresolved"] = diagnostics["stop_reason"] == 4
+        diagnostics["objective_order"] = diagnostics["retained_order"].copy()
+        diagnostics["objective_valid"] &= ~np.isin(diagnostics["stop_reason"],[6,10])
+        diagnostics["solve_status"] = np.where(np.isin(diagnostics["stop_reason"],[6,10]),diagnostics["stop_reason_name"],diagnostics["solve_status"])
+        # No assessed model exists for unavailable seeds/invalid targets or a
+        # zero-order failed search. Preserve the known zero energy of flat input.
+        unavailable=np.isin(diagnostics["stop_reason"],[6,9,10]) | ((diagnostics["retained_order"]==0) & ~diagnostics["flat"])
+        diagnostics["objective_valid"][unavailable]=False
+        diagnostics["solve_status"]=np.where(unavailable,diagnostics["stop_reason_name"],diagnostics["solve_status"])
+        for key in ("sse","initial_sse","residual_norm","mixture_ncc","best_single_sse","improvement_over_best_single","component_correlation","relative_gram_condition","previous_sse","incremental_improvement"):
+            diagnostics[key][unavailable]=np.nan
+        diagnostics["single_sse"][unavailable]=np.nan
+        diagnostics["prepared_fractions"][unavailable]=np.nan
+        diagnostics["single_sse"][phase<0]=np.nan
+        no_fit=diagnostics["retained_order"]==0
+        for key in ("best_single_sse","improvement_over_best_single","component_correlation","relative_gram_condition","previous_sse","incremental_improvement"):
+            diagnostics[key][no_fit]=np.nan
+        diagnostics["conditioning_assessed"][no_fit]=False
+        diagnostics["design_rank_reliable"][no_fit]=False
+        for key in ("conditioning_assessed","design_rank_reliable","residual_flat"):
+            diagnostics[key][unavailable]=False
+        diagnostics["discovery_id"] = np.where(phase>=0,np.broadcast_to(np.arange(k,dtype=np.int32),(n,k)),-1)
+        roi=np.empty(4,np.uint32)
+        available=self._lib.ze_seed_source_roi(self._e,_ptr(roi,_n.u32p)) if primary=="stored" else 0
+        diagnostics.update(max_components=k,maxComponents=k,primary=primary,seed_source_roi=roi.tolist() if available else None,
+                           keep_n=int(keep_n), candidate_method=self.settings["method"],
+                           candidate_seed_policy="ordinary_primary_only_v1" if k == 1 else "native_single_winner_v1" if keep_n == 1 else "spherical_localmax26_pole_quotient_2_grid_steps_v1" if self.settings["method"] == "spherical" else "dictionary_raw_top_n_v1",
+                           winner_rank=winner_ranks)
+        valid_trajectory = (diagnostics["retained_order"] > 0) & diagnostics["objective_valid"] & np.isfinite(diagnostics["sse"]) & (diagnostics["sse"] >= 0) & np.isfinite(diagnostics["initial_sse"]) & (diagnostics["initial_sse"] > 1e-12)
+        if not profile and keep_n > 1 and k >= 3 and trajectory_version == 1:
+            provenance = np.array([m._pad for m in progress], np.uint32)
+            if np.any(~np.isin(provenance, [0, 1, 0xffffffff])):
+                raise Error("invalid V5 overlap trajectory provenance")
+            diagnostics["trajectory_source"] = np.where(provenance == 0xffffffff, -1, provenance.astype(np.int64)).astype(np.int32)
+            diagnostics["trajectory_selection"] = "best_valid_final_sse_of_pooled_and_rank1_v1"
+        else:
+            diagnostics["trajectory_source"] = np.where(valid_trajectory, int(keep_n > 1 and k > 1), -1).astype(np.int32)
+            diagnostics["trajectory_selection"] = "ordinary_primary_only_v1" if k == 1 else "rank1_only_v1" if keep_n == 1 else "greedy_pooled_v5"
+        if profile:
+            provenance = np.array([m._pad for m in progress],np.uint32)
+            if np.any(~np.isin(provenance,[0,1,0xffffffff])):
+                raise Error("invalid V6 overlap trajectory provenance")
+            diagnostics.update(profile_version=1, selection_version=selection_version, orientation_polish=bool(polish),
+                polish_radius_deg=float(polish_radius_deg), min_residual_ncc=min_residual_ncc,
+                requested_min_residual_ncc=requested_min_residual_ncc, profile_precision="f32",
+                source_quaternions=source_q, profile_events=profile_events,
+                component_axis="selected support order; source poses and events retain proposal provenance",
+                trajectory_source=np.where(provenance==0xffffffff,-1,provenance.astype(np.int64)).astype(np.int32),
+                trajectory_selection="profiled_achieved_supports_v2" if selection_version == 2 else "profiled_complete_trajectories_v1",
+                residual_screen={"enabled":min_residual_ncc is not None,"minimum":min_residual_ncc,"comparison":"finite inclusive >= before fitting each proposal","confidence_calibrated":False})
+            if staged:
+                diagnostics["stage_gate"] = dict(
+                    version=1, minimum=stage_minimum, requested_minimum=stage_requested, orders=[2, 3, 4],
+                    comparison="(strongest lower-order SSE in the same branch and round minus best joint SSE) divided by original prepared-pattern energy",
+                    joint_candidate="positive addition only; residual NCC screened first", confidence_calibrated=False,
+                )
+        diagnostics.update(self._blur_gain_metadata(blur_gain,theta))
+        diagnostics.update(fit_model="contrast_gain_v1" if contrast else "source_dc_gain_v1",gain_domain=gain_domain)
+        if contrast:
+            diagnostics.update(self._contrast_metadata(diagnostics,amp,norms,phase>=0,theta,"globally_standardized_baked_master_contrast"))
+            diagnostics["contrast_basis_preparation"]={key:self.settings[key] for key in ("master_smooth","clahe","bandpass")}
+        if blur_gain or contrast:
+            moments=np.empty((len(self.phases),5),np.float64)
+            self._check(self._lib.ze_overlap_phase_moments(self._e,_ptr(moments,_n.f64p),moments.size),"overlap_phase_moments")
+            if contrast:
+                provenance=dict(phase_moment_names=["source_mean","source_sd","bake_mean","bake_sd"],phase_moments=moments[:,:4].tolist(),source_dc_restored=False)
+                diagnostics["contrast_basis_preparation"].update(provenance)
+                if blur_gain:diagnostics["blur_gain_optimizer"].update(provenance)
+            else:
+                diagnostics["blur_gain_optimizer"].update(phase_moment_names=["source_mean","source_sd","bake_mean","bake_sd","effective_dc"],phase_moments=moments.tolist(),phase_dc=moments[:,4].tolist(),dc_units="baked_master_standard_deviations")
+        if profile:
+            diagnostics.update(
+                active_count_definition="strictly_positive_compacted_support_size",
+                fitted_count_definition="amplitude_above_1e-6_display_only",
+                profile_optimizer={"version":1,"enabled":bool(polish),"method":"bounded_crystal_frame_axis_poll_variable_projection",
+                    "geometry":"fixed","trust_centre":"immutable_native_source_pose","radius_deg":polish_radius_deg,
+                    "singleton_starts_x_radius_factors":[0,.5,-.5],"joint_starts":1,
+                    "angular_step_radius_factors":[.5,.25,.125],"max_sweeps_per_scale":2,
+                    "nuisance_schedule":"full_at_entry_and_after_final_pose_change; short_after_moving_scale",
+                    "short_nuisance_max_evaluations":15,"max_replacements_per_attempted_order":2,
+                    "best_single_scope":"strongest_achieved_across_eligible_supports_and_both_complete_histories"})
+            if blur_gain:
+                optimizer=diagnostics["blur_gain_optimizer"]
+                optimizer["max_evaluations_per_inner_joint_search"]=optimizer.pop("max_evaluations")
+                optimizer["max_evaluations_per_inner_singleton_search"]=optimizer.pop("singleton_max_evaluations")
+                optimizer.update(evaluation_bound_scope="one_inner_search_not_total_profile",
+                    best_single="strongest_achieved_singleton_across_candidates_and_complete_histories",
+                    best_single_refinement="same_objective_bounded_pose_and_nuisance_profiles_when_enabled",
+                    joint_singleton_seeds={"k1":"separate_coarse_and_polished_theta_tables","k_gt_1":"same_achieved_member_theta_in_both_seed_tables"})
+        return diagnostics
+
+    @property
+    def detector_attitude_version(self):
+        """Oxford camera convention: 2 applied, 0 fallback, None unversioned runtime."""
+        query=getattr(self._lib,"ze_oxford_detector_attitude_version",None)
+        return int(query(self._e)) if query is not None else None
+
+    @property
+    def phase_generation(self):
+        """Native phase-asset epoch; a cheap context token without GPU reads."""
+        return int(self._lib.ze_phase_generation(self._e))
+
+    def orientation_colors(self, quaternions, phase, direction="z"):
+        """Native IPF RGBA colors using exactly the stored-map key and rotations."""
+        q=np.ascontiguousarray(quaternions,dtype=np.float32)
+        p=np.ascontiguousarray(phase,dtype=np.int32)
+        if q.shape != p.shape+(4,) or direction not in ("x","y","z"):
+            raise ValueError("quaternions must have phase.shape+(4,), direction x/y/z")
+        rgba=np.empty(p.shape+(4,),np.uint8)
+        self._check(self._lib.ze_orientation_colors(self._e,_ptr(q,_n.f32p),_ptr(p,_n.i32p),p.size,("x","y","z").index(direction),_ptr(rgba,_n.u8p),rgba.size),"orientation_colors")
+        return rgba
+
+    def overlap_inspect(self, cell, result, row=0, selected_component=0):
+        """Regenerate five prepared-domain images at CURRENT context; freeze it externally."""
+        k=int(result["max_components"])
+        if not 0<=row<len(result["cells"]) or not 0<=selected_component<k or int(result["cells"][row])!=int(cell):
+            raise ValueError("inspection row/cell/selected component mismatch")
+        records=(_n.OverlapComponent*k)()
+        for j in range(k):
+            records[j].q[:]=result["quaternions"][row,j]
+            records[j].phase=int(result["phase"][row,j])
+            records[j].amplitude=float(result["amplitudes"][row,j])
+        full=self.settings["binning"]!=1 and self.settings["full_resolution"]=="all"
+        h,w=self.shape(full=full)
+        images=np.empty((5,h,w),np.float32)
+        fit_model=result.get("fit_model","source_dc_gain_v1")
+        if fit_model not in ("contrast_gain_v1","source_dc_gain_v1"):
+            raise ValueError(f"unsupported overlap fit_model {fit_model}")
+        if fit_model=="contrast_gain_v1" or result.get("blur_gain",False):
+            theta=np.ascontiguousarray(result["blur_gain_theta"][row],np.float32)
+            if theta.shape!=(7,):raise ValueError("expected seven frozen blur/gain parameters")
+            name="ze_overlap_inspect_v4" if fit_model=="contrast_gain_v1" else "ze_overlap_inspect_v3"
+            fn=getattr(self._lib,name,None)
+            if fn is None:raise Error("contrast inspection requires native V4 overlap support")
+            self._check(fn(self._e,int(cell),records,k,int(selected_component),_ptr(theta,_n.f32p),7,_ptr(images,_n.f32p),images.size),"overlap_inspect")
+        else:
+            self._check(self._lib.ze_overlap_inspect(self._e,int(cell),records,k,int(selected_component),_ptr(images,_n.f32p),images.size),"overlap_inspect")
+        return dict(shape=(h,w),**{name:images[i].copy() for i,name in enumerate(("measured","conditional","selected_contribution","composite","residual"))})
+
+    @staticmethod
+    def _contrast_metadata(result,amplitudes,norms,present,theta,basis):
+        norms=norms.copy();norms[~present]=np.nan
+        valid_norm=present & np.isfinite(norms) & (norms>0)
+        beta=np.divide(amplitudes.astype(np.float64),norms,out=np.zeros(amplitudes.shape,np.float64),where=valid_norm)
+        total=beta.sum(axis=1,keepdims=True)
+        reliable=(result["objective_valid"] & result["design_rank_reliable"] & ~result["flat"] & ~result["conditioned"] &
+                  present.any(axis=1) & np.all(~present | valid_norm,axis=1) &
+                  np.all(~present | (np.isfinite(amplitudes) & (amplitudes>=0)),axis=1) &
+                  np.isfinite(total[:,0]) & (total[:,0]>0))
+        weights=np.full(amplitudes.shape,np.nan,np.float32)
+        np.divide(beta,total,out=weights,where=reliable[:,None] & present)
+        metadata=dict(component_norms=norms,contrast_basis_weights=weights,blur_gain_theta=theta.copy(),
+                      fit_model="contrast_gain_v1",gain_domain="contrast",weight_basis=basis,
+                      contrast_nnls_solver="kkt_enumerated_nnls_f32_tree",contrast_anchor="masked_upper_median_radix_f32",
+                      contrast_target_centering="provided_masked_f64_scalar_then_gpu_normalize" if basis=="supplied_projection_contrast" else "existing_once_prepared_target",
+                      component_norm_definition="masked_l2_center_gain_blur_centered_reference")
+        if "blur_gain_optimizer" in result:
+            result["blur_gain_optimizer"]["gain_domain"]="blurred_mask_centered_contrast"
+            result["blur_gain_optimizer"]["target_preparation"]="original_once_no_residual_background_filter"
+            result["blur_gain_optimizer"].update(nnls_solver="kkt_enumerated_nnls_f32_tree",pixel_sse="tiled_tree_parallel_64_lanes",
+                                                   kkt_tolerance_factor=32,kkt_float_epsilon=2**-23)
+        return metadata
+
+    def _blur_gain_metadata(self,enabled,theta):
+        if not enabled:return {"blur_gain":False}
+        query=getattr(self._lib,"ze_overlap_optimizer_version",None)
+        version=int(query()) if query is not None else 1
+        if version not in (1,2):
+            raise Error(f"unsupported overlap optimizer metadata version {version}")
+        fine=dict(log_rho_polish_steps=[.04375,.021875,.0109375,.00546875],
+                  joint_singleton_seeds="coarse_snapshot_then_polished_after_coordinates") if version==2 else {}
+        return dict(blur_gain=True,blur_gain_theta=theta.copy(),
+                    model="shared_blur_gain_prepared_projection_nnls",
+                    blur_gain_parameter_names=["sigma","log_rho","power","axis_y","axis_x","offset_y","offset_x"],
+                    blur_gain_optimizer=dict(method="bounded_coordinate_pattern_search_variable_projection",version=version,
+                        max_evaluations=104 if version==2 else 92,singleton_max_evaluations=96 if version==2 else 88,initial_steps=[1.5,.35,2,.2,.2,.06,.06],scales=[1,.5,.25],sweeps_per_scale=2,
+                        bounds=[[0,5],[-float(np.log(4)),float(np.log(4))],[.25,8],[.6,1.4],[.6,1.4],[-.15,.15],[-.15,.15]],
+                        sigma_units="effective_fit_pixels",gain_domain="prepared_master",physical_fractions=False,
+                        convergence="fixed_budget_local_search",best_single="independently_optimized_per_discovered_pose",best_single_refinement="winning_joint_theta_single_projection",pixel_sse="direct_parallel_64_lanes",**fine))
+
+    def fit_overlap_projections(self, patterns, projections, blur_gain=False, mask=None, gain_domain="source_dc"):
+        """GPU numerical fit for supplied projections, without crystallographic search.
+
+        patterns: (n,h,w); projections: (K,n,h,w), K=1..4. Each vector is centered
+        and unit-normalized on the GPU, without filters/masks. Returns nonnegative
+        amplitudes, signed residual in that normalized target domain, and the same
+        diagnostics as overlap_cells. Four-template fitting is available for model
+        validation. Full-Gram K3/4 spectral conditioning is assessed by the GPU's
+        bounded symmetric Jacobi solver. Every whole design passes a conservative
+        f32 rank check; unresolved designs
+        have NaN joint outputs and retain valid independent single_sse diagnostics.
+        This numerical seam defaults to legacy gain_domain='source_dc'. Explicit
+        gain_domain='contrast' uses V4 and returns component_norms and basis weights
+        in the supplied reference units. With blur_gain=False its theta is identity;
+        blur_gain=True fits bounded shared blur/gain. mask=(row,col,radius) is in fit
+        pixels. The fit is local; no target or residual is background-filtered again.
+        Input arrays are never modified. Maximum 131072 pixels; use binning for discovery.
+        """
+        if gain_domain not in ("contrast","source_dc"):
+            raise ValueError("gain_domain must be 'contrast' or 'source_dc'")
+        contrast=gain_domain=="contrast"
+        if contrast and not hasattr(self._lib,"ze_overlap_fit_v4"):
+            raise Error("contrast gain requires native V4 overlap support; load a current library or explicitly use gain_domain='source_dc'")
+        x = np.ascontiguousarray(patterns, dtype=np.float32)
+        a = np.ascontiguousarray(projections, dtype=np.float32)
+        if x.ndim != 3 or a.ndim != 4 or a.shape[1:] != x.shape or not 1 <= a.shape[0] <= 4 or any(v == 0 for v in x.shape):
+            raise ValueError("patterns must be (n,h,w), projections (K,n,h,w), K=1..4")
+        if not np.isfinite(x).all() or not np.isfinite(a).all():
+            raise ValueError("patterns and projections must be finite")
+        n, h, w = x.shape
+        k = a.shape[0]
+        amp = np.empty((n, k), np.float32)
+        residual = np.empty_like(x)
+        states = (_n.OverlapState * n)()
+        theta=np.empty((n,7),np.float32)
+        norms=np.empty((n,k),np.float32)
+        if blur_gain or contrast:
+            m=np.zeros(3,np.float32) if mask is None else np.ascontiguousarray(mask,np.float32)
+            if m.shape!=(3,) or not np.isfinite(m).all() or m[2]<0:raise ValueError("mask must be (row,col,radius) in fit pixels")
+            m=m.copy();m[2]**=2
+            if contrast:
+                self._check(self._lib.ze_overlap_fit_v4(self._e,_ptr(x,_n.f32p),_ptr(a,_n.f32p),n,k,h,w,_ptr(amp,_n.f32p),_ptr(residual,_n.f32p),states,_ptr(theta,_n.f32p),n,_ptr(m,_n.f32p),3,int(blur_gain),_ptr(norms,_n.f32p),n*k),"fit_overlap_projections_v4")
+            else:
+                self._check(self._lib.ze_overlap_fit_v3(self._e,_ptr(x,_n.f32p),_ptr(a,_n.f32p),n,k,h,w,_ptr(amp,_n.f32p),_ptr(residual,_n.f32p),states,_ptr(theta,_n.f32p),_ptr(m,_n.f32p)),"fit_overlap_projections")
+        else:
+            if mask is not None:raise ValueError("mask requires blur_gain=True")
+            self._check(self._lib.ze_overlap_fit(self._e, _ptr(x, _n.f32p), _ptr(a, _n.f32p), n, k, h, w,
+                                               _ptr(amp, _n.f32p), _ptr(residual, _n.f32p), states), "fit_overlap_projections")
+        result = self._overlap_diagnostics(states, amp)
+        result["residual"] = residual
+        result.update(self._blur_gain_metadata(blur_gain,theta))
+        result.update(fit_model="contrast_gain_v1" if contrast else "source_dc_gain_v1",gain_domain=gain_domain)
+        if contrast:result.update(self._contrast_metadata(result,amp,norms,np.ones(amp.shape,bool),theta,"supplied_projection_contrast"))
+        return result
 
     def tune(self, progress=None):
         """Fit how the work is cut up to this machine and this scan. A sample of the region is

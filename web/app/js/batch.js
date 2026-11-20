@@ -1,4 +1,4 @@
-import { isOxfordH5, OXFORD_SOURCE_PC_WARNING } from "./oxford-export-policy.js";
+import { isOxfordH5, OXFORD_SOURCE_PC_WARNING, geometryConvention, canRestoreGeometry } from "./oxford-export-policy.js";
 import { BatchDownloads } from "./batch-downloads.js";
 // Batch indexing owns its engine and GPU device. It never borrows the interactive engine.
 const HINTS = ["map_rows", "map_cols", "pattern_height", "pattern_width"];
@@ -71,7 +71,7 @@ function snapshot(spec) {
     settings: freeze(clone(spec.settings)), geometry: freeze(clone(spec.geometry)),
     openGeometry: spec.openGeometry == null ? null : freeze(clone(spec.openGeometry)),
     openHints: freeze(openHints), scanInfo: freeze(clone(spec.scanInfo)),
-    phases: freeze(clone(spec.phases || [])), version: clone(spec.version ?? null),
+    phases: freeze(clone(spec.phases || [])), version: clone(spec.version ?? null), detectorAttitudeVersion: spec.detectorAttitudeVersion ?? null,
     sources: freeze(sourceFiles.map(descriptor)), masters: freeze(masterFiles.map(descriptor)),
   };
 }
@@ -237,7 +237,8 @@ export class BatchQueue {
   }
   _journalData(job, completing = false) {
     return { zebsdsolve: job.version, scan: job.sourceFiles[0].name,
-      geometry_convention: isOxfordH5(job.scanInfo.format) ? "oxford-calibrated-v1" : "generic-v1",
+      geometry_convention: geometryConvention(job.scanInfo.format,job.detectorAttitudeVersion),
+      oxford_detector_attitude_version: job.detectorAttitudeVersion,
       geometry: job.geometry, settings: job.settings, source_files: job.sources, master_files: job.masters,
       phases: job.phases, opening_hints: job.openHints, acquisition_geometry: job.openGeometry, scan_info: job.scanInfo,
       warnings: job.warnings, map_source: "native engine map: IPF-Z and detector NCC; same frame and colors as the GUI",
@@ -312,6 +313,7 @@ export class BatchQueue {
     const opened = await engine.openScan(job.sourceFiles);
     const actual = engine.scan || engine.scanInfo || opened;
     for (const key of SCAN_FIELDS) if (job.scanInfo[key] !== actual?.[key]) throw new Error(`Scan ${key} changed: expected ${job.scanInfo[key]}, got ${actual?.[key]}.`);
+    if(!canRestoreGeometry(geometryConvention(job.scanInfo.format,job.detectorAttitudeVersion),actual?.format,engine.detectorAttitudeVersion))throw new Error("Oxford camera convention changed; reopen the acquisition and recreate this batch job.");
     engine.configure(clone(job.settings));
     engine.setGeometry(clone(job.geometry));
     await engine.clearPhases();

@@ -35,6 +35,92 @@ const PROJECTIONS = ["globe", "lambert", "stereographic", "joint"];
 const WARM_KEY = "zebsdsolve.pipelines.v1";
 const WARM_MAX = 400;
 
+export const overlapStopReasons = Object.freeze(["running","component_limit","flat_residual","no_proposal","unresolved_addition","boundary","missing_primary","flat_target","attempt_limit","invalid_target","stale_primary","residual_screen","replacement_limit","stage_improvement"]);
+
+export function overlapBlurGainMetadata(enabled, theta, runtimeExports={}) {
+  if(!enabled)return {blur_gain:false};
+  const version=runtimeExports.ze_overlap_optimizer_version?.()??1;
+  if(version!==1 && version!==2)throw new RangeError(`unsupported overlap optimizer metadata version ${version}`);
+  const fine=version===2?{log_rho_polish_steps:[.04375,.021875,.0109375,.00546875],joint_singleton_seeds:"coarse_snapshot_then_polished_after_coordinates"}:{};
+  return {blur_gain:true,blur_gain_theta:Float32Array.from(theta),model:"shared_blur_gain_prepared_projection_nnls",
+    blur_gain_parameter_names:["sigma","log_rho","power","axis_y","axis_x","offset_y","offset_x"],
+    blur_gain_optimizer:{method:"bounded_coordinate_pattern_search_variable_projection",version,max_evaluations:version===2?104:92,singleton_max_evaluations:version===2?96:88,initial_steps:[1.5,.35,2,.2,.2,.06,.06],scales:[1,.5,.25],sweeps_per_scale:2,...fine,
+      bounds:[[0,5],[-Math.log(4),Math.log(4)],[.25,8],[.6,1.4],[.6,1.4],[-.15,.15],[-.15,.15]],sigma_units:"effective_fit_pixels",gain_domain:"prepared_master",physical_fractions:false,
+      convergence:"fixed_budget_local_search",best_single:"independently_optimized_per_discovered_pose",best_single_refinement:"winning_joint_theta_single_projection",pixel_sse:"direct_parallel_64_lanes"}};
+}
+
+/** Undo only numerical column normalization; these are declared basis weights. */
+export function contrastBasisMetadata(result, norms, theta, basis="globally_standardized_baked_master_contrast") {
+  const k=result.max_components??result.maxComponents??(norms.length/result.sse.length),n=result.sse.length;
+  const component_norms=Float32Array.from(norms),weights=new Float32Array(n*k).fill(NaN);
+  for(let b=0;b<n;b++){
+    let valid=!!result.objective_valid[b]&&!!result.design_rank_reliable[b]&&!result.flat[b]&&!result.conditioned[b],sum=0,count=0;
+    for(let j=0;j<k;j++){
+      const i=b*k+j,present=result.phase?result.phase[i]>=0:true,d=component_norms[i],a=result.amplitudes[i];
+      if(!present){component_norms[i]=NaN;continue;}
+      count++;if(!Number.isFinite(d)||d<=0||!Number.isFinite(a)||a<0)valid=false;
+      sum+=a/d;
+    }
+    valid=valid&&count>0&&Number.isFinite(sum)&&sum>0;
+    if(valid)for(let j=0;j<k;j++){const i=b*k+j;if(!result.phase||result.phase[i]>=0)weights[i]=(result.amplitudes[i]/component_norms[i])/sum;}
+  }
+  if(result.blur_gain_optimizer)Object.assign(result.blur_gain_optimizer,{gain_domain:"blurred_mask_centered_contrast",target_preparation:"original_once_no_residual_background_filter",nnls_solver:"kkt_enumerated_nnls_f32_tree",pixel_sse:"tiled_tree_parallel_64_lanes",kkt_tolerance_factor:32,kkt_float_epsilon:2**-23});
+  return {component_norms,contrast_basis_weights:weights,blur_gain_theta:Float32Array.from(theta),fit_model:"contrast_gain_v1",gain_domain:"contrast",weight_basis:basis,contrast_nnls_solver:"kkt_enumerated_nnls_f32_tree",contrast_anchor:"masked_upper_median_radix_f32",contrast_target_centering:basis==="supplied_projection_contrast"?"provided_masked_f64_scalar_then_gpu_normalize":"existing_once_prepared_target",component_norm_definition:"masked_l2_center_gain_blur_centered_reference"};
+}
+
+/** Decode native records only; no crystal mathematics is implemented in JS. */
+export function decodeOverlapArrays(records, state, progress, cells, k) {
+  const n=cells.length, cv=new DataView(records.buffer,records.byteOffset,records.byteLength);
+  const pv=new DataView(progress.buffer,progress.byteOffset,progress.byteLength);
+  const out={cells:Float64Array.from(cells,Number),max_components:k,maxComponents:k,
+    quaternions:new Float32Array(n*k*4),phase:new Int32Array(n*k),amplitudes:new Float32Array(n*k),
+    prepared_fractions:new Float32Array(n*k).fill(NaN),proposal_ncc:new Float32Array(n*k),proposal_nmi:new Float32Array(n*k),
+    discovery_id:new Int32Array(n*k).fill(-1),single_sse:new Float32Array(n*k),
+    model:"fixed_prepared_projection_nnls",assessment:"unassessed_candidates",domain:"zero_mean_unit_norm_prepared_pattern",physical_fractions:false,blur_gain_parity:false};
+  for(const key of ["sse","initial_sse","residual_norm","mixture_ncc","best_single_sse","improvement_over_best_single","component_correlation","relative_gram_condition","previous_sse","incremental_improvement"])out[key]=new Float32Array(n);
+  for(const key of ["flags","candidate_count","fitted_count","retained_order","proposed_count","active_count","stop_reason","objective_order"])out[key]=new Uint32Array(n);
+  for(const key of ["conditioned","flat","conditioning_assessed","residual_flat","objective_valid","attribution_unresolved","unresolved_candidate_skipped","design_rank_reliable","addition_unresolved"])out[key]=new Uint8Array(n);
+  out.solve_status=[];out.stop_reason_name=[];
+  for(let b=0;b<n;b++) {
+    const offset=b*16, flags=Math.round(state[offset+3]), stop=pv.getUint32(b*32+12,true);
+    let sum=0;
+    for(let j=0;j<k;j++) {
+      const a=b*k+j,o=a*32;
+      for(let t=0;t<4;t++)out.quaternions[a*4+t]=cv.getFloat32(o+t*4,true);
+      out.amplitudes[a]=cv.getFloat32(o+16,true);sum+=out.amplitudes[a];
+      out.phase[a]=cv.getInt32(o+20,true);out.proposal_ncc[a]=out.phase[a]>=0?cv.getFloat32(o+24,true):NaN;out.proposal_nmi[a]=out.phase[a]>=0?cv.getFloat32(o+28,true):NaN;
+      out.single_sse[a]=out.phase[a]>=0?state[offset+8+j]:NaN;
+      if(out.phase[a]>=0){out.discovery_id[a]=j;out.candidate_count[b]++;}
+      if(out.amplitudes[a]>1e-6)out.fitted_count[b]++;
+    }
+    if(sum>1e-12 && !(flags&1))for(let j=0;j<k;j++)out.prepared_fractions[b*k+j]=out.amplitudes[b*k+j]/sum;
+    const ss=state[offset],initial=state[offset+1],condition=state[offset+13];
+    out.sse[b]=ss;out.initial_sse[b]=initial;out.residual_norm[b]=Math.sqrt(Math.max(ss,0));
+    out.mixture_ncc[b]=Math.sqrt(Math.max(0,Math.min(1,1-(initial>1e-12&&sum>0?ss/initial:NaN))));
+    out.best_single_sse[b]=state[offset+14];out.improvement_over_best_single[b]=Math.max(0,state[offset+14]-ss);
+    out.flags[b]=flags;out.conditioned[b]=!!(flags&1);out.flat[b]=!!(flags&2);
+    out.conditioning_assessed[b]=!(flags&(2|4))&&Number.isFinite(condition);out.relative_gram_condition[b]=out.conditioning_assessed[b]?condition:NaN;
+    out.component_correlation[b]=state[offset+12];out.residual_flat[b]=ss<=1e-8*Math.max(initial,1e-30);
+    out.objective_valid[b]=!(flags&8)&&stop!==6&&stop!==10;out.attribution_unresolved[b]=!!(flags&8);out.unresolved_candidate_skipped[b]=!!(flags&16);
+    out.design_rank_reliable[b]=!(flags&(8|2));out.addition_unresolved[b]=stop===4;
+    for(const [key,o]of [["retained_order",0],["proposed_count",4],["active_count",8],["stop_reason",12]])out[key][b]=pv.getUint32(b*32+o,true);
+    out.objective_order[b]=out.retained_order[b];out.previous_sse[b]=pv.getFloat32(b*32+16,true);out.incremental_improvement[b]=pv.getFloat32(b*32+20,true);
+    out.stop_reason_name[b]=overlapStopReasons[stop]??"unknown";
+    const unavailable=[6,9,10].includes(stop)||(out.retained_order[b]===0&&!out.flat[b]);
+    if(unavailable) {
+      out.objective_valid[b]=0;out.conditioning_assessed[b]=0;out.design_rank_reliable[b]=0;out.residual_flat[b]=0;
+      for(const key of ["sse","initial_sse","residual_norm","mixture_ncc","best_single_sse","improvement_over_best_single","component_correlation","relative_gram_condition","previous_sse","incremental_improvement"])out[key][b]=NaN;
+      for(let j=0;j<k;j++){out.single_sse[b*k+j]=NaN;out.prepared_fractions[b*k+j]=NaN;}
+    }
+    if(out.retained_order[b]===0) {
+      out.conditioning_assessed[b]=0;out.design_rank_reliable[b]=0;
+      for(const key of ["best_single_sse","improvement_over_best_single","component_correlation","relative_gram_condition","previous_sse","incremental_improvement"])out[key][b]=NaN;
+    }
+    out.solve_status[b]=unavailable?out.stop_reason_name[b]:flags&8?"numerically_unresolved":flags&2?"flat_target":flags&16?"unresolved_candidate_skipped":flags&4?"conditioning_unassessed":flags&1?"ill_conditioned":"solved";
+  }
+  return out;
+}
+
 function hashCode(str) {
   let h = 0x811c9dc5;
   for (let i = 0; i < str.length; i++) h = Math.imul(h ^ str.charCodeAt(i), 0x01000193);
@@ -398,12 +484,46 @@ function ioImports(state) {
   };
 }
 
+
+/** Decode host provenance only for the capability/version that owns offset 28. */
+export function overlapTrajectoryMetadata(out, progress, keepN, k, version=0) {
+  const n=out.retained_order.length;
+  if(keepN>1&&k>=3&&![0,1].includes(version))throw new Error(`unsupported overlap trajectory version ${version}`);
+  if(keepN>1&&k>=3&&version===1){
+    const pv=new DataView(progress.buffer,progress.byteOffset,progress.byteLength);
+    return {trajectory_selection:"best_valid_final_sse_of_pooled_and_rank1_v1",
+      trajectory_source:Int32Array.from({length:n},(_,b)=>{
+        const source=pv.getUint32(b*32+28,true);
+        if(![0,1,0xffffffff].includes(source))throw new Error("invalid V5 overlap trajectory provenance");
+        return source===0xffffffff?-1:source;
+      })};
+  }
+  return {trajectory_selection:k===1?"ordinary_primary_only_v1":keepN===1?"rank1_only_v1":"greedy_pooled_v5",
+    trajectory_source:Int32Array.from({length:n},(_,b)=>out.retained_order[b]>0&&out.objective_valid[b]&&Number.isFinite(out.sse[b])&&out.sse[b]>=0&&Number.isFinite(out.initial_sse[b])&&out.initial_sse[b]>1e-12?(keepN>1&&k>1?1:0):-1)};
+}
+
+/** V6 request-local trace; cells map local indices back to immutable scan IDs. */
+export function decodeOverlapProfileEvents(bytes, cells, selectionVersion=1, staged=false) {
+  const flagMask = staged ? 4095 : selectionVersion === 2 ? 1023 : 255;
+  if(bytes.byteLength%64)throw new RangeError("V6 overlap trace must contain complete 64-byte events");
+  const v=new DataView(bytes.buffer,bytes.byteOffset,bytes.byteLength),events=[];
+  for(let o=0;o<bytes.byteLength;o+=64){
+    const cell_index=v.getUint32(o,true),branch=v.getUint32(o+4,true),flags=v.getUint32(o+24,true);
+    if(cell_index>=cells.length||branch>1||(flags&~flagMask))throw new Error("invalid V6 overlap event");
+    events.push({cell_index,cell:Number(cells[cell_index]),branch,order:v.getUint32(o+8,true),attempt:v.getUint32(o+12,true),
+      phase:v.getInt32(o+16,true),rank:v.getInt32(o+20,true),flags,result_order:v.getUint32(o+28,true),
+      source_q:Array.from({length:4},(_,j)=>v.getFloat32(o+32+j*4,true)),residual_ncc:v.getFloat32(o+48,true),
+      baseline_sse:v.getFloat32(o+52,true),lower_sse:v.getFloat32(o+56,true),joint_sse:v.getFloat32(o+60,true)});
+  }
+  return events;
+}
+
 // Exports that never wait (plain calls); every other function export may suspend (on the GPU
 // or on a file read) and is called through WebAssembly.promising.
-const SYNC_EXPORTS = new Set(["ze_alloc", "ze_free", "ze_version", "ze_create", "ze_destroy", "ze_adapter", "ze_error",
+const SYNC_EXPORTS = new Set(["ze_alloc", "ze_free", "ze_version", "ze_overlap_optimizer_version", "ze_overlap_trajectory_version", "ze_overlap_profile_version", "ze_overlap_profile_selection_version", "ze_overlap_stage_gate_version", "ze_oxford_detector_attitude_version", "ze_overlap_profile_trace_capacity", "ze_create", "ze_destroy", "ze_adapter", "ze_error",
   "ze_has_acquisition_calibration", "ze_configure", "ze_settings", "ze_events", "ze_cancel", "ze_close_scan", "ze_scan_info", "ze_scan_format", "ze_scan_overview_kind", "ze_chunk_index_status",
   "ze_get_geometry", "ze_set_geometry", "ze_clear_phases", "ze_phase_count", "ze_phase_info", "ze_pattern_shape", "ze_nlpar_view",
-  "ze_pc_scores", "ze_fit_patterns", "ze_results", "ze_map", "ze_ipf_key", "ze_export", "ze_export_snapshot", "ze_export_oxford_snapshot", "ze_result_checkpoint", "ze_restore_result_checkpoint", "ze_result_chance", "ze_bunge", "ze_reduce", "ze_disorientation", "ze_shader",
+  "ze_seed_source_roi", "ze_stored_primary_validity", "ze_phase_generation", "ze_orientation_colors", "ze_pc_scores", "ze_fit_patterns", "ze_results", "ze_map", "ze_ipf_key", "ze_export", "ze_export_snapshot", "ze_export_oxford_snapshot", "ze_result_checkpoint", "ze_restore_result_checkpoint", "ze_result_chance", "ze_bunge", "ze_reduce", "ze_disorientation", "ze_shader",
   "ze_index_status", "ze_tune_begin", "ze_tune_report", "ze_pixel_angle", "ze_lattice", "ze_sweep", "ze_pc_level_count", "ze_pc_level", "ze_pc_level_ballots",
   "ze_gpu_counts", "ze_profile", "ze_profile_report", "ze_compile_wgsl", "ze_plane_points",
   "ze_sim_read_cif", "ze_sim_set_crystal", "ze_sim_edit_crystal", "ze_sim_crystal", "ze_sim_sheets", "ze_sim_add_phase", "ze_sim_npz",
@@ -517,6 +637,10 @@ export class Zebsdsolve {
     this.e = x.ze_create();
     if (!this.e) throw new Error("zebsdsolve: engine creation failed");
   }
+
+  /** Cheap native asset epoch, independent of warm-up/index scheduling. */
+  get phaseGeneration() { return this._frame(()=>Number(this.x.ze_phase_generation(this.e))); }
+  get detectorAttitudeVersion() { return this.x.ze_oxford_detector_attitude_version?.(this.e) ?? null; }
 
   get hasAcquisitionCalibration() { return !!this._frame(() => this.x.ze_has_acquisition_calibration(this.e)); }
   get device() { return this.state.device; }
@@ -1358,6 +1482,183 @@ export class Zebsdsolve {
       } else this._check(await this.x.ze_index_cells(this.e, f.u64(cells), n, p, nPh * n * 8), "index_cells");
       return new Float32Array(this.mem, p, nPh * n * 8).slice();
     }));
+  }
+
+  /** Candidate overlap fit; flat arrays use [cell, discovery slot, quaternion].
+   * Stored primary mode requires the exact current primary context. Missing cells
+   * return stop_reason=6. Caller commits a batch only after successful resolution. */
+  overlapCells(cells, {maxComponents=2, primary="search",fitBlurGain=false,gainDomain="contrast",keepN=1,polish=false,minResidualNcc=null,minStageImprovement=null,polishRadiusDeg=1}={}) {
+    if(typeof polish!=="boolean")throw new RangeError("polish must be a boolean");
+    if(typeof polishRadiusDeg!=="number"||!Number.isFinite(polishRadiusDeg)||polishRadiusDeg<=0||polishRadiusDeg>5)throw new RangeError("polishRadiusDeg must be >0 and <=5 degrees");
+    if(minResidualNcc!==null&&(typeof minResidualNcc!=="number"||!Number.isFinite(minResidualNcc)||minResidualNcc< -1||minResidualNcc>1))throw new RangeError("minResidualNcc must be null or finite in [-1,1]");
+    const staged = minStageImprovement !== null;
+    let requestedStageImprovement = null, stageMinimum = null;
+    if (staged) {
+      if (minResidualNcc === null) throw new RangeError("Stage improvement requires residual NCC screening");
+      if (![2, 3, 4].includes(maxComponents) || !Array.isArray(minStageImprovement) || minStageImprovement.length !== 3 ||
+          Array.from(minStageImprovement).some((v, i) => i >= maxComponents - 1 ? v !== null : !Number.isFinite(v) || v < 0 || v > 1)) {
+        throw new RangeError("Enter a ΔSSE minimum in [0, 1] for each requested addition, with null for unused stages");
+      }
+      if (this.x.ze_overlap_stage_gate_version?.() !== 1) throw new Error("Stage improvement requires a current WASM overlap module");
+      requestedStageImprovement = [...minStageImprovement];
+      stageMinimum = requestedStageImprovement.map(v => v === null ? null : Math.fround(v));
+    }
+    const requestedMinResidualNcc=minResidualNcc;
+    if(minResidualNcc!==null)minResidualNcc=Math.fround(minResidualNcc);
+    polishRadiusDeg=Math.fround(polishRadiusDeg);
+    const profile=polish||minResidualNcc!==null;
+    let selectionVersion = 1;
+    if(profile){
+      if(gainDomain!=="contrast")throw new RangeError("overlap profiling requires contrast gain");
+      if(!this.x.ze_overlap_cells_v6||!this.x.ze_overlap_profile_version||!this.x.ze_overlap_profile_trace_capacity)throw new Error("overlap profiling requires WASM V6 support; load a current module");
+      if(this.x.ze_overlap_profile_version()!==1)throw new Error("unsupported overlap profile version");
+      selectionVersion = this.x.ze_overlap_profile_selection_version?.() ?? 1;
+      if (![1, 2].includes(selectionVersion)) throw new Error("unsupported overlap selection version");
+    }
+    if(!["contrast","source_dc"].includes(gainDomain))throw new RangeError("gainDomain must be contrast or source_dc");
+    if(!Number.isInteger(keepN)||keepN<1||keepN>8)throw new RangeError("keepN must be an integer from 1 through 8");
+    if(keepN>1&&maxComponents>1){
+      if(gainDomain!=="contrast")throw new RangeError("keepN > 1 requires contrast gain");
+      if(this.settings.method==="pca")throw new RangeError("keepN > 1 does not support PCA proposals");
+      if(!this.x.ze_overlap_cells_v5)throw new Error("keepN > 1 requires WASM V5 overlap support; load a current module");
+    }
+    const contrast=gainDomain==="contrast";
+    if(contrast&&!this.x.ze_overlap_cells_v4)throw new Error("contrast gain requires WASM V4 overlap support; load a current module or explicitly use gainDomain:'source_dc'");
+    if(!Number.isInteger(maxComponents)||maxComponents<1||maxComponents>4)throw new RangeError("maxComponents must be 1..4");
+    if(!["search","stored"].includes(primary))throw new RangeError("primary must be search or stored");
+    cells=Array.from(cells,Number);
+    if(cells.some(c=>!Number.isSafeInteger(c)||c<0))throw new RangeError("cells must be nonnegative safe integers");
+    return this._serial(()=>this._frame(async f=>{
+      const n=cells.length,k=maxComponents,cp=f.alloc(n*k*32),sp=f.alloc(n*64),mp=f.alloc(n*32);
+      const tp=fitBlurGain||contrast?f.alloc(n*7*4):0,np=contrast?f.alloc(n*k*4):0;
+      const wp=profile||keepN>1&&k>1?f.alloc(n*k*4):0;
+      let profileEvents=[],sourceQ=null;
+      const trajectoryVersion=keepN>1&&k>=3&&this.x.ze_overlap_trajectory_version?this.x.ze_overlap_trajectory_version():0;
+      if(![0,1].includes(trajectoryVersion))throw new Error(`unsupported overlap trajectory version ${trajectoryVersion}`);
+      if(profile){
+        const capacity=this.x.ze_overlap_profile_trace_capacity(this.e,n,k,keepN);
+        if(n&&(!Number.isSafeInteger(capacity)||capacity<=0))throw new Error("invalid V6 overlap trace capacity");
+        const optionsSize = staged ? 28 : 16;
+        const options=f.alloc(optionsSize),ov=new DataView(this.mem,options,optionsSize);
+        ov.setUint32(0,optionsSize,true);ov.setUint32(4,(polish?1:0)|(minResidualNcc!==null?2:0)|(selectionVersion===2?4:0),true);
+        ov.setFloat32(8,polishRadiusDeg,true);ov.setFloat32(12,minResidualNcc??0,true);
+        if (staged) stageMinimum.forEach((v, i) => ov.setFloat32(16+4*i,v??0,true));
+        const qp=f.alloc(n*k*16),ep=f.alloc(capacity*64),countp=f.alloc(4);
+        this._check(await this.x.ze_overlap_cells_v6(this.e,f.u64(cells),n,k,primary==="stored"?1:0,fitBlurGain?1:0,keepN,cp,n*k,sp,n,mp,n,tp,n,np,n*k,wp,n*k,options,qp,n*k,ep,capacity,countp),"overlap_cells_v6");
+        const count=new DataView(this.mem,countp,4).getUint32(0,true);
+        if(count>capacity)throw new Error("V6 overlap trace exceeds allocated capacity");
+        sourceQ=new Float32Array(this.mem,qp,n*k*4).slice();
+        profileEvents=decodeOverlapProfileEvents(new Uint8Array(this.mem,ep,count*64),cells,selectionVersion,staged);
+      }else if(contrast&&keepN>1&&k>1)this._check(await this.x.ze_overlap_cells_v5(this.e,f.u64(cells),n,k,primary==="stored"?1:0,fitBlurGain?1:0,keepN,cp,n*k,sp,n,mp,n,tp,n,np,n*k,wp,n*k),"overlap_cells_v5");
+      else if(contrast)this._check(await this.x.ze_overlap_cells_v4(this.e,f.u64(cells),n,k,primary==="stored"?1:0,fitBlurGain?1:0,cp,n*k,sp,n,mp,n,tp,n,np,n*k),"overlap_cells_v4");
+      else if(fitBlurGain)this._check(await this.x.ze_overlap_cells_v3(this.e,f.u64(cells),n,k,primary==="stored"?1:0,cp,n*k,sp,n,mp,n,tp,n),"overlap_cells");
+      else this._check(await this.x.ze_overlap_cells_v2(this.e,f.u64(cells),n,k,primary==="stored"?1:0,cp,n*k,sp,n,mp,n),"overlap_cells");
+      const out=decodeOverlapArrays(new Uint8Array(this.mem,cp,n*k*32).slice(),new Float32Array(this.mem,sp,n*16).slice(),new Uint8Array(this.mem,mp,n*32).slice(),cells,k);
+      out.winner_rank=wp?new Int32Array(this.mem,wp,n*k).slice():Int32Array.from(out.phase,(phase,i)=>phase<0?-1:i%k===0?0:1);
+      Object.assign(out,{keep_n:keepN,candidate_method:this.settings.method,
+        candidate_seed_policy:k===1?"ordinary_primary_only_v1":keepN===1?"native_single_winner_v1":this.settings.method==="spherical"?"spherical_localmax26_pole_quotient_2_grid_steps_v1":"dictionary_raw_top_n_v1"});
+      Object.assign(out,overlapTrajectoryMetadata(out,new Uint8Array(this.mem,mp,n*32),keepN,k,trajectoryVersion));
+      if(profile){
+        const pv=new DataView(this.mem,mp,n*32);
+        Object.assign(out,{profile_version:1,selection_version:selectionVersion,orientation_polish:polish,polish_radius_deg:polishRadiusDeg,min_residual_ncc:minResidualNcc,
+          source_quaternions:sourceQ,profile_events:profileEvents,requested_min_residual_ncc:requestedMinResidualNcc,profile_precision:"f32",
+          component_axis:"selected support order; source poses and events retain proposal provenance",
+          trajectory_selection:selectionVersion===2?"profiled_achieved_supports_v2":"profiled_complete_trajectories_v1",
+          trajectory_source:Int32Array.from({length:n},(_,b)=>{const p=pv.getUint32(b*32+28,true);if(![0,1,0xffffffff].includes(p))throw Error("invalid V6 overlap trajectory provenance");return p===0xffffffff?-1:p;}),
+          residual_screen:{enabled:minResidualNcc!==null,minimum:minResidualNcc,comparison:"finite inclusive >= before fitting each proposal",confidence_calibrated:false}});
+        if (staged) out.stage_gate = {
+          version:1, minimum:stageMinimum, requested_minimum:requestedStageImprovement,
+          orders:[2,3,4], comparison:"(strongest lower-order SSE in the same branch and round minus best joint SSE) divided by original prepared-pattern energy",
+          joint_candidate:"positive addition only; residual NCC screened first",
+          confidence_calibrated:false,
+        };
+      }
+      const rp=f.alloc(16),hasROI=primary==="stored"&&this.x.ze_seed_source_roi(this.e,rp);
+      const seed_source_roi=hasROI?Array.from(new Uint32Array(this.mem,rp,4)):null;
+      const metadata=overlapBlurGainMetadata(fitBlurGain,fitBlurGain?new Float32Array(this.mem,tp,n*7):null,this.x);
+      Object.assign(metadata,{fit_model:contrast?"contrast_gain_v1":"source_dc_gain_v1",gain_domain:gainDomain});
+      if(contrast){
+        Object.assign(out,metadata);
+        Object.assign(metadata,contrastBasisMetadata(out,new Float32Array(this.mem,np,n*k),new Float32Array(this.mem,tp,n*7)));
+        const settings=this.settings;
+        metadata.contrast_basis_preparation=Object.fromEntries(["master_smooth","clahe","bandpass"].map(key=>[key,settings[key]]));
+      }
+      if(fitBlurGain||contrast){
+        const phases=this.phases.length,moments=f.alloc(phases*5*8);
+        this._check(this.x.ze_overlap_phase_moments(this.e,moments,phases*5),"overlap_phase_moments");
+        const values=new Float64Array(this.mem,moments,phases*5),rows=Array.from({length:phases},(_,i)=>Array.from(values.slice(i*5,(i+1)*5)));
+        if(contrast){
+          const provenance={phase_moment_names:["source_mean","source_sd","bake_mean","bake_sd"],phase_moments:rows.map(row=>row.slice(0,4)),source_dc_restored:false};
+          Object.assign(metadata.contrast_basis_preparation,provenance);
+          if(fitBlurGain)Object.assign(metadata.blur_gain_optimizer,provenance);
+        }else Object.assign(metadata.blur_gain_optimizer,{phase_moment_names:["source_mean","source_sd","bake_mean","bake_sd","effective_dc"],phase_moments:rows,phase_dc:rows.map(row=>row[4]),dc_units:"baked_master_standard_deviations"});
+      }
+      if(profile){
+        Object.assign(metadata,{active_count_definition:"strictly_positive_compacted_support_size",fitted_count_definition:"amplitude_above_1e-6_display_only",
+          profile_optimizer:{version:1,enabled:polish,method:"bounded_crystal_frame_axis_poll_variable_projection",geometry:"fixed",trust_centre:"immutable_native_source_pose",radius_deg:polishRadiusDeg,
+            singleton_starts_x_radius_factors:[0,.5,-.5],joint_starts:1,angular_step_radius_factors:[.5,.25,.125],max_sweeps_per_scale:2,
+            nuisance_schedule:"full_at_entry_and_after_final_pose_change; short_after_moving_scale",short_nuisance_max_evaluations:15,max_replacements_per_attempted_order:2,
+            best_single_scope:"strongest_achieved_across_eligible_supports_and_both_complete_histories"}});
+        if(fitBlurGain){const optimizer=metadata.blur_gain_optimizer;
+          optimizer.max_evaluations_per_inner_joint_search=optimizer.max_evaluations;delete optimizer.max_evaluations;
+          optimizer.max_evaluations_per_inner_singleton_search=optimizer.singleton_max_evaluations;delete optimizer.singleton_max_evaluations;
+          Object.assign(optimizer,{evaluation_bound_scope:"one_inner_search_not_total_profile",best_single:"strongest_achieved_singleton_across_candidates_and_complete_histories",
+            best_single_refinement:"same_objective_bounded_pose_and_nuisance_profiles_when_enabled",joint_singleton_seeds:{k1:"separate_coarse_and_polished_theta_tables",k_gt_1:"same_achieved_member_theta_in_both_seed_tables"}});
+        }
+      }
+      return Object.assign(out,metadata,{primary,seed_source_roi,geometry:this.geometry,settings:this.settings,phases:this.phases,oxford_detector_attitude_version:this.detectorAttitudeVersion});
+    }));
+  }
+
+  /** Arbitrary-component native IPF RGBA, matching native map colors exactly. */
+  orientationColors(quaternions, phase, direction="z") {
+    const q=Float32Array.from(quaternions),p=Int32Array.from(phase),axis=["x","y","z"].indexOf(direction);
+    if(q.length!==p.length*4||axis<0)throw new RangeError("q length must be 4*phase length and direction x/y/z");
+    return this._frame(f=>{
+      const pp=f.alloc(p.length*4),out=f.alloc(p.length*4);new Int32Array(this.mem,pp,p.length).set(p);
+      this._check(this.x.ze_orientation_colors(this.e,f.f32(q),pp,p.length,axis,out,p.length*4),"orientation_colors");
+      return new Uint8ClampedArray(this.mem,out,p.length*4).slice();
+    });
+  }
+
+  /** Regenerate at CURRENT native context. The caller must reject stale results. */
+  overlapInspect(cell,result,row=0,selectedComponent=0) {
+    const k=result.max_components??result.maxComponents;
+    if(!Number.isSafeInteger(cell)||cell<0||!Number.isInteger(row)||row<0||row>=result.cells.length||Number(result.cells[row])!==cell||!Number.isInteger(selectedComponent)||selectedComponent<0||selectedComponent>=k)throw new RangeError("inspection row/cell/component mismatch");
+    return this._serial(()=>this._frame(async f=>{
+      const cp=f.alloc(k*32),v=new DataView(this.mem,cp,k*32);
+      for(let j=0;j<k;j++){
+        const index=row*k+j;
+        for(let t=0;t<4;t++)v.setFloat32(j*32+t*4,result.quaternions[index*4+t],true);
+        v.setFloat32(j*32+16,result.amplitudes[index],true);v.setInt32(j*32+20,result.phase[index],true);
+        v.setFloat32(j*32+24,result.proposal_ncc?.[index]??0,true);v.setFloat32(j*32+28,result.proposal_nmi?.[index]??0,true);
+      }
+      const st=this.settings,[h,w]=this.shape(st.binning!==1&&st.full_resolution==="all"),px=h*w,out=f.alloc(5*px*4);
+      const fitModel=result.fit_model??"source_dc_gain_v1";
+      if(!["contrast_gain_v1","source_dc_gain_v1"].includes(fitModel))throw new RangeError(`unsupported overlap fit_model ${fitModel}`);
+      if(fitModel==="contrast_gain_v1"||result.blur_gain){
+        const theta=Float32Array.from(result.blur_gain_theta.slice(row*7,(row+1)*7));
+        if(theta.length!==7)throw new RangeError("expected seven frozen blur/gain parameters");
+        const inspect=fitModel==="contrast_gain_v1"?this.x.ze_overlap_inspect_v4:this.x.ze_overlap_inspect_v3;
+        if(!inspect)throw new Error("contrast inspection requires WASM V4 overlap support");
+        this._check(await inspect(this.e,BigInt(cell),cp,k,selectedComponent,f.f32(theta),7,out,5*px),"overlap_inspect");
+      }else this._check(await this.x.ze_overlap_inspect(this.e,BigInt(cell),cp,k,selectedComponent,out,5*px),"overlap_inspect");
+      const data=new Float32Array(this.mem,out,5*px).slice(),answer={shape:[h,w]};
+      ["measured","conditional","selected_contribution","composite","residual"].forEach((key,i)=>answer[key]=data.slice(i*px,(i+1)*px));
+      return answer;
+    }));
+  }
+
+  /** Row-major native overlap seed validity under current settings, geometry and phases. */
+  storedPrimaryValidity(first = 0, count = this.scan.rows * this.scan.cols - first) {
+    if (!Number.isInteger(first) || first < 0 || first > 0xffffffff || !Number.isInteger(count) || count < 0 || count > 0xffffffff) throw new RangeError("Invalid primary seed range");
+    if (!this.x.ze_stored_primary_validity) throw new Error("Stored primary validation requires a current WASM module");
+    return this._frame(f => {
+      const p = f.alloc(count);
+      const rc = this.x.ze_stored_primary_validity(this.e, first, p, count);
+      if (rc !== 0) this._check(rc, "stored_primary_validity");
+      return new Uint8Array(this.mem, p, count).slice();
+    });
   }
 
   /** The stored results per map cell: { quaternions (4 per cell), euler (3), ncc, nmi, phase

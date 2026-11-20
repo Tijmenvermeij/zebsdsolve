@@ -1,0 +1,14 @@
+import assert from 'node:assert/strict';
+import {profileEventsForExport} from '../app/js/overlap.js';
+import {mapDescription} from '../app/js/overlap-metrics.js';
+const cells=[10,42,91],events=[{cell:10,cell_index:0,flags:32},{cell:42,cell_index:1,flags:2},{cell:91,cell_index:0,flags:128}];
+const out=profileEventsForExport(events,cells);
+assert.deepEqual(out.map(e=>e.cell_index),[0,1,2]);assert.deepEqual(out.map(e=>e.tile_cell_index),[0,1,0]);
+assert.deepEqual(events.map(e=>e.cell_index),[0,1,0]);
+assert.deepEqual(profileEventsForExport(events,cells),out);
+assert.throws(()=>profileEventsForExport(events,[10,42]),/uncommitted/);
+assert.throws(()=>profileEventsForExport([], [10,10]),/Duplicate/);
+assert.match(mapDescription('count',0,{metadata:{profile_version:1}}),/Strictly positive/);
+assert.match(mapDescription('proposals',0,{metadata:{profile_version:1}}),/compaction/);
+assert.match(mapDescription('count',0,null),/1e-6/);
+console.log('Overlap event export: combined rows, tile-local provenance, no mutation, missing-cell guard and V6 count hovers pass');

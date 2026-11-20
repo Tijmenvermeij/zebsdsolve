@@ -250,4 +250,26 @@ pub const Detector = struct {
         p.n_exp = n_exp;
         self.run("dict_score", p, n_exp, &.{ pats.at(3), self.sims.at(12), self.dict_best.at(13) });
     }
+
+    /// Overlap-private raw-score pool, rank-major [rank][experimental item].
+    pub fn dictBeginCandidates(self: *Detector, n_exp: u32, keep_n: u32) !void {
+        if (keep_n < 1 or keep_n > 8) return error.OverlapKeepNMustBeOneThroughEight;
+        self.g.ensure(&self.dict_best, @as(u64, n_exp) * keep_n * 8);
+        const start = try self.g.gpa.alloc(u32, @as(usize, n_exp) * keep_n * 2);
+        defer self.g.gpa.free(start);
+        for (0..@as(usize, n_exp) * keep_n) |i| {
+            start[2 * i] = @bitCast(@as(f32, -3.4e38));
+            start[2 * i + 1] = std.math.maxInt(u32);
+        }
+        self.g.writeSlice(self.dict_best, 0, u32, start);
+    }
+    pub fn dictChunkCandidates(self: *Detector, m: MasterGpu, fr: Frame, t: [3]f32, pats: Buf, dict_q: Buf, n: u32, dict0: u32, n_exp: u32, keep_n: u32) void {
+        self.dictSims(m, fr, t, dict_q, n, dict0);
+        var p = self.params(m, fr, n);
+        p.dict0 = dict0;
+        p.n_dict = n;
+        p.n_exp = n_exp;
+        p.flags = keep_n;
+        self.run("dict_score_candidates", p, n_exp, &.{ pats.at(3), self.sims.at(12), self.dict_best.at(13) });
+    }
 };

@@ -103,6 +103,10 @@ fn snapshotImpl(e: *engine.Engine, requested: ?rot.Quat, is_oxford: bool) ![]u8 
         try w.writeAll(",\"scanning_rotation_radians\":");
         try finite(w, m.scanning_rotation);
         if (context.calibration.status() == .supported) {
+            try w.writeAll(",\"detector_attitude_convention\":");
+            try value(w, oxford.detector_attitude_convention);
+            try w.writeAll(",\"detector_attitude_convention_version\":");
+            try value(w, context.calibration.detectorAttitudeVersion());
             try w.writeAll(",\"effective_detector_euler_radians\":");
             try numbers(w, try context.calibration.effectiveDetectorEuler(&geometry));
             try w.writeAll(",\"effective_tilt_radians\":");

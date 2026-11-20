@@ -36,6 +36,10 @@ const pca_mod = @import("pca.zig");
 const nlpar_mod = @import("nlpar.zig");
 const crystal_mod = @import("sim/crystal.zig");
 const simulate_mod = @import("simulate.zig");
+pub const overlap = @import("overlap.zig");
+pub const overlap_peaks = @import("overlap_peaks.zig");
+pub const overlap_nuisance = @import("overlap_nuisance.zig");
+pub const overlap_profile = @import("overlap_profile.zig");
 
 const Gpu = gpu_mod.Gpu;
 const Buf = gpu_mod.Buf;
@@ -170,6 +174,8 @@ pub const Phase = struct {
     /// and a count of its rebuilds (what was derived from it knows by that when it is stale)
     det: [2]detector.MasterGpu = .{ .{}, .{} },
     work: [2][]f32 = .{ &.{}, &.{} },
+    bake_mean: [2]f64 = .{ 0, 0 },
+    bake_sd: [2]f64 = .{ 1, 1 },
     baked: [2]?BakeKey = .{ null, null },
     serial: [2]u32 = .{ 0, 0 },
     /// dictionary orientations (4 f32 each) in the phase's fundamental zone, and on the device
@@ -463,7 +469,21 @@ pub fn sameExportContext(a: ExportContext, b: ExportContext) bool {
     return std.meta.eql(x, y) and std.meta.eql(a.geometry, b.geometry) and @import("oxford.zig").Calibration.eql(a.calibration, b.calibration) and a.phase_generation == b.phase_generation;
 }
 
+/// Seed conditioning excludes only region selection. Raw poses/NCC/NMI do not
+/// depend on ROI; chance-z, acceptance labels and export guards remain strict.
+pub fn sameSeedContext(a: ExportContext, b: ExportContext) bool {
+    var x = a;
+    var y = b;
+    inline for (.{ "roi_x", "roi_y", "roi_w", "roi_h" }) |field| {
+        @field(x.settings, field) = 0;
+        @field(y.settings, field) = 0;
+    }
+    return sameExportContext(x, y);
+}
+
 pub const Results = struct {
+    seed_context: ?ExportContext = null,
+    seed_valid: []bool = &.{},
     context: ?ExportContext = null,
     context_consistent: bool = true,
     /// Phase-major, best stored candidate per phase; no within-phase peak search.
@@ -485,6 +505,7 @@ pub const Results = struct {
         const n_quat = std.math.mul(usize, 4, n) catch return error.ScanShapeTooLarge;
         _ = std.math.mul(usize, n_quat, @sizeOf(f32)) catch return error.ScanShapeTooLarge;
         self.free(gpa);
+        self.seed_valid = try gpa.alloc(bool, n);
         self.quat = try gpa.alloc(f32, n_quat);
         self.ncc = try gpa.alloc(f32, n);
         self.nmi = try gpa.alloc(f32, n);
@@ -496,6 +517,8 @@ pub const Results = struct {
     }
 
     fn clear(self: *Results) void {
+        self.seed_context = null;
+        @memset(self.seed_valid, false);
         self.context = null;
         self.context_consistent = true;
         @memset(self.candidate_sweep, -1);
@@ -509,6 +532,7 @@ pub const Results = struct {
     }
 
     pub fn free(self: *Results, gpa: Allocator) void {
+        gpa.free(self.seed_valid);
         gpa.free(self.candidates);
         gpa.free(self.candidate_sweep);
         gpa.free(self.quat);
@@ -672,7 +696,7 @@ pub const Engine = struct {
     fit_phase: []i32 = &.{},
     fit_ncc: []f32 = &.{},
     tune: Tune = .{},
-    cancel: bool = false,
+    cancel: @import("cancellation.zig").Flag = .{},
     err_buf: [1024]u8 = undefined,
     err_len: usize = 0,
 
@@ -1677,6 +1701,8 @@ pub const Engine = struct {
             p.work[k] = try gpa.alloc(f32, n);
         }
         const work = p.work[k];
+        p.bake_mean[k] = 0;
+        p.bake_sd[k] = 1;
         @memcpy(work, m.raw);
         g.ensure(&p.det[k].buf, n * 4);
         p.det[k].side = side;
@@ -1732,6 +1758,8 @@ pub const Engine = struct {
         var ss: f64 = 0;
         for (work) |v| ss += (v - mean) * (v - mean);
         const scale = 1.0 / @max(@sqrt(ss / @as(f64, @floatFromInt(n))), 1e-30);
+        p.bake_mean[k] = mean;
+        p.bake_sd[k] = 1.0 / scale;
         for (work) |*v| v.* = @floatCast((v.* - mean) * scale);
         g.writeSlice(buf, 0, f32, work);
     }
@@ -1871,7 +1899,7 @@ pub const Engine = struct {
         for (0..s.pca_epochs) |_| {
             var d0: u32 = 0;
             while (d0 < total) : (d0 += chunk) {
-                if (self.cancel) return error.Cancelled;
+                if (self.cancel.get()) return error.Cancelled;
                 const nb = @min(chunk, total - d0);
                 steps += 1;
                 // a short tail is no sample: it would pull the basis toward its few patterns
@@ -1913,8 +1941,6 @@ pub const Engine = struct {
     /// score it (NCC, NMI) at the scores', and measure there what NMI chance gives. `out` gets
     /// one record per phase per cell ([phase][cell]). One readback.
     pub fn indexCells(self: *Engine, cells: []const u64, prm: Search, out: []Record) !void {
-        const g = &self.g;
-        const gpa = self.gpa;
         const s = &self.set;
         const n_ph = self.phases.items.len;
         const n: u32 = @intCast(cells.len);
@@ -1944,6 +1970,29 @@ pub const Engine = struct {
         try self.uploadCellsAs(cells, &.{ ls, lr, lc }, .{ .account = account });
         if (account) self.nl_report = .queued;
 
+        try self.indexPrepared(cells, prm, bd, out);
+        self.reportNlpar();
+        // each match's NMI on the scan's own scale
+        for (0..n_ph) |pi| {
+            for (out[pi * n ..][0..n]) |*r| r.z = (r.nmi - self.chance_med[pi]) / self.chance_spread[pi];
+        }
+    }
+
+    /// Search/refine/score a batch already in pats at the three stage levels.
+    /// Never uploads, preprocesses, calibrates chance, or assigns chance-z.
+    /// Masters/band/PCA must already have been prepared by indexCells.
+    fn indexPrepared(self: *Engine, cells: []const u64, prm: Search, bd: ?*Band, out: []Record) !void {
+        const g = &self.g;
+        const gpa = self.gpa;
+        const s = &self.set;
+        const n_ph = self.phases.items.len;
+        const n: u32 = @intCast(cells.len);
+        const ls = self.levelOf(.search);
+        const lr = self.levelOf(.refine);
+        const lc = self.levelOf(.score);
+        const spherical_method = prm.method == .spherical;
+        const t64 = try self.translationOf(&self.geo, ls);
+        const t_avg: [3]f32 = .{ @floatCast(t64[0]), @floatCast(t64[1]), @floatCast(t64[2]) };
         // the items at each level in use: the detector's position for each pattern, in pixels
         const items = try gpa.alloc(spherical.Item, n);
         defer gpa.free(items);
@@ -2029,11 +2078,699 @@ pub const Engine = struct {
             self.readAhead(self.ahead);
         }
         try g.wait();
-        self.reportNlpar();
-        // each match's NMI on the scan's own scale
-        for (0..n_ph) |pi| {
-            for (out[pi * n ..][0..n]) |*r| r.z = (r.nmi - self.chance_med[pi]) / self.chance_spread[pi];
+    }
+
+    /// Overlap-private residual pool. Output is immutable [phase][rank][cell].
+    /// Every valid pose is refined against the same signed normalized residual;
+    /// missing ranks are compacted out before detector projection/refinement.
+    pub fn indexPreparedCandidates(self: *Engine, cells: []const u64, prm: Search, bd: ?*Band, keep_n: u32, out: []Record) !void {
+        if (keep_n == 1) return self.indexPrepared(cells, prm, bd, out);
+        if (prm.method == .pca) return error.MultiCandidatePcaUnsupported;
+        const g = &self.g;
+        const n: u32 = @intCast(cells.len);
+        const lv = self.levelOf(.search);
+        const fr = try self.frame(lv);
+        const t64 = try self.translationOf(&self.geo, lv);
+        const t_avg: [3]f32 = .{ @floatCast(t64[0]), @floatCast(t64[1]), @floatCast(t64[2]) };
+        if (out.len != self.phases.items.len * keep_n * n) return error.BadLength;
+        @memset(out, .{ .q = @splat(0), .ncc = -2, .nmi = 0, .step = 0, .z = 0 });
+        const items = try self.gpa.alloc(spherical.Item, n);
+        defer self.gpa.free(items);
+        const poses = try self.gpa.alloc(detector.Pose, n);
+        defer self.gpa.free(poses);
+        const source_rows = try self.gpa.alloc(usize, n);
+        defer self.gpa.free(source_rows);
+        const refined = try self.gpa.alloc(Record, n);
+        defer self.gpa.free(refined);
+        const peaks = try self.gpa.alloc([8]f32, @as(usize, n) * keep_n);
+        defer self.gpa.free(peaks);
+        const scores = try self.gpa.alloc([2]u32, @as(usize, n) * keep_n);
+        defer self.gpa.free(scores);
+        var records = g.storage(@as(u64, n) * @sizeOf(Record));
+        defer g.release(&records);
+        for (cells, 0..) |cell, b| {
+            const t = try self.positionOf(&self.geo, cell, lv);
+            items[b] = .{ t[0], t[1], t[2], @floatFromInt(b) };
         }
+        const options: detector.RefineOptions = .{ .iters = if (self.set.refine) self.set.refine_iters else 0, .max_step = @floatCast(std.math.degreesToRadians(self.set.refine_step)), .nmi_bins = self.set.nmi_bins };
+        if (prm.method == .spherical) try self.prepareDenominators(bd.?, lv, fr);
+        for (self.phases.items, 0..) |*phase, pi| {
+            if (self.cancel.get()) return error.Cancelled;
+            @memset(peaks, @splat(0));
+            if (prm.method == .spherical) {
+                if (comptime @hasDecl(spherical.Spherical, "candidatePeaks")) {
+                    const ph = &bd.?.ph.items[pi].?.gpu;
+                    const tile = @min(n, self.sp.tileItems(ph, @as(u64, self.set.tile_mb) << 20));
+                    var first: u32 = 0;
+                    while (first < n) : (first += tile) {
+                        if (self.cancel.get()) return error.Cancelled;
+                        const nt = @min(tile, n - first);
+                        self.sp.coefficients(self.pats[@intFromEnum(lv)], items[first..][0..nt], fr, spherical.FLAG_CENTER | spherical.FLAG_NORM, &self.sp.alm, &self.sp.stats);
+                        const tile_peaks = try self.gpa.alloc([8]f32, @as(usize, nt) * keep_n);
+                        defer self.gpa.free(tile_peaks);
+                        if (comptime @hasField(spherical.Spherical, "candidate_cancel")) self.sp.candidate_cancel = &self.cancel;
+                        defer {
+                            if (comptime @hasField(spherical.Spherical, "candidate_cancel")) self.sp.candidate_cancel = null;
+                        }
+                        try self.sp.candidatePeaks(ph, nt, ph.rden.at(8), nt, phase.master.rotation, keep_n, tile_peaks);
+                        for (0..keep_n) |rank| @memcpy(peaks[rank * n + first ..][0..nt], tile_peaks[rank * nt ..][0..nt]);
+                    }
+                } else return error.MultiCandidateSphericalUnavailable;
+            } else {
+                try self.prepareDictionary(phase, prm.dict_grid);
+                const total: u32 = @intCast(phase.dict.len / 4);
+                const chunk: u32 = @intCast(std.math.clamp((64 << 20) / (@as(u64, fr.pat_h) * fr.pat_w * 4), 64, 16384));
+                try self.det.dictBeginCandidates(n, keep_n);
+                var d0: u32 = 0;
+                while (d0 < total) : (d0 += chunk) {
+                    if (self.cancel.get()) return error.Cancelled;
+                    self.det.dictChunkCandidates(phase.det[@intFromEnum(lv)], fr, t_avg, self.pats[@intFromEnum(lv)], phase.dict_gpu, @min(chunk, total - d0), d0, n, keep_n);
+                }
+                g.read(self.det.dict_best, 0, std.mem.sliceAsBytes(scores));
+                try g.wait();
+                for (scores, 0..) |hit, i| {
+                    const index = hit[1];
+                    if (index >= total) {
+                        peaks[i][4] = -2;
+                        continue;
+                    }
+                    @memcpy(peaks[i][0..4], phase.dict[@as(usize, index) * 4 ..][0..4]);
+                    peaks[i][4] = @bitCast(hit[0]);
+                }
+            }
+            for (0..keep_n) |rank| {
+                if (self.cancel.get()) return error.Cancelled;
+                var valid_count: usize = 0;
+                for (0..n) |b| {
+                    const peak = peaks[rank * n + b];
+                    var norm: f32 = 0;
+                    for (peak[0..4]) |v| norm += v * v;
+                    if (!std.math.isFinite(norm) or @abs(norm - 1) > 0.01 or !std.math.isFinite(peak[4]) or peak[4] < -1) continue;
+                    poses[valid_count] = .{ .t = items[b][0..3].*, .pat = @floatFromInt(b), .q = peak[0..4].* };
+                    source_rows[valid_count] = b;
+                    valid_count += 1;
+                }
+                if (valid_count == 0) continue;
+                self.det.setPoses(poses[0..valid_count]);
+                self.det.refine(phase.det[@intFromEnum(lv)], fr, self.pats[@intFromEnum(lv)], @intCast(valid_count), options, records, 0);
+                g.read(records, 0, std.mem.sliceAsBytes(refined[0..valid_count]));
+                try g.wait();
+                for (0..valid_count) |j| out[(pi * keep_n + rank) * n + source_rows[j]] = refined[j];
+            }
+        }
+    }
+
+    /// Candidate overlap components, in [cell][component] order. This is a fixed
+    /// prepared-domain projection model, not a physical raw-intensity decomposition.
+    /// Ordinary stored indexing results and the source acquisition are untouched.
+    pub fn overlapCells(self: *Engine, cells: []const u64, max_components: u32, out: []overlap.Component, states: []overlap.State) !void {
+        const progress = try self.gpa.alloc(overlap.Progress, cells.len);
+        defer self.gpa.free(progress);
+        return self.overlapCellsV2(cells, max_components, false, out, states, progress);
+    }
+
+    /// Discovery slots retain their identity even if a later joint fit gives a
+    /// previous distinct template zero weight. No physical acceptance is implied.
+    pub fn overlapCellsV2(self: *Engine, cells: []const u64, max_components: u32, stored: bool, out: []overlap.Component, states: []overlap.State, progress: []overlap.Progress) !void {
+        return self.overlapCellsV3(cells, max_components, stored, out, states, progress, null);
+    }
+
+    pub fn overlapDC(self: *const Engine, phase: *const Phase, lv: Level) f32 {
+        const k = @intFromEnum(lv);
+        const source_dc = if (!self.set.bandpass and !self.set.clahe and phase.master.source_sd > 0) phase.master.source_mean / phase.master.source_sd else 0;
+        return @floatCast((phase.bake_mean[k] + source_dc) / phase.bake_sd[k]);
+    }
+
+    pub fn overlapCellsV3(self: *Engine, cells: []const u64, max_components: u32, stored: bool, out: []overlap.Component, states: []overlap.State, progress: []overlap.Progress, theta: ?[]overlap_nuisance.Theta) !void {
+        return self.overlapCellsModel(cells, max_components, stored, out, states, progress, theta, false, theta != null, null, 1, null, null);
+    }
+    pub fn overlapCellsV4(self: *Engine, cells: []const u64, max_components: u32, stored: bool, out: []overlap.Component, states: []overlap.State, progress: []overlap.Progress, theta: []overlap_nuisance.Theta, optimize: bool, norms: []f32) !void {
+        if (norms.len != cells.len * max_components) return error.BadLength;
+        @memset(norms, std.math.nan(f32));
+        return self.overlapCellsModel(cells, max_components, stored, out, states, progress, theta, true, optimize, norms, 1, null, null);
+    }
+    /// V5 adds residual-order candidate pools; K1 and keep_n=1 call V4 exactly.
+    pub fn overlapCellsV5(self: *Engine, cells: []const u64, max_components: u32, stored: bool, out: []overlap.Component, states: []overlap.State, progress: []overlap.Progress, theta: []overlap_nuisance.Theta, optimize: bool, norms: []f32, keep_n: u32, winner_ranks: []i32) !void {
+        if (keep_n < 1 or keep_n > 8) return error.OverlapKeepNMustBeOneThroughEight;
+        if (winner_ranks.len != out.len or norms.len != out.len) return error.BadLength;
+        @memset(winner_ranks, -1);
+        if (keep_n == 1 or max_components == 1) {
+            try self.overlapCellsV4(cells, max_components, stored, out, states, progress, theta, optimize, norms);
+            for (out, winner_ranks, 0..) |component, *rank, i| if (component.phase >= 0) {
+                rank.* = if (i % max_components == 0) 0 else 1;
+            };
+            return;
+        }
+        @memset(norms, std.math.nan(f32));
+        return self.overlapCellsModel(cells, max_components, stored, out, states, progress, theta, true, optimize, norms, keep_n, winner_ranks, null);
+    }
+    /// Transactional V6 boundary: no partial components, ranks or diagnostics
+    /// reach the caller if cancellation, allocation or device work fails.
+    pub fn overlapCellsV6(self: *Engine, cells: []const u64, k: u32, stored: bool, outputs: OverlapTrajectoryPayload, optimize: bool, keep_n: u32, options: overlap_profile.Options, source_q: [][4]f32, events: []overlap_profile.Event) !usize {
+        if (!options.valid()) return error.BadProfileOptions;
+        const n = cells.len;
+        const nk = try std.math.mul(usize, n, k);
+        if (outputs.components.len != nk or outputs.states.len != n or outputs.progress.len != n or outputs.theta.len != n or
+            outputs.norms.len != nk or outputs.ranks.len != nk or source_q.len != nk) return error.BadLength;
+        const capacity = try overlap_profile.traceCapacity(n, self.phases.items.len, k, keep_n);
+        if (events.len < capacity) return error.ProfileTraceTooSmall;
+        var arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        const temp: OverlapTrajectoryPayload = .{
+            .components = try alloc.alloc(overlap.Component, nk),
+            .states = try alloc.alloc(overlap.State, n),
+            .progress = try alloc.alloc(overlap.Progress, n),
+            .theta = try alloc.alloc(overlap_nuisance.Theta, n),
+            .norms = try alloc.alloc(f32, nk),
+            .ranks = try alloc.alloc(i32, nk),
+        };
+        var req: overlap_profile.Request = .{ .options = options, .source_q = try alloc.alloc([4]f32, nk), .events = try alloc.alloc(overlap_profile.Event, capacity) };
+        @memset(temp.norms, std.math.nan(f32));
+        @memset(temp.ranks, -1);
+        @memset(req.source_q, @splat(0));
+        // K1 only requests the ordinary primary. In particular, PCA is valid
+        // here and SI must not allocate a volume for a nonexistent residual.
+        const residual_keep_n = if (k == 1) 1 else keep_n;
+        try self.overlapCellsModel(cells, k, stored, temp.components, temp.states, temp.progress, temp.theta, true, optimize, temp.norms, residual_keep_n, temp.ranks, &req);
+        if (n > 0 and self.cancel.get()) return error.Cancelled;
+        @memcpy(outputs.components, temp.components);
+        @memcpy(outputs.states, temp.states);
+        @memcpy(outputs.progress, temp.progress);
+        @memcpy(outputs.theta, temp.theta);
+        @memcpy(outputs.norms, temp.norms);
+        @memcpy(outputs.ranks, temp.ranks);
+        @memcpy(source_q, req.source_q);
+        @memcpy(events[0..req.used], req.events[0..req.used]);
+        return req.used;
+    }
+    const StoredPrimaryStatus = enum(u32) { valid = 0, missing = 6, stale = 10 };
+
+    pub fn storedPrimaryContextCurrent(self: *const Engine) bool {
+        const context = self.res.seed_context orelse return false;
+        return sameSeedContext(context, .{ .settings = self.set, .geometry = self.geo, .calibration = self.calibration, .phase_generation = self.phase_generation });
+    }
+
+    pub fn storedPrimaryStatus(self: *const Engine, cell: usize, context_current: bool) StoredPrimaryStatus {
+        const phase = self.res.phase[cell];
+        if (phase < 0) return .missing;
+        if (!context_current or self.res.seed_valid.len != self.res.phase.len or !self.res.seed_valid[cell]) return .stale;
+        var norm: f32 = 0;
+        for (self.res.quat[4 * cell ..][0..4]) |v| norm += v * v;
+        const ncc = self.res.ncc[cell];
+        if (phase >= self.phases.items.len or !std.math.isFinite(norm) or @abs(norm - 1) > 0.01 or !std.math.isFinite(ncc) or ncc < -1 or ncc > 1.00001 or !std.math.isFinite(self.res.nmi[cell])) return .missing;
+        return .valid;
+    }
+
+    fn overlapCellsModel(self: *Engine, cells: []const u64, max_components: u32, stored: bool, out: []overlap.Component, states: []overlap.State, progress: []overlap.Progress, theta: ?[]overlap_nuisance.Theta, contrast: bool, optimize: bool, norms: ?[]f32, keep_n: u32, winner_ranks: ?[]i32, profile_request: ?*overlap_profile.Request) !void {
+        if (theta) |values| {
+            if (values.len != cells.len) return error.BadLength;
+            @memset(values, overlap_nuisance.identity);
+        }
+        if (max_components < 1 or max_components > overlap.capacity) return error.OverlapComponentsMustBeOneThroughFour;
+        const n = cells.len;
+        if (out.len != n * max_components or states.len != n or progress.len != n) return error.BadLength;
+        if (self.phases.items.len == 0) return error.NoPhases;
+        const lv = self.levelOf(.search);
+        if (self.levelOf(.refine) != lv or self.levelOf(.score) != lv) return error.OverlapRequiresSameResolutionUseFullResolutionNoneOrAll;
+        const info_ = try self.info();
+        for (cells) |cell| if (cell >= @as(u64, info_.rows) * info_.cols) {
+            return error.BadCell;
+        };
+        const stored_context_current = stored and self.storedPrimaryContextCurrent();
+        if (stored and self.res.seed_context != null and !stored_context_current) return error.StoredPrimaryContextStaleRerunIndex;
+        for (out) |*c| c.* = .{};
+        for (progress) |*m| m.* = .{};
+        for (states) |*state| state.* = .{};
+        if (n == 0) return;
+        const hw = try self.patternShape(lv);
+        const px = hw[0] * hw[1];
+        if (px > 131072) return error.OverlapPatternTooLargeUseBinning;
+        const ni: u32 = @intCast(n);
+        const g = &self.g;
+        const scratch_bytes = @max(@as(u64, overlap.capacity) * ni * px * 4, @as(u64, ni) * @sizeOf(overlap.State));
+        if (scratch_bytes > @min(g.lim.max_storage_binding, g.lim.max_buffer)) return error.OverlapBatchTooLargeUseSmallerBatches;
+        const gpa = self.gpa;
+        const prm = self.searchOf();
+        if (keep_n > 1 and prm.method == .pca) return error.MultiCandidatePcaUnsupported;
+        if (self.phases.items.len * keep_n > (1 << 24)) return error.TooManyCandidateIdentities;
+        // Reset before preflight can suspend; never clear cancellation after a wait.
+        self.cancel.set(false);
+        // Fail on unsupported one-item SI allocations before ordinary fresh K1.
+        if (keep_n > 1 and prm.method == .spherical) {
+            if (comptime !@hasDecl(spherical.Spherical, "candidatePeaks")) return error.MultiCandidateSphericalUnavailable;
+            const candidate_band = try self.band(prm.bandwidth, lv);
+            const limit = @min(g.lim.max_storage_binding, g.lim.max_buffer);
+            for (candidate_band.ph.items) |slot| {
+                const ph = &slot.?.gpu;
+                if (ph.specBytes(&candidate_band.tables) > limit or ph.volumeCells(&candidate_band.tables) * 4 > limit) return error.BandwidthExceedsDeviceLimit;
+            }
+        }
+        if (self.cancel.get()) return error.Cancelled;
+        const recs = try gpa.alloc(Record, self.phases.items.len * n);
+        defer gpa.free(recs);
+        const missing = try gpa.alloc(u32, n);
+        defer gpa.free(missing);
+        @memset(missing, 0);
+        const primary_gates = try gpa.alloc(u32, n);
+        defer gpa.free(primary_gates);
+        @memset(primary_gates, 0);
+        if (stored) {
+            @memset(recs, .{ .q = @splat(0), .ncc = -2, .nmi = 0, .step = 0, .z = 0 });
+            var valid_count: usize = 0;
+            for (cells, 0..) |cell, i| {
+                const c: usize = @intCast(cell);
+                const primary_status = self.storedPrimaryStatus(c, stored_context_current);
+                missing[i] = @intFromEnum(primary_status);
+                if (primary_status != .valid) continue;
+                const phase = self.res.phase[c];
+                const q = self.res.quat[4 * c ..][0..4].*;
+                valid_count += 1;
+                primary_gates[i] = @as(u32, @intCast(phase)) + 1;
+                // sweep=-1 may still hold a computed valid best winner.
+                recs[@as(usize, @intCast(phase)) * n + i] = .{ .q = q, .ncc = self.res.ncc[c], .nmi = self.res.nmi[c], .step = 0, .z = 0 };
+            }
+            if (valid_count == 0) {
+                for (progress, states, missing) |*m, *state, reason| {
+                    m.stop_reason = reason;
+                    m.previous_sse = std.math.nan(f32);
+                    m.incremental_improvement = std.math.nan(f32);
+                    state.correlation = std.math.nan(f32);
+                    state.trial_sse = std.math.nan(f32);
+                    state.sse = std.math.nan(f32);
+                    state.initial_sse = std.math.nan(f32);
+                    state.condition = std.math.nan(f32);
+                    state.best_single_sse = std.math.nan(f32);
+                    state.single_sse = @splat(std.math.nan(f32));
+                    if (profile_request != null or (contrast and keep_n > 1 and max_components >= 3)) m._pad = std.math.maxInt(u32);
+                }
+                if (self.cancel.get()) return error.Cancelled;
+                return;
+            }
+            // Stored winner reuse never calls indexCells/calibrate/refine. Prepare
+            // only resources needed for future residual proposals; upload once.
+            self.det.chunk_px = self.set.refine_pixels;
+            self.det.wg = self.set.wg_refine;
+            if (prm.method == .spherical) _ = try self.band(prm.bandwidth, lv);
+            try self.prepareMasters(&.{lv});
+            if (prm.method == .pca) {
+                const t = try self.translationOf(&self.geo, lv);
+                for (self.phases.items) |*phase| try self.preparePca(phase, prm.dict_grid, lv, try self.frame(lv), .{ @floatCast(t[0]), @floatCast(t[1]), @floatCast(t[2]) });
+            }
+            try self.uploadCellsAs(cells, &.{lv}, .{});
+        } else {
+            // Fresh discovery preserves the existing first-search path exactly.
+            try self.indexCells(cells, prm, recs);
+        }
+        if (self.cancel.get()) return error.Cancelled;
+        if (profile_request) |req| {
+            return overlap_profile.run(self, cells, max_components, recs, missing, hw, .{
+                .components = out,
+                .states = states,
+                .progress = progress,
+                .theta = theta.?,
+                .norms = norms.?,
+                .ranks = winner_ranks.?,
+            }, optimize, keep_n, req);
+        }
+        const protected = contrast and keep_n > 1 and max_components >= 3;
+        if (!protected) return self.runPreparedTrajectory(cells, max_components, stored, recs, missing, primary_gates, hw, prm, out, states, progress, theta, contrast, optimize, norms, keep_n, winner_ranks);
+        // Ordinary indexing's optional read-ahead is unrelated to this frozen
+        // request; residual histories must never trigger acquisition I/O.
+        const saved_ahead = self.ahead;
+        self.ahead = &.{};
+        defer self.ahead = saved_ahead;
+        // Freeze the once-prepared input before either branch overwrites pats
+        // with residuals. No acquisition I/O or preprocessing occurs in a branch.
+        var target = g.storage(@as(u64, ni) * px * 4);
+        defer g.release(&target);
+        g.copy(self.pats[@intFromEnum(lv)], 0, target, 0, @as(u64, ni) * px * 4);
+        g.copy(target, 0, self.pats[@intFromEnum(lv)], 0, @as(u64, ni) * px * 4);
+        try self.runPreparedTrajectory(cells, max_components, stored, recs, missing, primary_gates, hw, prm, out, states, progress, theta, contrast, optimize, norms, keep_n, winner_ranks);
+        if (self.cancel.get()) return error.Cancelled;
+        const reference = try gpa.alloc(overlap.Component, out.len);
+        defer gpa.free(reference);
+        const reference_states = try gpa.alloc(overlap.State, n);
+        defer gpa.free(reference_states);
+        const reference_progress = try gpa.alloc(overlap.Progress, n);
+        defer gpa.free(reference_progress);
+        const reference_theta = try gpa.alloc(overlap_nuisance.Theta, n);
+        defer gpa.free(reference_theta);
+        const reference_norms = try gpa.alloc(f32, out.len);
+        defer gpa.free(reference_norms);
+        const reference_ranks = try gpa.alloc(i32, out.len);
+        defer gpa.free(reference_ranks);
+        g.copy(target, 0, self.pats[@intFromEnum(lv)], 0, @as(u64, ni) * px * 4);
+        try self.runPreparedTrajectory(cells, max_components, stored, recs, missing, primary_gates, hw, prm, reference, reference_states, reference_progress, reference_theta, contrast, optimize, reference_norms, 1, reference_ranks);
+        if (self.cancel.get()) return error.Cancelled;
+        try finishOverlapTrajectories(self.cancel.get(), max_components, .{ .components = out, .states = states, .progress = progress, .theta = theta.?, .norms = norms.?, .ranks = winner_ranks.? }, .{ .components = reference, .states = reference_states, .progress = reference_progress, .theta = reference_theta, .norms = reference_norms, .ranks = reference_ranks });
+        if (self.cancel.get()) return error.Cancelled;
+    }
+
+    pub const OverlapTrajectoryPayload = struct {
+        components: []overlap.Component,
+        states: []overlap.State,
+        progress: []overlap.Progress,
+        theta: []overlap_nuisance.Theta,
+        norms: []f32,
+        ranks: []i32,
+    };
+    /// Host finalization boundary: cancellation observed here cannot publish a
+    /// selected payload. The SDK also discards the whole operation on any error.
+    pub fn finishOverlapTrajectories(cancelled: bool, k: u32, pooled: OverlapTrajectoryPayload, reference: OverlapTrajectoryPayload) !void {
+        if (cancelled) return error.Cancelled;
+        for (0..pooled.states.len) |i| {
+            const source = overlapTrajectorySource(pooled.states[i], pooled.progress[i], reference.states[i], reference.progress[i]);
+            if (source != 1) {
+                const first = i * k;
+                @memcpy(pooled.components[first..][0..k], reference.components[first..][0..k]);
+                pooled.states[i] = reference.states[i];
+                pooled.progress[i] = reference.progress[i];
+                pooled.theta[i] = reference.theta[i];
+                @memcpy(pooled.norms[first..][0..k], reference.norms[first..][0..k]);
+                @memcpy(pooled.ranks[first..][0..k], reference.ranks[first..][0..k]);
+            }
+            // No GPU operation consumes progress after this host-only stamp.
+            pooled.progress[i]._pad = if (source < 0) std.math.maxInt(u32) else @intCast(source);
+        }
+    }
+
+    fn overlapTrajectoryValid(state: overlap.State, progress: overlap.Progress) bool {
+        if (progress.retained_order == 0 or progress.stop_reason == 6 or progress.stop_reason == 9 or progress.stop_reason == 10) return false;
+        if (!std.math.isFinite(state.sse) or state.sse < 0 or !std.math.isFinite(state.initial_sse) or state.initial_sse <= 1e-12) return false;
+        if (!std.math.isFinite(state.flags) or state.flags < 0 or state.flags >= 4294967296.0) return false;
+        return (@as(u32, @intFromFloat(state.flags)) & (8 | 2)) == 0;
+    }
+    /// Per-cell final-objective choice. Exact ties and both invalid choose the
+    /// complete reference payload; -1 distinguishes unavailable from reference.
+    pub fn overlapTrajectorySource(pooled: overlap.State, pooled_progress: overlap.Progress, reference: overlap.State, reference_progress: overlap.Progress) i32 {
+        const p = overlapTrajectoryValid(pooled, pooled_progress);
+        const r = overlapTrajectoryValid(reference, reference_progress);
+        if (p and (!r or pooled.sse < reference.sse)) return 1;
+        return if (r) 0 else -1;
+    }
+
+    /// Run one history from immutable primary records and the current prepared
+    /// GPU target. Each branch owns all fit/model/record scratch; never uploads
+    /// inputs, preprocesses targets, searches a primary, or resets cancellation.
+    fn runPreparedTrajectory(self: *Engine, cells: []const u64, max_components: u32, stored: bool, primary: []const Record, missing: []const u32, primary_gates: []const u32, hw: [2]u32, prm: Search, out: []overlap.Component, states: []overlap.State, progress: []overlap.Progress, theta: ?[]overlap_nuisance.Theta, contrast: bool, optimize: bool, norms: ?[]f32, keep_n: u32, winner_ranks: ?[]i32) !void {
+        const n = cells.len;
+        const ni: u32 = @intCast(n);
+        const px = hw[0] * hw[1];
+        const lv = self.levelOf(.search);
+        const g = &self.g;
+        const gpa = self.gpa;
+        for (out) |*component| component.* = .{};
+        @memset(states, .{});
+        @memset(progress, .{});
+        if (theta) |values| @memset(values, overlap_nuisance.identity);
+        if (norms) |values| @memset(values, std.math.nan(f32));
+        if (winner_ranks) |values| @memset(values, -1);
+        const recs = try gpa.dupe(Record, primary);
+        defer gpa.free(recs);
+        const pool = if (keep_n > 1) try gpa.alloc(Record, self.phases.items.len * keep_n * n) else recs;
+        defer if (keep_n > 1) gpa.free(pool);
+        const winner_ids = try gpa.alloc(f32, n);
+        defer gpa.free(winner_ids);
+        var fit = overlap.Fit.init(g, ni, px, hw[1], self.maskOf(hw[0], hw[1]), self.pats[@intFromEnum(lv)]);
+        defer fit.deinit();
+        var nuisance: ?overlap_nuisance.Model = if (theta != null) overlap_nuisance.Model.init(g, &self.prep, &fit) else null;
+        if (nuisance) |*model| {
+            model.contrast = contrast;
+            model.optimize_enabled = optimize;
+        }
+        defer if (nuisance) |*model| model.deinit();
+        fit.readProgress(progress);
+        fit.read(states);
+        try g.wait();
+        if (self.cancel.get()) return error.Cancelled;
+        for (missing, progress, primary_gates) |is_missing, *m, gate| {
+            if (is_missing != 0) m.stop_reason = is_missing;
+            if (stored and is_missing == 0) m._pad = gate;
+        }
+        fit.writeProgress(progress);
+        const poses = try gpa.alloc(detector.Pose, n);
+        defer gpa.free(poses);
+        const bd = if (prm.method == .spherical) try self.band(prm.bandwidth, lv) else null;
+        const fr = try self.frame(lv);
+        for (0..max_components) |pass| {
+            if (self.cancel.get()) return error.Cancelled;
+            if (pass != 0) {
+                fit.residual(0, self.pats[@intFromEnum(lv)], true);
+                if (keep_n > 1) try self.indexPreparedCandidates(cells, prm, bd, keep_n, pool) else try self.indexPrepared(cells, prm, bd, recs);
+                if (self.cancel.get()) return error.Cancelled;
+            }
+            fit.beginManaged();
+            if (nuisance) |*model| model.begin();
+            for (self.phases.items, 0..) |*phase, pi| {
+                const rank_count: usize = if (pass == 0) 1 else keep_n;
+                for (0..rank_count) |rank| {
+                    if (self.cancel.get()) return error.Cancelled;
+                    const candidates = if (pass == 0 or keep_n == 1) recs[pi * n ..][0..n] else pool[(pi * keep_n + rank) * n ..][0..n];
+                    for (cells, 0..) |cell, i| {
+                        var q = candidates[i].q;
+                        if (keep_n > 1) {
+                            var qnorm: f32 = 0;
+                            for (q) |v| qnorm += v * v;
+                            if (!std.math.isFinite(qnorm) or @abs(qnorm - 1) > 0.01) q = .{ 1, 0, 0, 0 };
+                        }
+                        poses[i] = .{ .t = try self.positionOf(&self.geo, cell, lv), .pat = 0, .q = q };
+                    }
+                    self.det.setPoses(poses);
+                    self.det.project(phase.det[@intFromEnum(lv)], fr, ni);
+                    for (poses, 0..) |pose, i| {
+                        var norm: f32 = 0;
+                        for (pose.q) |v| norm += v * v;
+                        const r = candidates[i];
+                        var source_norm: f32 = 0;
+                        for (r.q) |v| source_norm += v * v;
+                        const valid = (keep_n == 1 or (std.math.isFinite(source_norm) and @abs(source_norm - 1) <= 0.01)) and std.math.isFinite(norm) and @abs(norm - 1) <= 0.01 and std.math.isFinite(r.ncc) and r.ncc >= -1 and r.ncc <= 1.00001 and std.math.isFinite(r.nmi);
+                        const gate: u32 = if (valid) @as(u32, @intCast(pi)) + 1 else std.math.maxInt(u32);
+                        g.writeSlice(fit.progress, @as(u64, i) * @sizeOf(overlap.Progress) + 28, u32, &.{gate});
+                        if (!valid) g.clearRange(self.det.sims, @as(u64, i) * px * 4, @as(u64, px) * 4);
+                    }
+                    if (nuisance) |*model| {
+                        if (keep_n > 1) model.candidateWithID(self.det.sims, @intCast(pi), self.overlapDC(phase, lv), stored and pass == 0, @intCast(pi * keep_n + rank)) else model.candidate(self.det.sims, @intCast(pi), self.overlapDC(phase, lv), stored and pass == 0);
+                    } else {
+                        self.prep.filter(self.det.sims, ni, hw[0], hw[1], .{ .mask = fr.mask });
+                        fit.candidateManaged(self.det.sims, @intCast(pi), stored and pass == 0);
+                    }
+                }
+            }
+            fit.read(states);
+            fit.readProgress(progress);
+            if (keep_n > 1) nuisance.?.readWinnerIDs(winner_ids);
+            try g.wait();
+            if (self.cancel.get()) return error.Cancelled;
+            var any = false;
+            for (states, progress, 0..) |state, *m, i| {
+                if (m.stop_reason != 0) continue;
+                if (state.phase < 0) {
+                    m.stop_reason = if ((m.boundary_seen & 2) != 0) 4 else if ((m.boundary_seen & 1) != 0) 5 else 3;
+                    continue;
+                }
+                const pi: usize = @intFromFloat(state.phase);
+                const winner_rank: usize = if (pass == 0 or keep_n == 1) 0 else @as(usize, @intFromFloat(winner_ids[i])) % keep_n;
+                if (keep_n > 1 and (winner_ids[i] < 0 or @as(usize, @intFromFloat(winner_ids[i])) / keep_n != pi)) return error.IncoherentOverlapWinnerIdentity;
+                const r = if (pass == 0 or keep_n == 1) recs[pi * n + i] else pool[(pi * keep_n + winner_rank) * n + i];
+                const slot = m.retained_order;
+                if (winner_ranks) |ranks| ranks[i * max_components + slot] = if (pass == 0) 0 else @intCast(winner_rank + 1);
+                out[i * max_components + slot] = .{ .q = r.q, .phase = @intCast(pi), .proposal_ncc = r.ncc, .proposal_nmi = r.nmi, .amplitude = state.amplitude[slot] };
+                m.retained_order += 1;
+                m.active_count = 0;
+                for (0..m.retained_order) |j| {
+                    out[i * max_components + j].amplitude = state.amplitude[j];
+                    if (state.amplitude[j] > 1e-6) m.active_count += 1;
+                }
+                m.incremental_improvement = @max(0, m.previous_sse - state.sse);
+                if (state.sse <= 1e-8 * state.initial_sse) m.stop_reason = 2 else if (m.retained_order >= max_components) m.stop_reason = 1 else any = true;
+            }
+            fit.writeProgress(progress);
+            if (!any) break;
+        }
+        if (nuisance) |*model| {
+            if (norms) |values| {
+                // Allocate before queuing either host destination: allocation
+                // failure must not unwind a still-pending theta readback.
+                const final_norms = try gpa.alloc([4]f32, n);
+                defer gpa.free(final_norms);
+                model.readTheta(theta.?);
+                model.readNorms(final_norms, true);
+                try g.wait();
+                if (self.cancel.get()) return error.Cancelled;
+                for (final_norms, 0..) |row, b| for (0..max_components) |j| {
+                    values[b * max_components + j] = row[j];
+                };
+            } else model.readTheta(theta.?);
+            try g.wait();
+            if (self.cancel.get()) return error.Cancelled;
+        }
+        for (missing, states, progress) |reason, *state, *m| if (reason != 0) {
+            state.* = .{ .sse = std.math.nan(f32), .initial_sse = std.math.nan(f32), .correlation = std.math.nan(f32), .condition = std.math.nan(f32), .single_sse = @splat(std.math.nan(f32)), .best_single_sse = std.math.nan(f32), .trial_sse = std.math.nan(f32) };
+            m.previous_sse = std.math.nan(f32);
+            m.incremental_improvement = std.math.nan(f32);
+        };
+    }
+
+    /// Five images in the original prepared-target units, regenerated for one
+    /// cell: measured, conditional-on-others, selected contribution, composite,
+    /// signed final residual. Caller freezes/validates the current context.
+    pub fn overlapInspect(self: *Engine, cell: u64, components: []const overlap.Component, selected: u32, out: []f32) !void {
+        return self.overlapInspectV3(cell, components, selected, null, out);
+    }
+    pub fn overlapInspectV3(self: *Engine, cell: u64, components: []const overlap.Component, selected: u32, theta: ?overlap_nuisance.Theta, out: []f32) !void {
+        return self.overlapInspectModel(cell, components, selected, theta, false, out);
+    }
+    pub fn overlapInspectV4(self: *Engine, cell: u64, components: []const overlap.Component, selected: u32, theta: overlap_nuisance.Theta, out: []f32) !void {
+        return self.overlapInspectModel(cell, components, selected, theta, true, out);
+    }
+    fn overlapInspectModel(self: *Engine, cell: u64, components: []const overlap.Component, selected: u32, theta: ?overlap_nuisance.Theta, contrast: bool, out: []f32) !void {
+        if (components.len == 0 or components.len > 4 or selected >= components.len) return error.BadLength;
+        const info_ = try self.info();
+        if (cell >= @as(u64, info_.rows) * info_.cols) return error.BadCell;
+        const lv = self.levelOf(.search);
+        if (self.levelOf(.refine) != lv or self.levelOf(.score) != lv) return error.OverlapRequiresSameResolutionUseFullResolutionNoneOrAll;
+        const hw = try self.patternShape(lv);
+        const px = @as(usize, hw[0]) * hw[1];
+        if (out.len != 5 * px or px > 131072) return error.BadLength;
+        try self.pattern(cell, .filtered, lv, out[0..px]);
+        const mask = self.maskOf(hw[0], hw[1]);
+        var lo: f32 = std.math.inf(f32);
+        var hi: f32 = -std.math.inf(f32);
+        for (out[0..px], 0..) |v, i| {
+            const dr = @as(f32, @floatFromInt(i / hw[1])) - mask[0];
+            const dc = @as(f32, @floatFromInt(i % hw[1])) - mask[1];
+            if (mask[2] <= 0 or dr * dr + dc * dc <= mask[2]) {
+                lo = @min(lo, v);
+                hi = @max(hi, v);
+            }
+        }
+        if (hi - lo <= 1e-6 * @max(@max(@abs(lo), @abs(hi)), 1e-30)) @memset(out[0..px], 0);
+        @memcpy(out[px .. 2 * px], out[0..px]);
+        @memset(out[2 * px ..], 0);
+        try self.prepareMasters(&.{lv});
+        const fr = try self.frame(lv);
+        const sim = try self.gpa.alloc(f32, px);
+        defer self.gpa.free(sim);
+        var fit: ?overlap.Fit = if (theta != null) overlap.Fit.init(&self.g, 1, @intCast(px), hw[1], mask, self.pats[@intFromEnum(lv)]) else null;
+        defer if (fit) |*f| f.deinit();
+        var nuisance: ?overlap_nuisance.Model = if (fit) |*f| overlap_nuisance.Model.init(&self.g, &self.prep, f) else null;
+        defer if (nuisance) |*m| m.deinit();
+        if (nuisance) |*model| model.contrast = contrast;
+        for (components, 0..) |c, j| {
+            if (!std.math.isFinite(c.amplitude) or c.amplitude < 0) return error.BadComponent;
+            if (c.phase < 0) {
+                if (c.amplitude != 0) return error.BadComponent;
+                continue;
+            }
+            if (c.phase >= self.phases.items.len) return error.NoSuchPhase;
+            var norm: f32 = 0;
+            for (c.q) |v| norm += v * v;
+            if (!std.math.isFinite(norm) or @abs(norm - 1) > 0.01) return error.BadQuaternion;
+            self.det.setPoses(&.{.{ .t = try self.positionOf(&self.geo, cell, lv), .pat = 0, .q = c.q }});
+            self.det.project(self.phases.items[@intCast(c.phase)].det[@intFromEnum(lv)], fr, 1);
+            var prepared = self.det.sims;
+            if (nuisance) |*m| {
+                prepared = m.apply(self.det.sims, self.overlapDC(&self.phases.items[@intCast(c.phase)], lv), theta.?);
+            } else self.prep.filter(prepared, 1, hw[0], hw[1], .{ .mask = fr.mask });
+            self.g.read(prepared, 0, std.mem.sliceAsBytes(sim));
+            try self.g.wait();
+            for (sim, 0..) |v, i| {
+                const a = c.amplitude * v;
+                out[3 * px + i] += a;
+                if (j == selected) out[2 * px + i] = a else out[px + i] -= a;
+            }
+        }
+        for (0..px) |i| out[4 * px + i] = out[i] - out[3 * px + i];
+    }
+
+    /// Fixed supplied projections: a small public numerical seam for known-answer
+    /// checks and candidate assessment, normalized on the GPU with no hidden filters.
+    /// Templates are [component][pattern][pixel], target is [pattern][pixel].
+    pub fn fitOverlapProjections(self: *Engine, target: []const f32, templates: []const f32, n: u32, k: u32, h: u32, w: u32, amplitudes: []f32, residual: []f32, states: []overlap.State) !void {
+        return self.fitOverlapProjectionsV3(target, templates, n, k, h, w, amplitudes, residual, states, null, .{ 0, 0, 0 });
+    }
+    pub fn fitOverlapProjectionsV3(self: *Engine, target: []const f32, templates: []const f32, n: u32, k: u32, h: u32, w: u32, amplitudes: []f32, residual: []f32, states: []overlap.State, theta: ?[]overlap_nuisance.Theta, mask: [3]f32) !void {
+        return self.fitOverlapProjectionsModel(target, templates, n, k, h, w, amplitudes, residual, states, theta, mask, false, theta != null, null);
+    }
+    pub fn fitOverlapProjectionsV4(self: *Engine, target: []const f32, templates: []const f32, n: u32, k: u32, h: u32, w: u32, amplitudes: []f32, residual: []f32, states: []overlap.State, theta: []overlap_nuisance.Theta, mask: [3]f32, optimize: bool, norms: []f32) !void {
+        if (norms.len != n * k) return error.BadLength;
+        return self.fitOverlapProjectionsModel(target, templates, n, k, h, w, amplitudes, residual, states, theta, mask, true, optimize, norms);
+    }
+    fn fitOverlapProjectionsModel(self: *Engine, target: []const f32, templates: []const f32, n: u32, k: u32, h: u32, w: u32, amplitudes: []f32, residual: []f32, states: []overlap.State, theta: ?[]overlap_nuisance.Theta, mask: [3]f32, contrast: bool, optimize: bool, norms: ?[]f32) !void {
+        if (n == 0 or h == 0 or w == 0 or k == 0 or k > overlap.capacity) return error.BadLength;
+        const px = @as(usize, h) * w;
+        if (px > 131072) return error.OverlapPatternTooLargeUseBinning;
+        if (target.len != n * px or templates.len != k * n * px or amplitudes.len != n * k or residual.len != target.len or states.len != n) return error.BadLength;
+        for (target) |v| if (!std.math.isFinite(v)) {
+            return error.NonFinitePattern;
+        };
+        for (templates) |v| if (!std.math.isFinite(v)) {
+            return error.NonFinitePattern;
+        };
+        const g = &self.g;
+        const scratch_bytes = @max(@as(u64, overlap.capacity) * n * px * 4, @as(u64, n) * @sizeOf(overlap.State));
+        if (scratch_bytes > @min(g.lim.max_storage_binding, g.lim.max_buffer)) return error.OverlapBatchTooLargeUseSmallerBatches;
+        var original = g.storage(target.len * 4);
+        defer g.release(&original);
+        var output = g.storage(target.len * 4);
+        defer g.release(&output);
+        if (contrast) {
+            // Scalar centering only: protect this supplied-image seam from a
+            // representable target pedestal. Experimental index preparation and
+            // every spatial/background operator remain unchanged.
+            const stable_target = try self.gpa.alloc(f32, target.len);
+            defer self.gpa.free(stable_target);
+            for (0..n) |b| {
+                const image = target[b * px ..][0..px];
+                var anchor: f64 = 0;
+                var total: f64 = 0;
+                var count: usize = 0;
+                for (image, 0..) |v, i| {
+                    const dy = @as(f64, @floatFromInt(i / w)) - mask[0];
+                    const dx = @as(f64, @floatFromInt(i % w)) - mask[1];
+                    if (mask[2] > 0 and dy * dy + dx * dx > mask[2]) continue;
+                    if (count == 0) anchor = v;
+                    total += @as(f64, v) - anchor;
+                    count += 1;
+                }
+                const mean_delta = total / @as(f64, @floatFromInt(@max(count, 1)));
+                for (image, 0..) |v, i| stable_target[b * px + i] = @floatCast((@as(f64, v) - anchor) - mean_delta);
+            }
+            g.writeSlice(original, 0, f32, stable_target);
+        } else g.writeSlice(original, 0, f32, target);
+        self.prep.filter(original, n, h, w, .{ .mask = mask });
+        var fit = overlap.Fit.init(g, n, @intCast(px), w, mask, original);
+        defer fit.deinit();
+        if (theta) |values| {
+            if (values.len != n) return error.BadLength;
+            var model = overlap_nuisance.Model.init(g, &self.prep, &fit);
+            defer model.deinit();
+            model.contrast = contrast;
+            model.optimize_enabled = optimize;
+            model.fixed(templates, k);
+            model.readTheta(values);
+            if (norms) |norm_values| {
+                const final_norms = try self.gpa.alloc([4]f32, n);
+                defer self.gpa.free(final_norms);
+                model.readNorms(final_norms, false);
+                try g.wait();
+                for (final_norms, 0..) |row, b| for (0..k) |j| {
+                    norm_values[b * k + j] = row[j];
+                };
+            }
+        } else {
+            g.writeSlice(fit.bank, 0, f32, templates);
+            self.prep.filter(fit.bank, k * n, h, w, .{ .mask = mask });
+            fit.fixed(k);
+        }
+        fit.residual(k, output, false);
+        fit.read(states);
+        g.read(output, 0, std.mem.sliceAsBytes(residual));
+        try g.wait();
+        for (states, 0..) |state, b_| for (0..k) |j| {
+            amplitudes[b_ * k + j] = state.amplitude[j];
+        };
     }
 
     /// Measure, once for the scan as it is prepared now, what mutual information chance gives:
@@ -2208,12 +2945,22 @@ pub const Engine = struct {
         self.index_cells = cells;
         self.nl_report = if (self.set.nlpar) .wanted else .off;
         if (self.set.nlpar) try self.orderInBlocks(cells);
+        if (self.res.seed_context) |old| {
+            if (!sameSeedContext(old, context)) {
+                @memset(self.res.seed_valid, false);
+                self.res.seed_context = context;
+            }
+        } else {
+            @memset(self.res.seed_valid, false);
+            self.res.seed_context = context;
+        }
         self.index_done = 0;
         self.index_region = cells.len;
         self.index_sweep = 0;
         self.index_accepted = 0;
-        self.cancel = false;
+        self.cancel.set(false);
         for (cells) |c| {
+            self.res.seed_valid[@intCast(c)] = false;
             for (0..self.res.candidate_phases) |p| self.res.candidate_sweep[p * self.res.phase.len + @as(usize, @intCast(c))] = -1;
             self.res.phase[@intCast(c)] = -1;
             self.res.sweep[@intCast(c)] = -1;
@@ -2266,12 +3013,13 @@ pub const Engine = struct {
     /// refinement had settled (settings.accept_step_deg). Every cell keeps the best match any
     /// sweep gave it, accepted or not.
     pub fn indexStep(self: *Engine) !usize {
+        const batch_context: ExportContext = .{ .settings = self.set, .geometry = self.geo, .calibration = self.calibration, .phase_generation = self.phase_generation };
         if (self.res.context) |context| {
             if (!sameExportContext(context, .{ .settings = self.set, .geometry = self.geo, .calibration = self.calibration, .phase_generation = self.phase_generation })) self.res.context_consistent = false;
         }
         const s = &self.set;
         const left = self.index_cells.len - self.index_done;
-        if (left == 0 or self.cancel) return 0;
+        if (left == 0 or self.cancel.get()) return 0;
         const n = @min(left, s.batch);
         const cells = self.index_cells[self.index_done..][0..n];
         const n_ph = self.phases.items.len;
@@ -2281,6 +3029,9 @@ pub const Engine = struct {
         self.ahead = self.index_cells[self.index_done + n ..][0..@min(left - n, s.batch)];
         defer self.ahead = &.{};
         try self.indexCells(cells, .{ .method = sw.method, .bandwidth = sw.bandwidth, .dict_grid = sw.dict_grid }, recs);
+        const after_context: ExportContext = .{ .settings = self.set, .geometry = self.geo, .calibration = self.calibration, .phase_generation = self.phase_generation };
+        if (!sameExportContext(batch_context, after_context)) self.res.context_consistent = false;
+        const coherent_seed = if (self.res.seed_context) |seed| sameSeedContext(seed, batch_context) and sameSeedContext(batch_context, after_context) else false;
         const settle: f32 = @floatCast(std.math.degreesToRadians(s.accept_step_deg));
         for (cells, 0..) |c, b| {
             const cell: usize = @intCast(c);
@@ -2308,6 +3059,9 @@ pub const Engine = struct {
                 self.res.z[at] = r.z;
                 self.res.phase[at] = @intCast(p);
                 self.res.settled[at] = r.step <= settle;
+                var norm: f32 = 0;
+                for (r.q) |v| norm += v * v;
+                self.res.seed_valid[at] = coherent_seed and std.math.isFinite(norm) and @abs(norm - 1) <= 0.01 and std.math.isFinite(r.ncc) and r.ncc >= -1 and r.ncc <= 1.00001 and std.math.isFinite(r.nmi);
             }
             const kept_good = if (s.accept_nmi > 0) self.res.nmi[at] >= s.accept_nmi else self.res.z[at] >= s.accept_z;
             if (self.res.sweep[at] < 0 and kept_good and self.res.settled[at]) {
@@ -2410,7 +3164,7 @@ pub const Engine = struct {
         t.best = self.tuneValues();
         t.first = t.best;
         t.active = true;
-        self.cancel = false;
+        self.cancel.set(false);
     }
 
     /// Run the trial in hand: index its sample with its settings as indexing would a sweep of
@@ -2434,7 +3188,7 @@ pub const Engine = struct {
         defer self.ahead = &.{};
         var at: usize = 0;
         while (at < cells.len) {
-            if (self.cancel) return error.Cancelled;
+            if (self.cancel.get()) return error.Cancelled;
             const n = @min(batch, cells.len - at);
             self.ahead = cells[at + n ..][0..@min(batch, cells.len - at - n)];
             try self.indexCells(cells[at..][0..n], .{ .method = sw.method, .bandwidth = sw.bandwidth, .dict_grid = sw.dict_grid }, recs[0 .. n_ph * n]);
@@ -2743,7 +3497,7 @@ pub const Engine = struct {
                     k += 1;
                 }
                 if (k == 0) continue;
-                if (self.cancel) return error.Cancelled;
+                if (self.cancel.get()) return error.Cancelled;
                 try self.simulate(@intCast(p), cells[0..k], qs[0 .. 4 * k], lv, sims[0 .. k * px]);
                 for (cells[0..k], 0..) |c, i| @memcpy(data[@intCast(c * px)..][0..px], sims[i * px ..][0..px]);
                 made += k;

@@ -14,6 +14,9 @@ const std = @import("std");
 const gpu_mod = @import("gpu/gpu.zig");
 const shaders = @import("shaders");
 const sh = @import("sh.zig");
+const sym = @import("sym.zig");
+const rot = @import("rot.zig");
+const peak_select = @import("overlap_peaks.zig");
 const master_mod = @import("master.zig");
 
 const Gpu = gpu_mod.Gpu;
@@ -115,7 +118,19 @@ pub const Tables = struct {
     /// d^l_{k,m}(π/2), host copy for the phases' weight tables
     wigner: []f64,
 
+    /// Pure allocation preflight, before any grid/Wigner generation. Sizes are
+    /// individual storage bindings, not their combined resident memory.
+    pub fn checkSize(L: u32, limit: u64) !void {
+        if (L == 0 or L > TW_LEN / 2) return error.BandwidthExceedsDeviceLimit;
+        const l: u64 = L;
+        const n: u64 = fftSize(L);
+        const pairs = l * (l + 1) / 2;
+        for ([_]u64{ 2 * n * 4, pairs * (n / 2) * 4, pairs * 4, l * l * l * 4, TW_LEN * 8 }) |bytes| {
+            if (bytes > limit) return error.BandwidthExceedsDeviceLimit;
+        }
+    }
     pub fn init(g: *Gpu, L: u32) !Tables {
+        try checkSize(L, @min(g.lim.max_storage_binding, g.lim.max_buffer));
         const gpa = g.gpa;
         const n = fftSize(L);
         const n_theta = n;
@@ -200,9 +215,23 @@ pub const PhaseGpu = struct {
     /// reciprocal denominator volume for the reference geometry
     rden: Buf = .{},
 
+    /// Effective fold is the native FFT fold, which can differ from the
+    /// master's metadata order. Reject before either CPU weight allocation.
+    pub fn checkSize(L: u32, n: u32, fold: u32, limit: u64) !void {
+        if (L == 0 or L > TW_LEN / 2 or fold == 0 or n == 0 or n % fold != 0) return error.BandwidthExceedsDeviceLimit;
+        const l: u64 = L;
+        const grid: u64 = n;
+        const nc = grid / fold;
+        const mc: u64 = 2 * ((L - 1) / fold) + 1;
+        const weights = l * mc * l * 8;
+        const spectrum = (grid / 2 + 1) * l * nc * 8;
+        const denominator = (grid / 2 + 1) * grid * nc * 4;
+        if (weights > limit or spectrum > limit or denominator > limit) return error.BandwidthExceedsDeviceLimit;
+    }
     pub fn init(g: *Gpu, t: *const Tables, hm: *const master_mod.Harmonics) !PhaseGpu {
         const gpa = g.gpa;
         const fold = master_mod.foldOf(hm.rules);
+        try checkSize(t.L, t.n, fold, @min(g.lim.max_storage_binding, g.lim.max_buffer));
         const mu_max = (t.L - 1) / fold;
         const wf = try master_mod.weights(gpa, t.L, hm.f, t.wigner, fold);
         defer gpa.free(wf);
@@ -261,6 +290,13 @@ pub const Spherical = struct {
     best: Buf = .{},
     /// per item: quaternion (w, x, y, z), score, a, b, c
     peaks: Buf = .{},
+    candidate_cancel: ?*const @import("cancellation.zig").Flag = null,
+    seed_selector: peak_select.Selector,
+    seed_numerator: Buf = .{},
+    seed_denominator: Buf = .{},
+    seed_pages: Buf = .{},
+    seed_page: Buf = .{},
+    seed_interpolated: Buf = .{},
     // the window's side (denominators): its own coefficient and volume buffers
     w_alm: Buf = .{},
     w_stats: Buf = .{},
@@ -268,11 +304,12 @@ pub const Spherical = struct {
     vol_f2: Buf = .{},
 
     pub fn init(g: *Gpu) Spherical {
-        return .{ .g = g };
+        return .{ .g = g, .seed_selector = peak_select.Selector.init(g) };
     }
 
     pub fn deinit(self: *Spherical) void {
-        inline for (.{ "items", "grid", "alm", "stats", "spec", "cand_v", "cand_i", "best", "peaks", "w_alm", "w_stats", "vol_f", "vol_f2" }) |f| self.g.release(&@field(self, f));
+        self.seed_selector.deinit();
+        inline for (.{ "items", "grid", "alm", "stats", "spec", "cand_v", "cand_i", "best", "peaks", "w_alm", "w_stats", "vol_f", "vol_f2", "seed_numerator", "seed_denominator", "seed_pages", "seed_page", "seed_interpolated" }) |f| self.g.release(&@field(self, f));
     }
 
     fn pipe(self: *Spherical, comptime module: []const u8, comptime entry: []const u8) u32 {
@@ -434,5 +471,116 @@ pub const Spherical = struct {
         const f = Gpu.flat(@intCast((n * cells + 255) / 256));
         so.grid_x = f[0];
         g.dispatch(self.pipe("so3", "rden_build"), f[0], f[1], 1, &.{ g.uniform(3, std.mem.asBytes(&so)), self.vol_f.at(13), self.vol_f2.at(14), self.w_stats.at(15), rden.at(16) });
+    }
+    fn candidateCancelled(self: *Spherical) !void {
+        if (self.candidate_cancel) |flag| if (flag.get()) {
+            try self.g.wait();
+            return error.Cancelled;
+        };
+    }
+    fn candidateSlab(self: *Spherical, ph: *const PhaseGpu, item: u32, first: u32, rows: u32, out: Buf) void {
+        var so = self.soParams(ph, 1);
+        so.pad0 = item;
+        so.pad1 = first;
+        so.pad2 = rows;
+        const k = self.lineParams(self.t.n / 2, rows * ph.nc);
+        const u = self.g.uniformPair(0, std.mem.asBytes(&k.u), 3, std.mem.asBytes(&so));
+        self.g.dispatch(self.fftPipe("so3", "a_volume_slab"), k.f[0], k.f[1], 1, &.{ u[0], self.t.tw.at(2), u[1], self.spec.at(7), out.at(12) });
+    }
+    fn peakQuat(p: [8]f32) rot.Quat {
+        return .{ p[0], p[1], p[2], p[3] };
+    }
+    /// Overlap-only seed pool. Rank-major native peak rows; rank zero is the
+    /// exact ordinary SI peak. Extra ranks are normalized quotient-grid local
+    /// maxima, refined with the ordinary interpolation, separated under the
+    /// phase's proper LEFT rotation group. Missing ranks have score -2 and q=0.
+    pub fn candidatePeaks(self: *Spherical, ph: *const PhaseGpu, n_items: u32, rden: Bind, rden_div: u32, group: sym.Laue, keep_n: u32, out: [][8]f32) !void {
+        if (keep_n == 0 or keep_n > 8 or out.len != @as(usize, n_items) * keep_n) return error.BadCandidateCount;
+        const g = self.g;
+        const t = self.t;
+        const lim = @min(g.lim.max_storage_binding, g.lim.max_buffer);
+        if (ph.specBytes(t) > lim or ph.volumeCells(t) * 4 > lim) return error.BandwidthExceedsDeviceLimit;
+        if (@as(u64, n_items) * ph.specBytes(t) > lim) return error.SphericalCandidateTileTooLarge;
+        try self.candidateCancelled();
+        for (out) |*p| p.* = .{ 0, 0, 0, 0, -2, 0, 0, 0 };
+        self.correlate(ph, n_items, rden, rden_div);
+        g.read(self.peaks, 0, std.mem.sliceAsBytes(out[0..n_items]));
+        try g.wait();
+        if (keep_n == 1) return;
+        const row_bytes = @as(u64, ph.nc) * t.n * 4;
+        if (3 * row_bytes > lim) return error.BandwidthExceedsDeviceLimit;
+        const core_rows: u32 = @intCast(@min(16, lim / row_bytes - 2));
+        const nb = t.n / 2 + 1;
+        const nslabs = (nb + core_rows - 1) / core_rows;
+        g.ensure(&self.seed_pages, @as(u64, nslabs) * 64);
+        g.ensure(&self.seed_page, 64);
+        g.ensure(&self.seed_interpolated, 8 * 32);
+        const rdiv = @max(1, rden_div);
+        const spacing = 2 * std.math.tau / @as(f64, @floatFromInt(t.n));
+        for (0..n_items) |item_index| {
+            const item: u32 = @intCast(item_index);
+            var count: u32 = 1;
+            var after: ?peak_select.Key = null;
+            while (count < keep_n) {
+                try self.candidateCancelled();
+                self.seed_selector.setCursor(after);
+                var j: u32 = 0;
+                var slab_index: u32 = 0;
+                while (j < nb) : (j += core_rows) {
+                    try self.candidateCancelled();
+                    const first = j -| 1;
+                    const end = @min(nb, j + core_rows + 1);
+                    const rows = end - first;
+                    const bytes = @as(u64, rows) * row_bytes;
+                    g.ensure(&self.seed_numerator, bytes);
+                    g.ensure(&self.seed_denominator, bytes);
+                    self.candidateSlab(ph, item, first, rows, self.seed_numerator);
+                    const offset = rden.offset + (@as(u64, item / rdiv) * nb + first) * row_bytes;
+                    g.copy(.{ .id = rden.buf, .size = 0 }, offset, self.seed_denominator, 0, bytes);
+                    self.seed_selector.slab(.{ .n = t.n, .nc = ph.nc, .nb = nb, .first = first, .rows = rows, .core_first = j, .core_rows = @min(core_rows, nb - j), .cursor_set = @intFromBool(after != null) }, self.seed_numerator, self.seed_denominator, self.seed_pages, @as(u64, slab_index) * 64);
+                    slab_index += 1;
+                }
+                self.seed_selector.reduce(self.seed_pages, nslabs * 8, self.seed_page, 0);
+                var page: [8]peak_select.Key = undefined;
+                g.read(self.seed_page, 0, std.mem.sliceAsBytes(&page));
+                try g.wait();
+                var valid: usize = 0;
+                for (page) |key| {
+                    if (key.index == 0xffffffff) break;
+                    valid += 1;
+                }
+                if (valid == 0) break;
+                var so = self.soParams(ph, n_items);
+                so.rden_div = rdiv;
+                const grid = Gpu.flat((n_items + 63) / 64);
+                so.grid_x = grid[0];
+                var rd = rden;
+                rd.slot = 8;
+                for (page[0..valid], 0..) |key, rank| {
+                    g.writeSlice(self.best, @as(u64, item) * 8, peak_select.Key, &.{key});
+                    g.dispatch(self.pipe("so3", "peak_finish"), grid[0], grid[1], 1, &.{ g.uniform(3, std.mem.asBytes(&so)), self.spec.at(7), rd, self.best.at(11), self.peaks.at(17) });
+                    g.copy(self.peaks, @as(u64, item) * 32, self.seed_interpolated, @as(u64, rank) * 32, 32);
+                }
+                var proposed: [8][8]f32 = undefined;
+                g.read(self.seed_interpolated, 0, std.mem.sliceAsBytes(proposed[0..valid]));
+                try g.wait();
+                for (proposed[0..valid], page[0..valid]) |peak, key| {
+                    after = key;
+                    var distinct = true;
+                    for (0..count) |rank| {
+                        if (sym.disorientation(peakQuat(peak), peakQuat(out[rank * n_items + item]), group) <= spacing) {
+                            distinct = false;
+                            break;
+                        }
+                    }
+                    if (distinct) {
+                        out[count * n_items + item] = peak;
+                        count += 1;
+                    }
+                    if (count == keep_n) break;
+                }
+                if (valid < 8) break;
+            }
+        }
     }
 };

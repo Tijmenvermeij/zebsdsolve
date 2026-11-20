@@ -748,3 +748,54 @@ fn nmi(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) l
         score[dp.dict0 + b] = v;
     }
 }
+
+// Overlap-only exact top-N. Same serial dot accumulation as dict_score; each
+// lane and each merge orders by score descending, global dictionary index ascending.
+var<workgroup> pool_score:array<f32,2048>;
+var<workgroup> pool_index:array<u32,2048>;
+fn pool_before(a:f32,ai:u32,b:f32,bi:u32)->bool{return a>b || (a==b && ai<bi);}
+@compute @workgroup_size(256)
+fn dict_score_candidates(@builtin(workgroup_id) wid:vec3<u32>,@builtin(local_invocation_index) lid:u32){
+ let e=wid.y*dp.grid_x+wid.x;let hw=dp.pat_h*dp.pat_w;let keep=dp.flags;
+ var values:array<f32,8>;var indices:array<u32,8>;
+ for(var r=0u;r<8u;r++){values[r]=-3.4e38;indices[r]=0xffffffffu;}
+ if(e<dp.n_exp){for(var d=lid;d<dp.n_dict;d+=256u){
+  var acc=0.0;for(var i=0u;i<hw;i++){acc+=pats[e*hw+i]*sims_in[d*hw+i];}
+  let idx=dp.dict0+d;
+  for(var r=0u;r<keep;r++){if(pool_before(acc,idx,values[r],indices[r])){
+   for(var j=keep-1u;j>r;j--){values[j]=values[j-1u];indices[j]=indices[j-1u];}
+   values[r]=acc;indices[r]=idx;break;
+  }}
+ }}
+ for(var r=0u;r<keep;r++){pool_score[lid*8u+r]=values[r];pool_index[lid*8u+r]=indices[r];}
+ workgroupBarrier();
+ for(var off=128u;off>0u;off>>=1u){
+  if(lid<off){
+   var a=0u;var b=0u;
+   for(var r=0u;r<keep;r++){
+    let ia=lid*8u+a;let ib=(lid+off)*8u+b;
+    let take_a=a<keep && (b>=keep || pool_before(pool_score[ia],pool_index[ia],pool_score[ib],pool_index[ib]));
+    if(take_a){values[r]=pool_score[ia];indices[r]=pool_index[ia];a++;}
+    else{values[r]=pool_score[ib];indices[r]=pool_index[ib];b++;}
+   }
+  }
+  workgroupBarrier();
+  if(lid<off){for(var r=0u;r<keep;r++){pool_score[lid*8u+r]=values[r];pool_index[lid*8u+r]=indices[r];}}
+  workgroupBarrier();
+ }
+ if(lid==0u && e<dp.n_exp){
+  // Merge this chunk into the immutable dictionary-index-ranked running list.
+  for(var r=0u;r<keep;r++){
+   let at=(r*dp.n_exp+e)*2u;values[r]=bitcast<f32>(dict_best[at]);indices[r]=dict_best[at+1u];
+  }
+  for(var c=0u;c<keep;c++){
+   let value=pool_score[c];let idx=pool_index[c];
+   if(idx==0xffffffffu){continue;}
+   for(var r=0u;r<keep;r++){if(pool_before(value,idx,values[r],indices[r])){
+    for(var j=keep-1u;j>r;j--){values[j]=values[j-1u];indices[j]=indices[j-1u];}
+    values[r]=value;indices[r]=idx;break;
+   }}
+  }
+  for(var r=0u;r<keep;r++){let at=(r*dp.n_exp+e)*2u;dict_best[at]=bitcast<u32>(values[r]);dict_best[at+1u]=indices[r];}
+ }
+}

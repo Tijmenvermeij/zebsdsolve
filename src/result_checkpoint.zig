@@ -44,6 +44,7 @@ fn fingerprint(e: *const engine.Engine) [32]u8 {
     hashValue(&h, e.set);
     hashValue(&h, e.geo);
     hashValue(&h, e.calibration);
+    e.calibration.hashDetectorAttitude(&h);
     for (e.phases.items) |p| {
         const m = p.master;
         hashValue(&h, m.name);
@@ -180,6 +181,10 @@ pub fn restore(e: *engine.Engine, input: []const u8) !void {
         if (sweep.* < -1 or (sweep.* >= 0 and sweep.* >= e.set.sweeps)) return error.InvalidResultCheckpoint;
     }
     replacement.context = .{ .settings = e.set, .geometry = e.geo, .calibration = e.calibration, .phase_generation = e.phase_generation };
+    // A verified homogeneous checkpoint is the one safe route to restore proof
+    // without reindexing. Mixed-context checkpoints remain rejected above.
+    replacement.seed_context = replacement.context;
+    for (replacement.phase, 0..) |phase, i| replacement.seed_valid[i] = phase >= 0;
     e.res.free(e.gpa);
     e.res = replacement;
 }

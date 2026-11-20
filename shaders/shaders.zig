@@ -41,6 +41,9 @@ pub const simulate = "const MAX_N: u32 = 512u;\nconst BPT: u32 = 2u;\n" ++ simul
 /// The crystal's unit cell in a picture, for the app.
 pub const cellview = @embedFile("cellview.wgsl");
 
+/// Fixed prepared-domain overlap projection fitting and signed residuals.
+pub const overlap = @embedFile("overlap.wgsl");
+
 /// Every module by name (tests/check_shaders.py builds each entry point of each).
 pub const modules = .{
     .{ "fft", fft },
@@ -53,4 +56,14 @@ pub const modules = .{
     .{ "nlpar", nlpar },
     .{ "simulate", simulate },
     .{ "cellview", cellview },
+    .{ "overlap", overlap },
+    .{ "overlap_peaks", overlap_peaks },
+    .{ "overlap_nuisance", overlap_nuisance },
+    .{ "overlap_profile", overlap_profile },
 };
+
+pub const overlap_nuisance = @embedFile("overlap_nuisance.wgsl");
+
+pub const overlap_peaks = @embedFile("overlap_peaks.wgsl");
+
+pub const overlap_profile = common ++ "\n" ++ @embedFile("overlap_profile.wgsl");

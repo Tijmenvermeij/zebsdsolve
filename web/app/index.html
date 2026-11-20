@@ -35,7 +35,8 @@
         <button type="button" role="tab" id="tab-patterns" data-tab="patterns" aria-selected="false"><span class="step">2</span>Patterns</button>
         <button type="button" role="tab" id="tab-geometry" data-tab="geometry" aria-selected="false"><span class="step">3</span>Geometry</button>
         <button type="button" role="tab" id="tab-index" data-tab="index" aria-selected="false"><span class="step">4</span>Index</button>
-        <button type="button" role="tab" id="tab-batch" data-tab="batch" aria-selected="false"><span class="step">5</span>Batch</button>
+        <button type="button" role="tab" id="tab-overlap" data-tab="overlap" aria-selected="false"><span class="step">5</span>Overlap</button>
+        <button type="button" role="tab" id="tab-batch" data-tab="batch" aria-selected="false"><span class="step">6</span>Batch</button>
       </nav>
 
       <div class="panels" id="panels">
@@ -161,6 +162,38 @@
             <button type="button" id="btn-json" title="The geometry and every setting, as JSON. Dropped on the window (or opened with a scan), it brings them back."><svg><use href="#i-down"/></svg>project .json</button>
           </div>
         </section>
+        <section class="panel" data-tab="overlap" role="tabpanel" aria-labelledby="tab-overlap" hidden>
+          <div class="row"><button type="button" class="primary act" id="btn-overlap-run">Run overlap</button></div>
+          <div class="fields">
+            <label class="field wide"><span>Primary</span><select id="overlap-primary"><option value="stored">Existing results</option><option value="index">Index first</option></select></label>
+            <label class="field"><span>Maximum components</span><select id="overlap-limit"><option>2</option><option>3</option><option>4</option></select></label>
+            <label class="field"><span>Search candidates</span><input id="overlap-keep-n" type="number" min="1" max="8" step="1" value="1" title="Orientations retained per phase for each residual search in the next overlap run. Each is refined against the same residual, then compared by fitting all components to the original pattern. The primary indexing step is unchanged. For 3–4 components, the single-candidate sequence is also checked to prevent a worse final fit."></label>
+          </div>
+          <label class="check" title="Fit one shared Gaussian blur and positive spatial gain profile for every retained component, refitting all amplitudes against the original prepared pattern. Detector geometry stays fixed. Optional orientation polishing uses the same fitting model."><input type="checkbox" id="overlap-blur-gain"> Fit blur / gain</label>
+          <label class="check" title="Refine component orientations with the same shared blur/gain and amplitude objective used for the mixture. Pattern centre stays fixed. A stronger smaller fit can restart the search. Stage thresholds instead require a passing addition to continue."><input type="checkbox" id="overlap-polish"> Polish orientations</label>
+          <div class="fields">
+            <label class="check" title="Screen each refined residual proposal before mixture fitting. If all proposals fail, retain the previous fit. This changes computation and is separate from Show only; the threshold is not calibrated confidence."><input type="checkbox" id="overlap-screen"> Screen residual NCC</label>
+            <label class="field"><span>Minimum NCC</span><input id="overlap-screen-value" type="number" min="-1" max="1" step="0.01" value="0" disabled title="Inclusive minimum signed residual NCC for each proposed component. Dataset quality, search settings and pattern-centre accuracy affect this score. Rejected proposals remain in the export."></label>
+          </div>
+          <div class="fields" title="Optional minimum reduction in residual SSE for each added component, divided by the original prepared pattern energy. Enter a fraction from 0 to 1: 0.01 means 1%. Leave all blank to disable. When enabled, fill every stage through Maximum components and enable Screen residual NCC. If the best joint fit misses the minimum, this search cannot advance to the next stage. These settings affect computation, not display filters.">
+            <label class="field" id="overlap-stage-2-row"><span>K2 minimum ΔSSE</span><input id="overlap-stage-2" type="number" min="0" max="1" step="any" title="Minimum normalized SSE reduction when adding component 2. Leave all stage thresholds blank to disable; 0.01 means 1% of original prepared pattern energy."></label>
+            <label class="field" id="overlap-stage-3-row"><span>K3 minimum ΔSSE</span><input id="overlap-stage-3" type="number" min="0" max="1" step="any" title="Minimum normalized SSE reduction when adding component 3. Leave all stage thresholds blank to disable; 0.01 means 1% of original prepared pattern energy."></label>
+            <label class="field" id="overlap-stage-4-row"><span>K4 minimum ΔSSE</span><input id="overlap-stage-4" type="number" min="0" max="1" step="any" title="Minimum normalized SSE reduction when adding component 4. Leave all stage thresholds blank to disable; 0.01 means 1% of original prepared pattern energy."></label>
+          </div>
+          <div class="row"><button type="button" class="act" id="btn-overlap-primary">Index primary</button><button type="button" class="act" id="btn-overlap-settings">Index settings</button></div>
+          <progress id="overlap-progress" max="1" value="0" aria-label="Overlap progress" hidden></progress>
+          <p class="readout" id="overlap-readout" role="status"></p>
+          <div class="fields">
+            <label class="field"><span>Primary NCC minimum</span><input id="overlap-primary-cutoff" type="number" min="-1" max="1" step="0.01" value="0" title="Inclusive acceptance of the original primary NCC. Controls the primary map and cells eligible for the next overlap run within the ROI; completed fits retain their execution cutoff."></label>
+            <label class="field"><span>Residual NCC minimum</span><input id="overlap-residual-cutoff" type="number" min="-1" max="1" step="0.01" value="0" title="Inclusive historical NCC of the refined residual-source orientation, before joint fitting or polishing. Controls overlap display only, independently of primary acceptance and computational screening."></label>
+            <label class="field wide"><span>Inspect</span><select id="overlap-component" title="Original indexed primary or a retained fit slot. Residual-source provenance is shown in the component table."><option value="primary">Primary</option><option value="1">Fit slot 1</option><option value="2">Fit slot 2</option></select></label>
+          </div>
+          <div class="fields overlap-filter">
+            <label class="field wide"><span>Show only</span><select id="overlap-filter-metric"><option value="">All results</option></select></label>
+            <label class="field"><span>Minimum</span><input id="overlap-filter-value" type="number" step="0.01" value="0.1" disabled></label>
+          </div>
+          <div class="row"><button type="button" id="btn-overlap-export">Export results</button></div>
+        </section>
         <section class="panel" data-tab="batch" role="tabpanel" aria-labelledby="tab-batch" hidden>
           <div class="row"><button type="button" class="primary act" id="btn-batch-current">Add current scan</button></div>
           <label class="check batch-download-option" title="One ZIP per scan, using your browser's download location. The browser may ask to allow multiple downloads."><input type="checkbox" id="batch-downloads"> Save to Downloads</label>
@@ -272,6 +305,17 @@
           <select id="overview-source" aria-label="Overview source" disabled><option value="none">Overview</option><option value="calculated">Pattern contrast</option></select>
           <button type="button" class="ghost mini" id="btn-overview" disabled>Calculate pattern contrast</button>
         </div>
+        <div class="map-views">
+          <div class="map-view">
+            <div class="pane-bar overlap-map-control" id="overlap-map-control" hidden><select id="overlap-map-component" aria-label="Left map component" title="Residual selects the first accepted residual-source orientation in each multi-component fit."><option value="primary">Primary</option><option value="residual">Residual</option><option value="1">Residual slot 1</option><option value="2">Residual slot 2</option></select><select id="overlap-map" aria-label="Left map metric">
+            <optgroup label="Selected component">
+              <option value="ipf_z">IPF Z</option><option value="ipf_x">IPF X</option><option value="phase">Phase</option>
+              <option value="fraction">Contrast share</option><option value="proposal_ncc">Search NCC</option>
+            </optgroup>
+            <optgroup label="Mixture fit">
+              <option value="mixture_ncc">Mixture NCC</option><option value="single_improvement">ΔSSE over single</option>
+            </optgroup>
+          </select></div>
         <div class="well" id="map-well" tabindex="0" title="Click or drag to select a pattern; the arrow keys step it (with shift: by ten). Scroll zooms about the pointer, a drag moves a zoomed map.">
           <canvas id="map" width="1" height="1"></canvas>
           <svg id="map-over" class="over"></svg>
@@ -279,6 +323,24 @@
           <div class="empty" id="map-empty">
             <p><b>Open a scan</b> to begin, or try the example.</p>
             <p class="hint">Then add the candidate phases, fit the pattern centre, and index.</p>
+          </div>
+        </div>
+          </div>
+          <div class="map-view" id="overlap-map-view" hidden>
+            <div class="pane-bar overlap-map-control" id="overlap-map-control-2"><select id="overlap-map-component-2" aria-label="Right map component" title="Residual selects the first accepted residual-source orientation in each multi-component fit."><option value="primary">Primary</option><option value="residual" selected>Residual</option><option value="1">Residual slot 1</option><option value="2">Residual slot 2</option></select><select id="overlap-map-2" aria-label="Right map metric">
+            <optgroup label="Selected component">
+              <option value="ipf_z">IPF Z</option><option value="ipf_x">IPF X</option><option value="phase">Phase</option>
+              <option value="fraction">Contrast share</option><option value="proposal_ncc">Search NCC</option>
+            </optgroup>
+            <optgroup label="Mixture fit">
+              <option value="mixture_ncc">Mixture NCC</option><option value="single_improvement">ΔSSE over single</option>
+            </optgroup>
+          </select></div>
+        <div class="well" id="overlap-map-well" tabindex="0" title="Click or drag to select a pattern; the arrow keys step it (with shift: by ten). Scroll zooms about the pointer, a drag moves a zoomed map.">
+          <canvas id="overlap-map-canvas" width="1" height="1"></canvas>
+          <svg id="overlap-map-over" class="over"></svg>
+          <div class="legend" id="overlap-map-legend" hidden title="What the map's colours mean. Click to fold it away."></div>
+        </div>
           </div>
         </div>
       </section>
@@ -394,6 +456,7 @@
       <section class="pane pat-pane" id="pat-pane">
         <div class="pane-bar">
           <span class="meta cell" id="pat-cell">pattern</span>
+          <label id="overlap-pattern-control" hidden><select id="overlap-inspection" aria-label="Pattern comparison"><option value="mixture">Mixture</option><option value="component">Component</option></select></label>
           <span class="grow"></span>
           <label class="check" title="A pattern that nothing has indexed yet is indexed on the spot, as the fits index theirs (spherical correlation at the fit's bandwidth, then refined), so its simulation and scores show for any cell and follow the filters and the geometry as you change them."><input type="checkbox" id="pat-live" checked> index on the spot</label>
           <label class="check" id="pat-full-box" title="Show the pattern at its stored size instead of the reduced one" hidden><input type="checkbox" id="pat-full"> stored size</label>
@@ -415,6 +478,12 @@
           <div class="facts-cell">
             <dl class="facts tall" id="pat-facts"></dl>
           </div>
+        </div>
+        <div class="pats overlap-pats" id="overlap-pats" hidden>
+          <figure><div class="well"><canvas id="overlap-target" width="1" height="1"></canvas></div><figcaption id="overlap-target-caption">Measured</figcaption></figure>
+          <figure><div class="well"><canvas id="overlap-simulation" width="1" height="1"></canvas></div><figcaption id="overlap-simulation-caption">Reconstruction</figcaption></figure>
+          <figure><div class="well"><canvas id="overlap-residual" width="1" height="1"></canvas></div><figcaption>Signed residual</figcaption></figure>
+          <div class="facts-cell"><span id="overlap-point-status" role="status"></span><table class="overlap-table"><thead><tr><th>Component</th><th>Phase</th><th id="overlap-weight-heading">Contrast share</th><th>Source NCC</th></tr></thead><tbody id="overlap-components"></tbody></table><dl class="facts" id="overlap-facts"></dl><details id="overlap-gain-panel" hidden><summary>Gain / blur</summary><figure><div class="well"><canvas id="overlap-gain" width="1" height="1"></canvas></div><figcaption id="overlap-gain-range"></figcaption></figure></details></div>
         </div>
       </section>
 

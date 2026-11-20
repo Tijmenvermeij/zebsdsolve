@@ -263,7 +263,7 @@ pub fn run(e: *Engine, cell: *const crystal.Cell) !Simulation {
     const gpa = e.gpa;
     const g = &e.g;
     const s = &e.set;
-    e.cancel = false;
+    e.cancel.set(false);
     if (cell.sites.len > MAX_SITES) return error.TooManySites;
 
     var geo = try potential.Geometry.init(gpa, cell, s.sim_dmin_nm);
@@ -347,7 +347,7 @@ pub fn run(e: *Engine, cell: *const crystal.Cell) !Simulation {
     const room = @min(@min(e.g.lim.max_storage_binding, e.g.lim.max_buffer) / 2, 256 << 20);
     var done_tiles: u32 = 0;
     for (bins, 0..) |bin, bi| {
-        if (e.cancel) return error.Cancelled;
+        if (e.cancel.get()) return error.Cancelled;
         var volt = try potential.Voltage.init(gpa, &geo, bin.voltage_kv);
         defer volt.deinit();
         g.writeSlice(tab_b, 0, f32, volt.table);
@@ -408,7 +408,7 @@ pub fn run(e: *Engine, cell: *const crystal.Cell) !Simulation {
         const n_tiles = (n_k + tile - 1) / tile;
         var k0: u32 = 0;
         while (k0 < n_k) : (k0 += tile) {
-            if (e.cancel) return error.Cancelled;
+            if (e.cancel.get()) return error.Cancelled;
             const cnt_k = @min(tile, n_k - k0);
             var pt = p;
             pt.n_k = cnt_k;

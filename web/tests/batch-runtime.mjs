@@ -54,7 +54,7 @@ function fixture({ engineOptions = {}, artifacts: makeArtifacts } = {}) {
   let queue;
   const createEngine = async () => {
     let done = 0;
-    const engine = { exportResultCheckpoint() { return new Uint8Array([1]); }, scan: { ...scan, ...engineOptions.scan }, deviceLost: null,
+    const engine = { exportResultCheckpoint() { return new Uint8Array([1]); }, scan: { ...scan, ...engineOptions.scan }, deviceLost: null, detectorAttitudeVersion: engineOptions.detectorAttitudeVersion,
       device: { destroy() { calls.push("destroy"); } },
       async closeScan() { calls.push("closeScan"); },
       configure(settings) { calls.push(["configure", settings]); },
@@ -369,8 +369,21 @@ for (const foreignContent of [false, true]) {
   const job = queue.add(spec()); queue.add(spec()); await queue.run(); assert.equal(job.status, "failed"); assert.match(job.error, /GPU device lost/); assert.equal(counts.index, 1);
 }
 {
-  const { queue } = fixture({ engineOptions: { scan: { format: "Oxford h5oina" } } }); const input = spec(); input.scanInfo.format = "Oxford h5oina"; input.geometry.planeKind = 2;
+  const { queue } = fixture({ engineOptions: { scan: { format: "Oxford h5oina" }, detectorAttitudeVersion:2 } }); const input = spec(); input.scanInfo.format = "Oxford h5oina"; input.detectorAttitudeVersion=2; input.geometry.planeKind = 2;
   const job = queue.add(input); assert.equal(job.warnings.length, 1); assert.ok(Object.isFrozen(job.warnings)); input.geometry.planeKind = 0;
   await queue.run(); assertLeaf(job, ".h5oina"); assert.equal(journal(job).warnings.length, 1);
+}
+for(const saved of [undefined,0,1]) {
+  const {queue,calls,counts}=fixture({engineOptions:{scan:{format:"Oxford h5oina"},detectorAttitudeVersion:2}});
+  const input=spec();input.scanInfo.format="Oxford h5oina";input.detectorAttitudeVersion=saved;
+  const job=queue.add(input);await queue.run();
+  assert.equal(job.status,"failed");assert.match(job.error,/camera convention changed/);
+  assert.equal(counts.index,0);assert.ok(!calls.some(call=>Array.isArray(call)&&call[0]==="geometry"));
+}
+{
+  const {queue,counts}=fixture({engineOptions:{scan:{format:"Oxford h5oina"},detectorAttitudeVersion:0}});
+  const input=spec();input.scanInfo.format="Oxford h5oina";input.detectorAttitudeVersion=0;
+  const job=queue.add(input);await queue.run();assert.equal(job.status,"complete");assert.equal(counts.index,1);
+  assert.equal(journal(job).geometry_convention,"oxford-fallback-v1");
 }
 console.log("Batch runtime: per-job destinations, five-file journals, frozen replay, concurrency, cancellation and guarded retries passed.");

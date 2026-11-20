@@ -7,19 +7,20 @@ import { createVotes } from "./votes.js";
 import { exportH5, exportOxford } from "./hdf5-export.js";
 import { BatchQueue, defaultOutputStem } from "./batch.js";
 import { batchArtifacts } from "./batch-artifacts.js";
-import { isOxfordH5, oxfordExportWarnings } from "./oxford-export-policy.js";
+import { isOxfordH5, oxfordExportWarnings, geometryConvention, canRestoreGeometry } from "./oxford-export-policy.js";
 import { createPlaneView } from "./planeview.js";
 import { MasterView, PROJECTIONS } from "./masterview.js";
 import { CellView } from "./cellview.js";
 import { drawEnergy } from "./energy.js";
 import { filesFromHandles, rememberFileHandle, fileHandleFor, sourceFolders, chooseScanFolder } from "./source-folders.js";
+import { createOverlap } from "./overlap.js";
 import { pairUPScan, chooseANG, validateUPProjectSources } from "./up-scan-files.js";
 
 const $ = (id) => document.getElementById(id);
 const app = $("app");
 const PHASE_COLORS = ["#3b82f6", "#f59e0b", "#10b981", "#ef4444", "#8b5cf6", "#14b8a6", "#ec4899", "#84cc16"];
 const RESULT_KINDS = ["ipf_z", "ipf_x", "ipf_y", "ncc", "nmi", "z", "phase", "sweep"];
-const TABS = ["simulate", "data", "patterns", "geometry", "index", "batch"];
+const TABS = ["simulate", "data", "patterns", "geometry", "index", "overlap", "batch"];
 // settings outside the pattern's own groups that change what the pattern view shows of a
 // pattern indexed on the spot
 const LIVE_KEYS = new Set(["fit_bandwidth", "refine", "refine_iters", "refine_step", "nmi_bins", "phase_by", "scan_x_sign", "scan_y_sign"]);
@@ -85,6 +86,8 @@ const st = {
   view: { k: 1, cx: 0, cy: 0, s: 1 },
   drag: null,
 };
+
+let overlapUI = null;
 
 // ── status, log, busy ──
 
@@ -163,7 +166,7 @@ function progress(frac) {
 /** Run one engine job: the actions and the settings are off and Stop is on while it runs. The
  *  selected pattern is shown again when it is done (a job changes what there is to show). */
 async function busy(label, fn) {
-  if (st.busy) return;
+  if (st.busy) return false;
   st.busy = 1;
   st.stop = false;
   app.dataset.busy = "1";
@@ -175,7 +178,7 @@ async function busy(label, fn) {
   try {
     await fn();
     succeeded = true;
-    status(st.gpuLost ? gpuLossMessage() : `${label.replace(/…$/, "")}: done in ${((performance.now() - t0) / 1000).toFixed(2)} s`, !!st.gpuLost);
+    status(st.gpuLost ? gpuLossMessage() : st.stop ? "stopped" : `${label.replace(/…$/, "")}: done in ${((performance.now() - t0) / 1000).toFixed(2)} s`, !!st.gpuLost);
   } catch (e) {
     ++st.showRun;
     ++st.masterRun;
@@ -195,7 +198,9 @@ async function busy(label, fn) {
     st.live.clear();
     if (st.gpuLost) updateEnabled();
     if (succeeded && !st.gpuLost) showCell();
+    overlapUI?.sync();
   }
+  return succeeded && !st.stop;
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -206,6 +211,8 @@ const factRows = (facts) => facts.flatMap(([k, v]) => { const dt = document.crea
 function selectTab(name) {
   if (st.batchRunning && name !== "batch") return;
   app.dataset.tab = name;
+  ++st.showRun;
+  overlapUI?.activate(name === "overlap");
   $("batch-workspace").hidden = name !== "batch";
   for (const b of $("tabs").children) {
     const on = b.dataset.tab === name;
@@ -224,6 +231,7 @@ function selectTab(name) {
     selectDock("master");
     showEnergy();
   }
+  if(name !== "overlap" && st.scan && !st.busy) showCell();
 }
 
 const done = (name, on = true) => { $(`tab-${name}`).dataset.done = on ? "1" : "0"; };
@@ -264,6 +272,8 @@ function afterSettings(keys) {
   if (keys.some((k) => ["sim_voltage_kv", "sim_tilt_deg", "sim_bin_kev"].includes(k))) showEnergy();
   if (keys.includes("accept_z") || keys.includes("accept_nmi")) drawZ();
   if (keys.some((k) => k.startsWith("ipf_"))) { st.keys.clear(); drawMap(); }
+  overlapUI?.sync();
+  if(overlapUI?.active)drawMap();
   drawLegend();
 }
 
@@ -326,6 +336,8 @@ function showGeometry() {
 function geometryChanged(byFit = false) {
   if (!byFit && st.fit) st.fit = { ...st.fit, quats: new Float32Array(0) };
   st.live.clear();
+  overlapUI?.sync();
+  if(overlapUI?.active)drawMap();
   showGeometry();
   if (votes) votes.follow();
   if (!st.busy) showCell();
@@ -1025,6 +1037,10 @@ function setMapKind(kind) {
 
 function drawMap() {
   if (!st.scan) return;
+  if(overlapUI?.active){
+    for(const [i,surface] of mapSurfaces().entries()){overlapUI.drawMap(surface.canvas,i);overlapUI.drawLegend(surface.legend,i);}
+    layoutMap();drawMapOverlay();return;
+  }
   const { rows, cols } = st.scan;
   const canvas = $("map");
   const dim = st.mapKind !== "overview" && st.results;
@@ -1046,6 +1062,7 @@ function drawMap() {
 
 /** What the map's colours mean, in its corner. */
 function drawLegend() {
+  if(overlapUI?.active){overlapUI.drawLegend($("map-legend"));return;}
   const box = $("map-legend");
   box.replaceChildren();
   const kind = st.mapKind;
@@ -1160,10 +1177,18 @@ function ipfKeyHalf(key, laue, lower, both) {
 
 /** Place the map and its overlay in the well for the current view. At zoom 1 the whole map
  *  shows, as large as fits; zooming never goes below that, and the map cannot be dragged off. */
+function mapSurfaces() {
+  const surface=(canvas,over,well,legend)=>({canvas:$(canvas),over:$(over),well:$(well),legend:$(legend)});
+  const maps=[surface("map","map-over","map-well","map-legend")];
+  if(overlapUI?.active)maps.push(surface("overlap-map-canvas","overlap-map-over","overlap-map-well","overlap-map-legend"));
+  return maps;
+}
+
 function layoutMap() {
-  const canvas = $("map"), over = $("map-over"), well = $("map-well");
+  const canvas = $("map");
   if (!st.scan || canvas.width < 2) return;
-  const W = well.clientWidth, H = well.clientHeight;
+  const surfaces=mapSurfaces();
+  const W = Math.min(...surfaces.map(m=>m.well.clientWidth)), H = Math.min(...surfaces.map(m=>m.well.clientHeight));
   const s0 = Math.max(1e-6, Math.min(W / canvas.width, H / canvas.height));
   const v = st.view;
   // in to 48 screen pixels per cell
@@ -1174,21 +1199,22 @@ function layoutMap() {
   v.cx = Math.max(hx, Math.min(canvas.width - hx, v.cx));
   v.cy = Math.max(hy, Math.min(canvas.height - hy, v.cy));
   v.s = s;
-  for (const el of [canvas, over]) {
-    el.style.left = `${W / 2 - v.cx * s}px`;
-    el.style.top = `${H / 2 - v.cy * s}px`;
-    el.style.width = `${w}px`;
-    el.style.height = `${h}px`;
+  for(const surface of surfaces) {
+    for (const el of [surface.canvas,surface.over]) {
+      el.style.left = `${surface.well.clientWidth / 2 - v.cx * s}px`;
+      el.style.top = `${surface.well.clientHeight / 2 - v.cy * s}px`;
+      el.style.width = `${w}px`;
+      el.style.height = `${h}px`;
+    }
+    surface.over.setAttribute("viewBox", `0 0 ${canvas.width} ${canvas.height}`);
   }
-  over.setAttribute("viewBox", `0 0 ${canvas.width} ${canvas.height}`);
   const zoomed = v.k > 1.0001;
   $("btn-zoom").disabled = !zoomed;
   $("btn-zoom").textContent = zoomed ? `whole map  ×${v.k.toFixed(1)}` : "whole map";
 }
 
 /** Zoom by `factor` keeping the map point under well position (px, py) where it is. */
-function zoomMap(factor, px, py) {
-  const well = $("map-well");
+function zoomMap(factor, px, py, well=$("map-well")) {
   const W = well.clientWidth, H = well.clientHeight;
   const v = st.view;
   const ux = v.cx + (px - W / 2) / v.s, uy = v.cy + (py - H / 2) / v.s;
@@ -1222,7 +1248,7 @@ function drawMapOverlay() {
     const d = st.roiDrag;
     over.append(svg("rect", { x: Math.min(d.c0, d.c1), y: Math.min(d.r0, d.r1), width: Math.abs(d.c1 - d.c0) + 1, height: Math.abs(d.r1 - d.r0) + 1, fill: "rgba(214,176,100,.15)", stroke: "#e8c77e", "stroke-width": u }));
   }
-  if ($("show-fit").checked) {
+  if ($("show-fit").checked && !overlapUI?.active) {
     const cells = st.fit ? st.fit.cells : fitLattice();
     for (const c of cells) {
       over.append(svg("circle", { cx: (c % cols) + 0.5, cy: Math.floor(c / cols) + 0.5, r: 3.5 * u, fill: st.fit ? "#7fbf6e" : "none", stroke: st.fit ? "#0a0a0b" : "#9d9da4", "stroke-width": u }));
@@ -1232,6 +1258,7 @@ function drawMapOverlay() {
     const x = st.cell % cols, y = Math.floor(st.cell / cols);
     over.append(svg("rect", { x: x - 2 * u, y: y - 2 * u, width: 1 + 4 * u, height: 1 + 4 * u, fill: "none", stroke: "#e8c77e", "stroke-width": 1.5 * u }));
   }
+  for(const surface of mapSurfaces().slice(1))surface.over.replaceChildren(...[...over.children].map(el=>el.cloneNode(true)));
 }
 
 /** The lattice the fits will use (pcfit.zig fitCells), to show before a fit has run. */
@@ -1246,8 +1273,8 @@ function fitLattice() {
   return out;
 }
 
-function mapCellAt(ev) {
-  const rect = $("map").getBoundingClientRect();
+function mapCellAt(ev,canvas=$("map")) {
+  const rect = canvas.getBoundingClientRect();
   const { rows, cols } = st.scan;
   const c = Math.floor(((ev.clientX - rect.left) / rect.width) * cols);
   const r = Math.floor(((ev.clientY - rect.top) / rect.height) * rows);
@@ -1255,7 +1282,8 @@ function mapCellAt(ev) {
   return { r, c, cell: r * cols + c };
 }
 
-function hoverText(p) {
+function hoverText(p,i=0) {
+  if(overlapUI?.active)return overlapUI.hover(p.r*st.scan.cols+p.c,i);
   const parts = [`row ${p.r}  col ${p.c}`];
   const R = st.results;
   if (R && R.phase[p.cell] >= 0) parts.push(`NCC ${R.ncc[p.cell].toFixed(3)}`, `NMI ${R.nmi[p.cell].toFixed(3)}`, `z ${R.z[p.cell].toFixed(1)}`);
@@ -1334,8 +1362,9 @@ function showNlpar(a) {
   $("nlpar-readout").textContent = `the selected pattern\nnoise ${a.noise.toFixed(a.noise < 10 ? 2 : 1)} a pixel as stored, ${(100 * a.left).toFixed(0)} % of it left\n${(100 * a.own).toFixed(0)} % of its average is the pattern itself\n${Math.max(more, 0)} of its ${a.side * a.side - 1} neighbours hold over 1 % of it`;
 }
 
-async function showCell() {
-  if (!st.scan || st.cell < 0 || st.gpuLost || st.overviewLoading || st.batchRunning) return;
+async function showCell(forcePrimary=false, primarySeedAvailable=true) {
+  if(overlapUI?.active && forcePrimary!==true){if(st.scan && st.cell>=0)await overlapUI.showCell(st.cell);return false;}
+  if (!st.scan || st.cell < 0 || st.gpuLost || st.overviewLoading || st.batchRunning) return false;
   const run = ++st.showRun;
   const cell = st.cell;
   const { cols } = st.scan;
@@ -1344,9 +1373,9 @@ async function showCell() {
     // at the reduced size, or (when patterns are reduced and it is asked for) the stored one
     const full = $("pat-full").checked && s.binning !== 1;
     const [h, w] = st.ze.shape(full);
-    const stage = st.stage;
+    const stage = forcePrimary===true ? "filtered" : st.stage;
     const exp = await st.ze.pattern(cell, stage, full);
-    if (run !== st.showRun) return;
+    if (run !== st.showRun) return false;
     // the mask the engine scores under (settings mask, mask_radius)
     const mask = new Uint8Array(h * w).fill(1);
     if (s.mask) {
@@ -1363,18 +1392,19 @@ async function showCell() {
     $("pat-cell").textContent = `row ${Math.floor(cell / cols)}, col ${cell % cols}`;
     $("pat-cell").title = `map cell ${cell}; shown at ${h} × ${w}`;
     let o = orientationOf(cell);
+    if(forcePrimary===true && (!primarySeedAvailable || o?.from!=="indexed"))o=null;
     const nPh = st.ze.phases.length;
-    if (!o && nPh && $("pat-live").checked && !st.busy) {
+    if (!o && nPh && $("pat-live").checked && !st.busy && forcePrimary!==true) {
       o = await indexNow(cell);
-      if (run !== st.showRun) return;
+      if (run !== st.showRun) return false;
     }
     if (o && nPh) {
       const sim = await st.ze.simulate(o.phase, [cell], o.q, full);
-      if (run !== st.showRun) return;
+      if (run !== st.showRun) return false;
       drawGray($("pat-sim"), sim, w, h, { mask });
       // difference of the two, each zero-mean and unit-norm under the mask (what the NCC compares)
       const proc = stage === "filtered" ? exp : await st.ze.pattern(cell, "filtered", full);
-      if (run !== st.showRun) return;
+      if (run !== st.showRun) return false;
       const norm = (a) => { let n = 0, t = 0; for (let i = 0; i < a.length; i++) if (mask[i]) { n++; t += a[i]; } const m = t / n; let ss = 0; const out = new Float32Array(a.length); for (let i = 0; i < a.length; i++) if (mask[i]) { out[i] = a[i] - m; ss += out[i] * out[i]; } const k = 1 / Math.sqrt(Math.max(ss, 1e-30)); for (let i = 0; i < a.length; i++) out[i] *= k; return out; };
       const a = norm(proc), b = norm(sim);
       st.cmp.diff = a.map((v, i) => v - b[i]);
@@ -1399,8 +1429,10 @@ async function showCell() {
     }
     if (exp.nlpar) facts.push(["averaging", `${(100 * exp.nlpar.left).toFixed(0)} % of the noise left`]);
     $("pat-facts").replaceChildren(...factRows(facts));
+    return true;
   } catch (e) {
     if (run === st.showRun) { status(String(e.message || e), true); log(String(e.message || e), true); }
+    return false;
   }
 }
 
@@ -1551,7 +1583,7 @@ function remainingTime(seconds) {
 }
 
 async function runIndex() {
-  await busy("indexing…", async () => {
+  return await busy("indexing…", async () => {
     try {
       const bar = $("index-progress");
       bar.hidden = false;
@@ -1559,6 +1591,7 @@ async function runIndex() {
       $("index-readout").textContent = "Preparing indexing…";
       await st.ze.indexBegin();
       st.resultsGeo = JSON.stringify(st.ze.geometry);
+      if (overlapUI?.active) st.results = st.ze.results();
       if (st.mapKind === "overview") setMapKind("ipf_z");
       const t0 = performance.now();
       let last = 0, visited = 0, s = null, timedSweep = -1, sweepStart = t0, sweepVisited = 0;
@@ -1759,7 +1792,7 @@ function showRoi() {
   $("roi-text").textContent = on ? `region ${s.roi_w} × ${s.roi_h}` : "region";
   $("btn-roi").title = `${on ? `Region of interest: ${s.roi_w} × ${s.roi_h} cells from column ${s.roi_x}, row ${s.roi_y}; the fits and indexing keep to it. ` : "The region of interest, which the fits and indexing keep to (now the whole map). "}Press, then drag a box on the map (shift-drag does it any time).`;
   $("btn-roi-clear").hidden = !on;
-  $("map-well").dataset.tool = st.roiTool ? "roi" : "";
+  for(const surface of mapSurfaces())surface.well.dataset.tool = st.roiTool ? "roi" : "";
 }
 
 function setRoi(set) {
@@ -1769,6 +1802,7 @@ function setRoi(set) {
 }
 
 function updateEnabled() {
+  overlapUI?.sync();
   const ready = !!st.scan && !st.gpuLost && st.ze.phases.length > 0;
   for (const id of ["btn-fit-auto", "btn-fit-pc", "btn-fit-plane", "btn-index", "btn-tune"]) $(id).disabled = !ready;
   for (const b of document.querySelectorAll(".needs-results")) b.disabled = !st.results;
@@ -1832,8 +1866,8 @@ async function takeFiles(files) {
   if (scans.length && !await openScan(scans, project?.settings, project?.opening_hints, project?.source_files)) return;
   if (masters.length) await addPhases(masters);
   if (project) {
-    if (project.geometry && /Oxford h5oina/i.test(st.scan?.format || "") && project.geometry_convention !== "oxford-calibrated-v1") {
-      const message = "This Oxford project uses the previous geometry convention. The original calibration is loaded; reindex and save a new project.";
+    if (project.geometry && !canRestoreGeometry(project.geometry_convention,st.scan?.format,st.ze.detectorAttitudeVersion)) {
+      const message = "Saved geometry uses a different camera convention and was not restored. Reopen the original acquisition, refit geometry and reindex.";
       log(message, true); status(message, true); updateEnabled(); return;
     }
     if (project.geometry) { beforeFit(); st.ze.setGeometry(project.geometry); geometryChanged(); }
@@ -1922,7 +1956,7 @@ async function loadExample() {
 }
 
 function projectJson() {
-  return JSON.stringify({ zebsdsolve: st.ze.version, scan: st.scanName, source_files: st.sourceFiles.map(file => ({ name: file.name, size: file.size, lastModified: file.lastModified })), geometry_convention: /Oxford h5oina/i.test(st.scan?.format || "") ? "oxford-calibrated-v1" : "generic-v1", geometry: st.ze.geometry, settings: st.ze.settings, opening_hints: st.sourceOpenHints, phases: st.ze.phases.map((p) => p.name) }, null, 2);
+  return JSON.stringify({ zebsdsolve: st.ze.version, scan: st.scanName, source_files: st.sourceFiles.map(file => ({ name: file.name, size: file.size, lastModified: file.lastModified })), geometry_convention: geometryConvention(st.scan?.format,st.ze.detectorAttitudeVersion), oxford_detector_attitude_version: st.ze.detectorAttitudeVersion, geometry: st.ze.geometry, settings: st.ze.settings, opening_hints: st.sourceOpenHints, phases: st.ze.phases.map((p) => p.name) }, null, 2);
 }
 
 /** Keep independent browser directory memories for scans and master patterns. */
@@ -1952,6 +1986,7 @@ async function pickFiles(kind) {
 async function main() {
   buildGeometry();
   fields = buildFields(document, applySetting);
+  overlapUI=createOverlap({st,busy,runPrimary:runIndex,selectTab,redraw:drawMap,status,log,renderIpfKey:ipfKey,inspectPrimary:seedAvailable=>showCell(true,seedAvailable)});
   votes = createVotes({
     geometry: () => st.ze.geometry,
     // the candidate under the cross-hair becomes the pattern centre, to fit again from there
@@ -2019,7 +2054,7 @@ function wireSplits() {
   let saved = {};
   try { saved = JSON.parse(localStorage.getItem("zebsdsolve.layout") || "{}") || {}; } catch { /* no storage: the defaults */ }
   const apply = () => {
-    for (const [prop, v] of [["--dock-h", saved.dock], ["--pat-w", saved.pat], ["--xtal-w", saved.xtal]]) {
+    for (const [prop, v] of [["--dock-h", saved.dock], ["--pat-w", saved.pat], ["--xtal-w", saved.xtal], ["--overlap-w", saved.overlap]]) {
       if (v > 0) stage.style.setProperty(prop, `${v}px`); else stage.style.removeProperty(prop);
     }
   };
@@ -2027,7 +2062,7 @@ function wireSplits() {
   apply();
   const wire = (el, which, axis) => {
     // (the bar beside the pattern is the bar beside the crystal on the Simulate step)
-    const keyOf = () => (which === "pat" && app.dataset.tab === "simulate" ? "xtal" : which);
+    const keyOf = () => (which === "pat" ? ({simulate:"xtal",overlap:"overlap"}[app.dataset.tab] || which) : which);
     el.addEventListener("mousedown", (e) => {
       if (e.button !== 0) return;
       e.preventDefault();
@@ -2222,14 +2257,16 @@ function updateWiring() {
   // the map: scroll zooms about the pointer, a drag moves a zoomed map (and scrubs the selection
   // over one that shows whole), a click selects, shift-drag sets the region of interest, and
   // the arrow keys step the selection
-  const map = $("map");
-  const well = $("map-well");
-  well.addEventListener("wheel", (e) => {
-    if (!st.scan) return;
-    e.preventDefault();
-    const rect = well.getBoundingClientRect();
-    zoomMap(Math.exp(-e.deltaY * (e.deltaMode === 1 ? 0.05 : 0.0015)), e.clientX - rect.left, e.clientY - rect.top);
-  }, { passive: false });
+  const surfaces=[{canvas:$("map"),well:$("map-well")},{canvas:$("overlap-map-canvas"),well:$("overlap-map-well")}];
+  let gestureSurface=surfaces[0];
+  for(const {well} of surfaces) {
+    well.addEventListener("wheel", (e) => {
+      if (!st.scan) return;
+      e.preventDefault();
+      const rect = well.getBoundingClientRect();
+      zoomMap(Math.exp(-e.deltaY * (e.deltaMode === 1 ? 0.05 : 0.0015)), e.clientX - rect.left, e.clientY - rect.top, well);
+    }, { passive: false });
+  }
   // the arrow keys, wherever the focus is but in a field or a view with keys of its own: on the
   // Simulate step they step the master's energy bin, elsewhere the selected pattern on the map
   document.addEventListener("keydown", (e) => {
@@ -2248,28 +2285,34 @@ function updateWiring() {
     const r = Math.max(0, Math.min(rows - 1, Math.floor(st.cell / cols) + k * d[0])), c = Math.max(0, Math.min(cols - 1, (st.cell % cols) + k * d[1]));
     if (r * cols + c !== st.cell) selectCell(r * cols + c);
   });
-  map.addEventListener("dblclick", resetZoom);
-  map.addEventListener("mousedown", (e) => {
-    if (!st.scan || e.button !== 0) return;
-    well.focus({ preventScroll: true });
-    const p = mapCellAt(e);
-    if (e.shiftKey || st.roiTool) {
-      if (!gpuAvailable()) return;
-      if (p) { st.roiDrag = { r0: p.r, c0: p.c, r1: p.r, c1: p.c }; drawMapOverlay(); }
+  for(const [i,{canvas:map,well}] of surfaces.entries()) {
+    map.addEventListener("dblclick", resetZoom);
+    map.addEventListener("mousedown", (e) => {
+      if (!st.scan || e.button !== 0) return;
+      gestureSurface=surfaces[i];
+      well.focus({ preventScroll: true });
+      const p = mapCellAt(e,map);
+      if (e.shiftKey || st.roiTool) {
+        if (!gpuAvailable()) return;
+        if (p) { st.roiDrag = { r0: p.r, c0: p.c, r1: p.r, c1: p.c }; drawMapOverlay(); }
+        e.preventDefault();
+        return;
+      }
+      st.drag = { x: e.clientX, y: e.clientY, cx: st.view.cx, cy: st.view.cy, moved: false, pan: st.view.k > 1.0001 };
+      if (!st.drag.pan && p) { if(overlapUI?.active)overlapUI.inspectMap(i,p.cell);selectCell(p.cell); }
       e.preventDefault();
-      return;
-    }
-    st.drag = { x: e.clientX, y: e.clientY, cx: st.view.cx, cy: st.view.cy, moved: false, pan: st.view.k > 1.0001 };
-    if (!st.drag.pan && p) selectCell(p.cell);
-    e.preventDefault();
-  });
-  map.addEventListener("mousemove", (e) => {
-    if (!st.scan) return;
-    const p = mapCellAt(e);
-    $("map-hover").textContent = p ? hoverText(p) : "";
-  });
+    });
+    map.addEventListener("mousemove", (e) => {
+      if (!st.scan) return;
+      const p = mapCellAt(e,map);
+      $("map-hover").textContent = p ? hoverText(p,i) : "";
+    });
+    map.addEventListener("mouseleave", () => { $("map-hover").textContent = ""; });
+    new ResizeObserver(() => { if (st.scan) { layoutMap(); drawMapOverlay(); } }).observe(well);
+  }
   window.addEventListener("mousemove", (e) => {
     if (!st.scan) return;
+    const {canvas:map,well}=gestureSurface;
     const d = st.drag;
     if (d) {
       const dx = e.clientX - d.x, dy = e.clientY - d.y;
@@ -2279,20 +2322,21 @@ function updateWiring() {
         st.view.cy = d.cy - dy / st.view.s;
         layoutMap();
       } else if (!d.pan) {
-        const p = mapCellAt(e);
+        const p = mapCellAt(e,map);
         if (p && p.cell !== st.cell) selectCell(p.cell);
       }
     }
     if (st.roiDrag) {
-      const p = mapCellAt(e);
+      const p = mapCellAt(e,map);
       if (p) { st.roiDrag.r1 = p.r; st.roiDrag.c1 = p.c; drawMapOverlay(); }
     }
   });
   window.addEventListener("mouseup", (e) => {
+    const {canvas:map,well}=gestureSurface;
     const d = st.drag;
     st.drag = null;
     well.dataset.pan = "0";
-    if (d && d.pan && !d.moved) { const p = mapCellAt(e); if (p) selectCell(p.cell); }
+    if (d && d.pan && !d.moved) { const p = mapCellAt(e,map); if (p) { if(overlapUI?.active)overlapUI.inspectMap(surfaces.indexOf(gestureSurface),p.cell);selectCell(p.cell); } }
     const roi = st.roiDrag;
     if (!roi) return;
     st.roiDrag = null;
@@ -2303,9 +2347,7 @@ function updateWiring() {
     setRoi(whole ? { roi_x: 0, roi_y: 0, roi_w: 0, roi_h: 0 } : { roi_x: x, roi_y: y, roi_w: w, roi_h: h });
     status(whole ? "region of interest: the whole map" : `region of interest: ${w} × ${h} cells from column ${x}, row ${y}`);
   });
-  map.addEventListener("mouseleave", () => { $("map-hover").textContent = ""; });
   // whatever is laid out by hand follows its pane
-  new ResizeObserver(() => { if (st.scan) { layoutMap(); drawMapOverlay(); } }).observe(well);
   new ResizeObserver(() => { if (st.scan) { drawPc(); if (st.cmp.mode === "split") drawCompare(); } }).observe($("pats"));
   new ResizeObserver(() => { if (!$("dock-votes").hidden) votes.draw(); if (!$("dock-plane").hidden) planeView.draw(); drawZ(); }).observe(document.querySelector(".dock"));
   new ResizeObserver(() => showEnergy()).observe($("energy"));
@@ -2424,7 +2466,7 @@ async function addBatchJob() {
     await st.ze._queue;
     if (files !== st.sourceFiles || st.busy || st.batchRunning || st.scanPicking) return;
     const spec = { sourceFiles: files, masterFiles: st.phaseFiles.filter((p) => p.on).map((p) => p.file), settings: st.ze.settings, geometry: st.ze.geometry,
-      openHints: st.sourceOpenHints, openGeometry: st.geoOpened, scanInfo: st.scan, phases: st.ze.phases, version: st.ze.version };
+      openHints: st.sourceOpenHints, openGeometry: st.geoOpened, scanInfo: st.scan, phases: st.ze.phases, version: st.ze.version, detectorAttitudeVersion: st.ze.detectorAttitudeVersion };
     const editing = batch.jobs.find(job => job.id === st.batchEditing);
     spec.directory = editing ? batch.directoryFor(editing) : await sourceFolders.find(files[0]).catch(() => null);
     if (files !== st.sourceFiles || st.busy || st.batchRunning || st.scanPicking) return;
@@ -2439,11 +2481,15 @@ async function loadBatchJob(job) {
   await busy("loading batch job…", async () => {
     await st.ze._queue;
     await st.ze.openScan(job.sourceFiles, { hints: job.openHints });
-    const acquired = structuredClone(job.openGeometry || st.ze.geometry);
+    const acquired = structuredClone(st.ze.geometry);
     // From this point native state is the new acquisition, even if a master fails.
     st.exampleBackground = null; st.scanName = job.sourceFiles[0].name;
     afterOpen(); st.sourceFile = job.sourceFiles[0]; st.sourceFiles = [...job.sourceFiles]; st.sourceOpenHints = structuredClone(job.openHints);
     st.geoOpened = acquired; st.pcFile = st.scan.hasPc ? [...acquired.pc] : null;
+    if(!canRestoreGeometry(geometryConvention(job.scanInfo.format,job.detectorAttitudeVersion),st.scan?.format,st.ze.detectorAttitudeVersion)) {
+      st.batchEditing = null;
+      throw new Error("Oxford camera convention changed; the original acquisition geometry is loaded. Refit geometry and recreate this batch job.");
+    }
     st.ze.clearPhases(); st.phaseFiles = [];
     try {
       st.ze.configure(job.settings); st.ze.setGeometry(job.geometry);

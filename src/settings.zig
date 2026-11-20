@@ -337,7 +337,8 @@ pub const Settings = struct {
     ///               as the dictionary is simulated once) and matched in those
     method: Method = .spherical,
     /// Dictionary: orientations sampled on a cubochoric grid of this many points per half edge
-    /// (the mean spacing is about 45° / dict_grid for cubic crystals' zone).
+    /// Nominal mean spacing is approximately 131.97049° / dict_grid + 0.03732°
+    /// (the conventional cubochoric sampling estimate, not a worst-case bound).
     dict_grid: u32 = 30,
     /// Patterns read and indexed per step.
     batch: u32 = 256,

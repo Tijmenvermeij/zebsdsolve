@@ -73,6 +73,39 @@ class IndexStatus(ctypes.Structure):
     ]
 
 
+class OverlapComponent(ctypes.Structure):
+    _fields_ = [("q", ctypes.c_float * 4), ("amplitude", ctypes.c_float),
+                ("phase", I32), ("proposal_ncc", ctypes.c_float), ("proposal_nmi", ctypes.c_float)]
+
+
+class OverlapProgress(ctypes.Structure):
+    _fields_ = [("retained_order",U32),("proposed_count",U32),("active_count",U32),("stop_reason",U32),
+                ("previous_sse",ctypes.c_float),("incremental_improvement",ctypes.c_float),("boundary_seen",U32),("_pad",U32)]
+
+
+class OverlapProfileOptions(ctypes.Structure):
+    _fields_ = [("size", U32), ("flags", U32), ("radius_deg", ctypes.c_float), ("min_residual_ncc", ctypes.c_float)]
+
+
+class OverlapStageOptions(ctypes.Structure):
+    _fields_ = [("base", OverlapProfileOptions), ("min_stage_improvement", ctypes.c_float * 3)]
+
+
+class OverlapProfileEvent(ctypes.Structure):
+    _fields_ = [("cell_index", U32), ("branch", U32), ("order", U32), ("attempt", U32),
+                ("phase", I32), ("rank", I32), ("flags", U32), ("result_order", U32),
+                ("source_q", ctypes.c_float * 4), ("residual_ncc", ctypes.c_float),
+                ("baseline_sse", ctypes.c_float), ("lower_sse", ctypes.c_float), ("joint_sse", ctypes.c_float)]
+
+
+class OverlapState(ctypes.Structure):
+    _fields_ = [("sse", ctypes.c_float), ("initial_sse", ctypes.c_float),
+                ("phase", ctypes.c_float), ("flags", ctypes.c_float),
+                ("amplitude", ctypes.c_float * 4), ("single_sse", ctypes.c_float * 4),
+                ("correlation", ctypes.c_float), ("condition", ctypes.c_float),
+                ("best_single_sse", ctypes.c_float), ("trial_sse", ctypes.c_float)]
+
+
 def _names():
     if sys.platform == "win32":
         return "zebsdsolve.dll", "wgpu_native.dll"
@@ -121,6 +154,8 @@ _SIGS = {
     "ze_set_geometry": ([P, ctypes.POINTER(Geometry)], None),
     "ze_add_phase": ([P, ctypes.c_char_p, SZ], I32),
     "ze_clear_phases": ([P], None),
+    "ze_seed_source_roi": ([P,u32p],U32),
+    "ze_phase_generation": ([P],U64),
     "ze_phase_count": ([P], U32),
     "ze_phase_info": ([P, U32, ctypes.POINTER(PhaseInfo)], I32),
     "ze_master_image": ([P, U32, f32p, SZ], I32),
@@ -157,6 +192,15 @@ _SIGS = {
     "ze_index_step": ([P], I64),
     "ze_index_status": ([P, ctypes.POINTER(IndexStatus)], None),
     "ze_sweep": ([P, U32, u32p], None),
+    "ze_overlap_cells": ([P, u64p, SZ, U32, ctypes.POINTER(OverlapComponent), SZ, ctypes.POINTER(OverlapState), SZ], I32),
+    "ze_overlap_cells_v2": ([P,u64p,SZ,U32,U32,ctypes.POINTER(OverlapComponent),SZ,ctypes.POINTER(OverlapState),SZ,ctypes.POINTER(OverlapProgress),SZ],I32),
+    "ze_overlap_phase_moments": ([P,f64p,SZ],I32),
+    "ze_overlap_cells_v3": ([P,u64p,SZ,U32,U32,ctypes.POINTER(OverlapComponent),SZ,ctypes.POINTER(OverlapState),SZ,ctypes.POINTER(OverlapProgress),SZ,f32p,SZ],I32),
+    "ze_overlap_inspect_v3": ([P,U64,ctypes.POINTER(OverlapComponent),SZ,U32,f32p,SZ,f32p,SZ],I32),
+    "ze_overlap_fit_v3": ([P,f32p,f32p,U32,U32,U32,U32,f32p,f32p,ctypes.POINTER(OverlapState),f32p,f32p],I32),
+    "ze_overlap_inspect": ([P,U64,ctypes.POINTER(OverlapComponent),SZ,U32,f32p,SZ],I32),
+    "ze_orientation_colors": ([P,f32p,i32p,SZ,U32,u8p,SZ],I32),
+    "ze_overlap_fit": ([P, f32p, f32p, U32, U32, U32, U32, f32p, f32p, ctypes.POINTER(OverlapState)], I32),
     "ze_index_cells": ([P, u64p, SZ, f32p, SZ], I32),
     "ze_index_cells_by": ([P, u64p, SZ, U32, U32, U32, f32p, SZ], I32),
     "ze_results": ([P, U32, P, SZ], I64),
@@ -171,6 +215,23 @@ _SIGS = {
     "ze_gpu_counts": ([P, u32p], None),
     "ze_profile": ([P, U32], I32),
     "ze_profile_report": ([P, ctypes.c_char_p, SZ], SZ),
+}
+
+
+# Optional capability exports preserve loading older libraries with the V3 ABI.
+_OPTIONAL_SIGS = {
+    "ze_overlap_optimizer_version": ([], U32),
+    "ze_overlap_profile_version": ([], U32),
+    "ze_overlap_stage_gate_version": ([], U32),
+    "ze_overlap_profile_selection_version": ([], U32),
+    "ze_oxford_detector_attitude_version": ([P], U32),
+    "ze_overlap_profile_trace_capacity": ([P,SZ,U32,U32],SZ),
+    "ze_overlap_cells_v6": ([P,u64p,SZ,U32,U32,U32,U32,ctypes.POINTER(OverlapComponent),SZ,ctypes.POINTER(OverlapState),SZ,ctypes.POINTER(OverlapProgress),SZ,f32p,SZ,f32p,SZ,i32p,SZ,ctypes.POINTER(OverlapProfileOptions),f32p,SZ,ctypes.POINTER(OverlapProfileEvent),SZ,ctypes.POINTER(SZ)],I32),
+    "ze_overlap_trajectory_version": ([], U32),
+    "ze_overlap_cells_v4": ([P,u64p,SZ,U32,U32,U32,ctypes.POINTER(OverlapComponent),SZ,ctypes.POINTER(OverlapState),SZ,ctypes.POINTER(OverlapProgress),SZ,f32p,SZ,f32p,SZ],I32),
+    "ze_overlap_cells_v5": ([P,u64p,SZ,U32,U32,U32,U32,ctypes.POINTER(OverlapComponent),SZ,ctypes.POINTER(OverlapState),SZ,ctypes.POINTER(OverlapProgress),SZ,f32p,SZ,f32p,SZ,i32p,SZ],I32),
+    "ze_overlap_inspect_v4": ([P,U64,ctypes.POINTER(OverlapComponent),SZ,U32,f32p,SZ,f32p,SZ],I32),
+    "ze_overlap_fit_v4": ([P,f32p,f32p,U32,U32,U32,U32,f32p,f32p,ctypes.POINTER(OverlapState),f32p,SZ,f32p,SZ,U32,f32p,SZ],I32),
 }
 
 
@@ -193,4 +254,8 @@ def load():
     for name, (args, res) in _SIGS.items():
         fn = getattr(lib, name)
         fn.argtypes, fn.restype = args, res
+    for name, (args, res) in _OPTIONAL_SIGS.items():
+        fn = getattr(lib, name, None)
+        if fn is not None:
+            fn.argtypes, fn.restype = args, res
     return lib, str(wgpu_path)
