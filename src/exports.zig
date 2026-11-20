@@ -146,7 +146,7 @@ fn geometryPlaneChanged(next: *const engine.Geometry, was: *const engine.Geometr
     return next.plane_kind != was.plane_kind or !std.meta.eql(next.plane, was.plane);
 }
 
-fn effectiveGeometry(e: *Engine, next: *const engine.Geometry, was: *const engine.Geometry, plane_changed: bool) engine.Geometry {
+fn asGiven(e: *Engine, next: *const engine.Geometry, was: *const engine.Geometry, plane_changed: bool) engine.Geometry {
     var g = next.*;
     // Preserve a calibrated acquisition's unknown pixel size. Otherwise use the scan's estimate.
     if (!(g.px_um > 0) and e.calibration.metadata == null) g.px_um = e.defaultPx();
@@ -163,7 +163,7 @@ export fn ze_set_geometry(e: *Engine, in: *const engine.Geometry) void {
     const home = if (e.geo_home) |*h| h else &e.geo;
     const was = home.*;
     const plane_changed = geometryPlaneChanged(in, &was);
-    const g = effectiveGeometry(e, in, &was, plane_changed);
+    const g = asGiven(e, in, &was, plane_changed);
     if (!std.meta.eql(g.pc, was.pc)) e.geo_given.pc = g.pc;
     if (plane_changed) {
         e.geo_given.plane_kind = g.plane_kind;
@@ -691,7 +691,7 @@ export fn ze_cell_under(e: *Engine, cell: u64, geo: *const engine.Geometry, band
     if (n_ph == 0 or n_recs != n_ph * 8) return failed(e, "cell_under", error.BadLength);
     if (bandwidth < 8 or bandwidth > 256) return failed(e, "cell_under", error.BadSetting);
     const was = e.geo_home orelse e.geo;
-    const g = effectiveGeometry(e, geo, &was, geometryPlaneChanged(geo, &was));
+    const g = asGiven(e, geo, &was, geometryPlaneChanged(geo, &was));
     const rs = @as([*]engine.Record, @ptrCast(@alignCast(recs)))[0..n_ph];
     const p = e.cellUnder(cell, g, bandwidth, e.viewLevel(full != 0), rs, sim[0..len]) catch |err| return failed(e, "cell_under", err);
     return @intCast(p);

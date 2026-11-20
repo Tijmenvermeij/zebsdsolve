@@ -811,10 +811,9 @@ fn jointPlane(j: *const Joint, which: plane_mod.Model, theta: *[plane_mod.N]f64,
         const pc = Geometry.pcOf(j.R, fit.base[b], j.h, j.h * j.fr.aspect);
         pts[b] = .{ .row = rc[0], .col = rc[1], .y = .{ pc[0] * j.fr.aspect, pc[1], pc[2] } };
     }
-    // An affine starting geometry gives no independent projective coefficients.
-    // Start with a constant denominator and let the patterns constrain its two slopes.
-    const seed_model: plane_mod.Model = if (which == .projective and fit.geo0.plane_kind != @intFromEnum(plane_mod.Kind.projective)) .affine else which;
-    theta.* = plane_mod.fitTheta(seed_model, pts, j.fr) orelse return error.TooFewFitPatterns;
+    // (from one centre for every cell the projective row is not told: the fit through the
+    // points keeps it at zero, and the patterns say it)
+    theta.* = plane_mod.fitTheta(which, pts, j.fr) orelse return error.TooFewFitPatterns;
     var rounds = try jointFit(j, which, theta, most);
     pseudoPoints(j, theta.*, pts);
     if (!(outlier > 0)) return rounds;
@@ -1136,7 +1135,7 @@ fn finishPlane(e: *Engine, fit: *Fit, res_out: *PlaneResult, before_in: *const G
         .line => "a tilt line: PCx the same everywhere, PCy and PCz along the rows",
         else => "the plane",
     } });
-    e.events.log("plane of source points ({s}): {d} of {d} fit patterns used; about it they scatter by {d:.5} {d:.5} {d:.5} (PCx, PCy, PCz); mean NCC {d:.4} with each pattern at its own best (was {d:.4})", .{ @tagName(kind), res.n_used, res.n_patterns, res.rmsd[0], res.rmsd[1], res.rmsd[2], res.ncc, res.start_ncc });
+    e.events.log("plane of source points ({s}): {d} of {d} fit patterns used; about it they scatter by {d:.5} {d:.5} {d:.5} (PCx, PCy, PCz); mean NCC {d:.4} with each pattern at its own best (was {d:.4})", .{ @tagName(model), res.n_used, res.n_patterns, res.rmsd[0], res.rmsd[1], res.rmsd[2], res.ncc, res.start_ncc });
     e.events.log("plane: source at the map's middle {d:.5} {d:.5} {d:.5}; the sample's frame against the nominal one: swing {d:.2}° ± {d:.2}°, tilt {d:.2}° ± {d:.2}°, the scan turned in its plane {d:.2}° ± {d:.2}°; the beam's travel for a row {d:.3} ± {d:.3} and for a column {d:.3} ± {d:.3} of what the steps and the pixel size say; the scan's directions {d:.2}° ± {d:.2}° off square", .{ res.pc[0], res.pc[1], res.pc[2], said.rot[0] * deg, res.said_rot_se[0] * deg, said.rot[1] * deg, res.said_rot_se[1] * deg, said.rot[2] * deg, res.said_rot_se[2] * deg, said.step[0], res.step_se[0], said.step[1], res.step_se[1], said.skew * deg, res.skew_se * deg });
     return res;
 }

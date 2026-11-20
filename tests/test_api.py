@@ -736,17 +736,17 @@ def main():
 
     # a cell under another pattern centre, the one in use staying: what setting that centre,
     # indexing the cell and simulating it would give
-    original_geo = s.geometry
-    pc0 = np.array(original_geo["pc"])
+    before = s.geometry
+    pc0 = np.array(before["pc"])
     s.set_geometry(plane_kind="affine", plane=[[0, 0, v] for v in pc0] + [[0, 0, 1]])
     with_plane = s.geometry
-    other, cell = np.array(with_plane["pc"]) + [0.01, -0.01, 0.005], int(some[7])
+    other, cell = pc0 + [0.01, -0.01, 0.005], int(some[7])
     u = s.cell_under(cell, pc=other)
     kept = s.geometry == with_plane
     s.set_geometry(pc=other)
     v = s.index_cells([cell], method="spherical", bandwidth=s.settings["fit_bandwidth"])
     sim_v = s.simulate(v["quaternions"][0, 0], cells=[cell], phase=0)
-    s.set_geometry(**original_geo)
+    s.set_geometry(**before)
     check("a cell can be indexed and simulated under another pattern centre, the fitted plane staying", kept and np.allclose(u["quaternion"], v["quaternions"][0, 0])
           and abs(u["ncc"] - float(v["ncc"][0, 0])) < 1e-6 and np.abs(u["simulation"].ravel() - np.asarray(sim_v).ravel()).max() < 1e-6,
           f"NCC {u['ncc']:.4f} there, as setting it gives")
@@ -827,6 +827,29 @@ def main():
           + "; strip: " + ", ".join(f"{m} ×{v['cv'] / min(x['cv'] for x in t['models'].values()):.2f}" for m, v in t["models"].items()) + f"; its centre {e_line:.4f} from kikuchipy's")
     ev = s.events()
     check("events are queued for the caller", any(x["kind"] == "pc" for x in ev) and any(x["kind"] == "progress" and x["stage"] == "plane" for x in ev))
+
+    # a projective plane through the source points of a 3 × 3 patch, which hardly move: they do
+    # not tell its slopes, which stay near zero, and the source at the map's middle near the
+    # affine plane's (it was 10⁵ away)
+    mid = {}
+    for kind in ("affine", "projective"):
+        s.set_geometry(pc=pc_file, plane_kind="none")
+        s.configure(roi_x=32, roi_y=20, roi_w=3, roi_h=3, plane_method="points", plane_kind=kind, plane_stride=1)
+        mid[kind] = np.array(s.fit_plane()["pc"])
+    w = np.array(s.geometry["plane"])[3]
+    swing = max(abs(w @ (c, r, 1) / (w @ (37, 27, 1)) - 1) for c in (0, 74) for r in (0, 54))
+    gap = np.abs(mid["projective"] - mid["affine"]).max()
+    check("a projective plane through points that hardly move keeps its slopes near zero", swing < 0.02 and gap < 0.003,
+          f"the denominator {swing:.4f} from the middle at the corners; the middle's source {gap:.5f} from the affine plane's")
+
+    # the joint projective fit from one pattern centre for every cell (no steps, no plane): the
+    # starting sources do not tell the projective row
+    s.configure(roi_x=32, roi_y=20, roi_w=3, roi_h=3, plane_method="joint", plane_kind="projective", plane_stride=1, plane_iters=15)
+    s.set_geometry(pc=(0.5, 0.25, 0.5), plane_kind="none", step_x_um=0, step_y_um=0)
+    joint = s.fit_plane()
+    check("the joint projective fit can start at a constant pattern centre",
+          joint["kind"] == "projective" and np.isfinite(joint["plane"]).all() and joint["ncc"] > joint["start_ncc"])
+
     s.close()
 
     # ── a master pattern simulated from a crystal ──
