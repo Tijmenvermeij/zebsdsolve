@@ -505,6 +505,37 @@ const backgroundSettings = () => {
   return { static_background, dynamic_background };
 };
 
+function chooseOxfordPatterns() {
+  return new Promise((resolve) => {
+    const dialog = document.createElement("dialog");
+    dialog.className = "scan-info-dialog";
+    dialog.setAttribute("aria-labelledby", "oxford-pattern-title");
+    const title = document.createElement("h3");
+    title.id = "oxford-pattern-title";
+    title.textContent = "Which patterns should this scan use?";
+    const row = document.createElement("div");
+    row.className = "row";
+    for (const [label, value] of [["Processed", "processed"], ["Unprocessed", "unprocessed"], ["Cancel", null]]) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = label;
+      if (value === "processed") button.className = "primary";
+      button.onclick = () => finish(value);
+      row.append(button);
+    }
+    function finish(value) {
+      dialog.close();
+      dialog.remove();
+      resolve(value);
+    }
+    dialog.oncancel = (event) => { event.preventDefault(); finish(null); };
+    dialog.append(title, row);
+    document.body.append(dialog);
+    dialog.showModal();
+    row.firstElementChild.focus();
+  });
+}
+
 async function openScan(files, projectSettings = null, projectHints = null, expectedSources = null) {
   if (!gpuAvailable() || st.busy || st.batchRunning || st.scanPicking) return;
   st.scanPicking = true;
@@ -519,7 +550,22 @@ async function openScan(files, projectSettings = null, projectHints = null, expe
     const settings = { ...st.exampleBackground, ...projectSettings };
     const originalHints = Object.fromEntries(Object.entries(openHints()).map(([key, value]) =>
       [key, projectHints?.[key] ?? settings[key] ?? value]));
-    await st.ze.openScan(files, { settings, hints: projectHints || {} });
+    const hints = { ...projectHints };
+    const savedSource = hints.oxford_patterns;
+    hints.oxford_patterns = savedSource ?? "ask";
+    try {
+      await st.ze.openScan(files, { settings, hints });
+    } catch (error) {
+      if (savedSource != null || !String(error.message).endsWith(": OxfordPatternChoiceRequired")) throw error;
+      const source = await chooseOxfordPatterns();
+      if (!source || st.stop) throw new Error("Cancelled opening scan");
+      if (!gpuAvailable()) return;
+      hints.oxford_patterns = source;
+      await st.ze.openScan(files, { settings, hints });
+    }
+    if (hints.oxford_patterns === "processed" || hints.oxford_patterns === "unprocessed") {
+      originalHints.oxford_patterns = hints.oxford_patterns;
+    }
     st.exampleBackground = null;
     opened = true;
     st.scanName = files[0].name;
@@ -581,6 +627,9 @@ function afterOpen(files = [], hints = null) {
     ["background", s.hasBackground ? "stored" : "none"], ["pattern centre", s.hasPc ? "from the file" : "unknown"],
     ["pixel", s.hasPx ? `${st.ze.geometry.pxUm.toFixed(1)} µm` : "none"],
   ];
+  if (s.format === "Oxford h5oina" && hints?.oxford_patterns) {
+    facts.push(["pattern source", hints.oxford_patterns]);
+  }
   if (s.voltageKv) facts.push(["voltage", `${s.voltageKv} kV`]);
   $("scan-facts").replaceChildren(...factRows(facts));
   // an EDAX .up1 / .up2 can take its scan's .ang (OIM's export of the same map)
@@ -2091,7 +2140,7 @@ async function takeFiles(files) {
   }
   const projects = files.filter((f) => /\.json$/i.test(f.name));
   const masters = files.filter((f) => !projects.includes(f) && isMaster(f));
-  const scans = files.filter((f) => !projects.includes(f) && !masters.includes(f));
+  let scans = files.filter((f) => !projects.includes(f) && !masters.includes(f));
   try { validateScanSelection(scans); }
   catch (error) { status(error.message, true); log(error.message, true); return; }
   let project = null;
@@ -2107,6 +2156,19 @@ async function takeFiles(files) {
     if (!scans.length) {
       try { validateUPProjectSources(project.source_files, st.sourceFiles); }
       catch (error) { status(String(error.message || error), true); log(String(error.message || error), true); return; }
+      const source = project.opening_hints?.oxford_patterns;
+      if ((source === "processed" || source === "unprocessed") && source !== st.sourceOpenHints?.oxford_patterns) {
+        const expected = project.source_files?.[0];
+        const current = st.sourceFile;
+        if (!isOxfordH5(st.scan?.format) || !expected || !current || expected.name !== current.name ||
+            expected.size !== current.size || expected.lastModified !== current.lastModified) {
+          const message = "Open this project with its original Oxford H5OINA scan.";
+          status(message, true);
+          log(message, true);
+          return;
+        }
+        scans = st.sourceFiles;
+      }
     }
     if (project.settings) {
       const have = st.ze.settings;

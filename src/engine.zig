@@ -827,7 +827,7 @@ pub const Engine = struct {
     pub fn openScan(self: *Engine, paths: []const []const u8) !void {
         var settings = self.set;
         wholeMap(&settings);
-        try self.openScanPrepared(paths, settings, settings, self.mask_explicit);
+        try self.openScanPrepared(paths, settings, settings, self.mask_explicit, .auto);
     }
 
     /// Project/read patches are prospective until parsing and result allocation succeed.
@@ -838,19 +838,31 @@ pub const Engine = struct {
         var explicit = self.mask_explicit;
         const project_mask = try read_settings.applyTrackingMask(self.gpa, settings_json);
         explicit = explicit or project_mask;
-        const hints_mask = try read_settings.applyTrackingMask(self.gpa, hints_json);
+        var hints = try std.json.parseFromSlice(std.json.Value, self.gpa, hints_json, .{});
+        defer hints.deinit();
+        if (hints.value != .object) return error.ExpectedObject;
+        const hints_obj = &hints.value.object;
+        const oxford_patterns: scan_mod.OxfordPatternChoice = if (hints_obj.fetchOrderedRemove("oxford_patterns")) |entry|
+            switch (entry.value) {
+                .string => |name| std.meta.stringToEnum(scan_mod.OxfordPatternChoice, name) orelse return error.InvalidOxfordPatternChoice,
+                else => return error.InvalidOxfordPatternChoice,
+            }
+        else
+            .auto;
+        const hints_mask = try read_settings.applyObjectTrackingMask(self.gpa, hints_obj.*);
         explicit = explicit or hints_mask;
         var final_settings = read_settings;
         _ = try final_settings.applyTrackingMask(self.gpa, settings_json);
-        try self.openScanPrepared(paths, read_settings, final_settings, explicit);
+        try self.openScanPrepared(paths, read_settings, final_settings, explicit, oxford_patterns);
     }
 
-    fn openScanPrepared(self: *Engine, paths: []const []const u8, read_settings: Settings, final_settings: Settings, explicit: bool) !void {
+    fn openScanPrepared(self: *Engine, paths: []const []const u8, read_settings: Settings, final_settings: Settings, explicit: bool, oxford_patterns: scan_mod.OxfordPatternChoice) !void {
         const s = try scan_mod.Scan.open(self.gpa, paths, .{
             .rows = read_settings.map_rows,
             .cols = read_settings.map_cols,
             .pat_h = read_settings.pattern_height,
             .pat_w = read_settings.pattern_width,
+            .oxford_patterns = oxford_patterns,
         });
         errdefer s.close();
         // Count and quaternion byte sizes must fit wasm32 before any resize arithmetic.
@@ -868,6 +880,7 @@ pub const Engine = struct {
         self.adoptInfo(s.info, read_settings.detector_width_mm);
         self.geo_given = self.geo;
         self.events.log("opened {s}: {d} × {d} patterns of {d} × {d}", .{ s.formatName(), s.info.rows, s.info.cols, s.info.pat_h, s.info.pat_w });
+        if (s.oxford_patterns) |source| self.events.log("Oxford pattern source: {s}", .{source.datasetName()});
     }
 
     /// Take patterns from memory: rows · cols patterns of h × w pixels, row-major, copied.

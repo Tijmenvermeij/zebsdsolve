@@ -58,7 +58,7 @@ function fixture({ engineOptions = {}, artifacts: makeArtifacts } = {}) {
       device: { destroy() { calls.push("destroy"); } },
       async closeScan() { calls.push("closeScan"); },
       configure(settings) { calls.push(["configure", settings]); },
-      async openScan(files) { calls.push(["open", files]); if (engineOptions.mismatch) this.scan.rows++; },
+      async openScan(files, options) { calls.push(["open", files, options]); if (engineOptions.mismatch) this.scan.rows++; },
       setGeometry(geometry) { calls.push(["geometry", geometry]); },
       async clearPhases() { calls.push("clearPhases"); }, async addPhase(file) { calls.push(["phase", file]); },
       async indexBegin() { calls.push("begin"); counts.index++; done = 0; await engineOptions.begin?.(queue, engine); },
@@ -124,7 +124,7 @@ for (const custom of [false, true]) {
   assert.equal(job.directoryName, "scan_ZEBSDsolve_BW123_02"); assert.equal(second.directoryName, "scan_ZEBSDsolve_BW123_03"); assert.equal(counts.index, 2);
   assert.equal(calls.filter(x => x === "dispose").length, 1); assert.deepEqual(calls.slice(-2), ["dispose", "destroy"]);
   const open = calls.findIndex(x => Array.isArray(x) && x[0] === "open");
-  assert.deepEqual(calls[open - 1], ["configure", job.openHints]); assert.deepEqual(calls[open + 1], ["configure", job.settings]);
+  assert.deepEqual(calls[open][2], { hints: job.openHints }); assert.deepEqual(calls[open + 1], ["configure", job.settings]);
   assert.deepEqual(calls[open + 2], ["geometry", job.geometry]); assert.equal(calls[open + 3], "clearPhases"); assert.strictEqual(calls[open][1][0], job.sourceFiles[0]);
   assert.deepEqual(calls.slice(open + 4, open + 6).map(x => x[1].name), ["phase1.h5", "phase2.h5"]);
   for (const input of [...job.sourceFiles, ...job.masterFiles]) assert.deepEqual(input.reads, [[0, 16]]);
@@ -369,8 +369,11 @@ for (const foreignContent of [false, true]) {
   const job = queue.add(spec()); queue.add(spec()); await queue.run(); assert.equal(job.status, "failed"); assert.match(job.error, /GPU device lost/); assert.equal(counts.index, 1);
 }
 {
-  const { queue } = fixture({ engineOptions: { scan: { format: "Oxford h5oina" } } }); const input = spec(); input.scanInfo.format = "Oxford h5oina"; input.geometry.planeKind = 2;
+  const { queue, calls } = fixture({ engineOptions: { scan: { format: "Oxford h5oina" } } }); const input = spec(); input.scanInfo.format = "Oxford h5oina"; input.geometry.planeKind = 2;
+  input.openHints.oxford_patterns = "unprocessed";
   const job = queue.add(input); assert.equal(job.warnings.length, 1); assert.ok(Object.isFrozen(job.warnings)); input.geometry.planeKind = 0;
   await queue.run(); assertLeaf(job, ".h5oina"); assert.equal(journal(job).warnings.length, 1);
+  assert.equal(calls.find(x => x[0] === "open")[2].hints.oxford_patterns, "unprocessed");
+  assert.equal(journal(job).opening_hints.oxford_patterns, "unprocessed");
 }
 console.log("Batch runtime: per-job destinations, five-file journals, frozen replay, concurrency, cancellation and guarded retries passed.");
