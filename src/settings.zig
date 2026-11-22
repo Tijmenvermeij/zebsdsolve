@@ -415,6 +415,10 @@ pub const Settings = struct {
             .object => |o| o,
             else => return error.ExpectedObject,
         };
+        return self.applyObjectTrackingMask(gpa, obj);
+    }
+
+    pub fn applyObjectTrackingMask(self: *Settings, gpa: std.mem.Allocator, obj: std.json.ObjectMap) !bool {
         var next = self.*;
         var it = obj.iterator();
         outer: while (it.next()) |kv| {

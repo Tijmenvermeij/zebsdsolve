@@ -58,7 +58,7 @@ function fixture({ engineOptions = {}, artifacts: makeArtifacts } = {}) {
       device: { destroy() { calls.push("destroy"); } },
       async closeScan() { calls.push("closeScan"); },
       configure(settings) { calls.push(["configure", settings]); },
-      async openScan(files) { calls.push(["open", files]); if (engineOptions.mismatch) this.scan.rows++; },
+      async openScan(files, options) { calls.push(["open", files, options]); if (engineOptions.mismatch) this.scan.rows++; },
       setGeometry(geometry) { calls.push(["geometry", geometry]); },
       async clearPhases() { calls.push("clearPhases"); }, async addPhase(file) { calls.push(["phase", file]); },
       async indexBegin() { calls.push("begin"); counts.index++; done = 0; await engineOptions.begin?.(queue, engine); },
@@ -124,7 +124,7 @@ for (const custom of [false, true]) {
   assert.equal(job.directoryName, "scan_ZEBSDsolve_BW123_02"); assert.equal(second.directoryName, "scan_ZEBSDsolve_BW123_03"); assert.equal(counts.index, 2);
   assert.equal(calls.filter(x => x === "dispose").length, 1); assert.deepEqual(calls.slice(-2), ["dispose", "destroy"]);
   const open = calls.findIndex(x => Array.isArray(x) && x[0] === "open");
-  assert.deepEqual(calls[open - 1], ["configure", job.openHints]); assert.deepEqual(calls[open + 1], ["configure", job.settings]);
+  assert.deepEqual(calls[open][2], { hints: job.openHints }); assert.deepEqual(calls[open + 1], ["configure", job.settings]);
   assert.deepEqual(calls[open + 2], ["geometry", job.geometry]); assert.equal(calls[open + 3], "clearPhases"); assert.strictEqual(calls[open][1][0], job.sourceFiles[0]);
   assert.deepEqual(calls.slice(open + 4, open + 6).map(x => x[1].name), ["phase1.h5", "phase2.h5"]);
   for (const input of [...job.sourceFiles, ...job.masterFiles]) assert.deepEqual(input.reads, [[0, 16]]);
@@ -370,12 +370,15 @@ for (const foreignContent of [false, true]) {
 }
 {
   const oxford = { format: "Oxford h5oina", geometryFrame: 2 };
-  const { queue } = fixture({ engineOptions: { scan: oxford, detectorAttitudeVersion: 2 } });
+  const { queue, calls } = fixture({ engineOptions: { scan: oxford, detectorAttitudeVersion: 2 } });
   const input = spec(); Object.assign(input.scanInfo, oxford); input.detectorAttitudeVersion = 2; input.geometry.planeKind = 2;
+  input.openHints.oxford_patterns = "unprocessed";
   const job = queue.add(input); assert.equal(job.warnings.length, 1); assert.ok(Object.isFrozen(job.warnings)); input.geometry.planeKind = 0;
   await queue.run(); assertLeaf(job, ".h5oina"); assert.equal(journal(job).warnings.length, 1);
   assert.equal(journal(job).geometry_convention, "oxford-calibrated-v3");
   assert.equal(journal(job).oxford_detector_attitude_version, 2);
+  assert.equal(calls.find(x => x[0] === "open")[2].hints.oxford_patterns, "unprocessed");
+  assert.equal(journal(job).opening_hints.oxford_patterns, "unprocessed");
 }
 for (const saved of [undefined, 1, 3]) {
   const oxford = { format: "Oxford h5oina", geometryFrame: 2 };
