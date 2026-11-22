@@ -66,6 +66,8 @@ function snapshot(spec) {
   if (!spec.settings || !spec.geometry || !spec.scanInfo) throw new Error("A batch job needs settings, geometry and scan metadata.");
   const warnings = isOxfordH5(spec.scanInfo.format) && spec.geometry.planeKind ? [OXFORD_SOURCE_PC_WARNING] : [];
   const openHints = Object.fromEntries(HINTS.map((key) => [key, spec.openHints?.[key] ?? spec.settings[key] ?? 0]));
+  const patternSource = spec.openHints?.oxford_patterns;
+  if (patternSource === "processed" || patternSource === "unprocessed") openHints.oxford_patterns = patternSource;
   return {
     sourceFiles, masterFiles, warnings: Object.freeze(warnings), directory: spec.directory || null,
     settings: freeze(clone(spec.settings)), geometry: freeze(clone(spec.geometry)),
@@ -308,8 +310,7 @@ export class BatchQueue {
     const engine = this._engine;
     this._checkStop(); this._checkDevice();
     await engine.closeScan?.();
-    engine.configure(clone(job.openHints));
-    const opened = await engine.openScan(job.sourceFiles);
+    const opened = await engine.openScan(job.sourceFiles, { hints: clone(job.openHints) });
     const actual = engine.scan || engine.scanInfo || opened;
     for (const key of SCAN_FIELDS) if (job.scanInfo[key] !== actual?.[key]) throw new Error(`Scan ${key} changed: expected ${job.scanInfo[key]}, got ${actual?.[key]}.`);
     engine.configure(clone(job.settings));

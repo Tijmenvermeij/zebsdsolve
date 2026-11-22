@@ -1,10 +1,10 @@
 {
-  "source_revision": "754c395109f9664ca8923bb8ccfa785cffb4bc4d",
+  "source_revision": "ba70070d3e23ef13765fe5dc0f4dcb175309304b",
   "source_dirty": false,
   "sha256": {
     "index.html": "5516738dba27bedd8f90b3c86031d4f5ea557f98a363b4d6aa17c8e096cda7f9",
-    "js/app.js": "5f3320ccb1498a69ad304b3e370e464b49d359b6a75b7b61e71eb70dfb45ea65",
+    "js/app.js": "6ce82f0621fee5307e0ce84d5fafbe950241323838c9e2e96709e9c024c6a6bd",
     "zebsdsolve/zebsdsolve.js": "079098a91f402a09098472c5ef898b04e99cbf4f0f8f30113329c4a8267e1d0f",
-    "zebsdsolve/zebsdsolve.wasm": "dfcd53dd805a08440c5cdd134b00475c0b6cf349d027a2c8be94889f6763f6a5"
+    "zebsdsolve/zebsdsolve.wasm": "b3562e4739325edf0b99ccfbc59a252f09fcf4ee6eb84ee472861a1989611d86"
   }
 }
