@@ -841,6 +841,20 @@ def main():
     gap = np.abs(mid["projective"] - mid["affine"]).max()
     check("a projective plane through points that hardly move keeps its slopes near zero", swing < 0.02 and gap < 0.003,
           f"the denominator {swing:.4f} from the middle at the corners; the middle's source {gap:.5f} from the affine plane's")
+    # the joint fit holds them as well: its denominator moved half its value on the 3 × 3 patch,
+    # and on a 12 × 12 one went through zero inside the map (there the points' fit moves it 0.06)
+    swing, gap = {}, {}
+    for patch in ((32, 20, 3), (30, 20, 12)):
+        mid = {}
+        for kind in ("affine", "projective"):
+            s.set_geometry(pc=pc_file, plane_kind="none")
+            s.configure(roi_x=patch[0], roi_y=patch[1], roi_w=patch[2], roi_h=patch[2], plane_method="joint", plane_kind=kind, plane_stride=1)
+            mid[kind] = np.array(s.fit_plane()["pc"])
+        w = np.array(s.geometry["plane"])[3]
+        swing[patch[2]] = max(abs(w @ (c, r, 1) / (w @ (37, 27, 1)) - 1) for c in (0, 74) for r in (0, 54))
+        gap[patch[2]] = np.abs(mid["projective"] - mid["affine"]).max()
+    check("the joint fit keeps a projective plane's slopes near zero too", swing[3] < 0.02 and swing[12] < 0.2 and max(gap.values()) < 0.003,
+          "; ".join(f"{k} × {k}: the denominator {swing[k]:.4f} from the middle at the corners, the middle's source {gap[k]:.5f} from the affine plane's" for k in swing))
 
     # the joint projective fit from one pattern centre for every cell (no steps, no plane): the
     # starting sources do not tell the projective row

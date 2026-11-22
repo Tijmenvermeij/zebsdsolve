@@ -212,8 +212,7 @@ pub fn fitTheta(which: Model, pts: []const Point, fr: Frame) ?[N]f64 {
             if (chi2 <= 1e-20 * yy) break;
             // the slopes' prior, against the points' scatter about the plane (W is their inverse
             // covariance up to a factor, which Σ rᵀ W r over the degrees of freedom says)
-            const scatter = chi2 / @as(f64, @floatFromInt(count * 3 - all.len));
-            const lam = scatter / (slope_prior * slope_prior);
+            const lam = slopeWeight(chi2, count * 3 - all.len);
             for (F, 0..) |fi, i| {
                 if (fi < 9) continue;
                 A[i * N + i] += lam;
@@ -228,10 +227,22 @@ pub fn fitTheta(which: Model, pts: []const Point, fr: Frame) ?[N]f64 {
         }
         if (it > 0 and moved < 1e-13) break;
     }
-    // (the denominator over the map, the frame's c and r running from −1 to 1, is at least
-    // 1 − |θ₉| − |θ₁₀|)
-    if (which == .projective and !(@abs(theta[9]) + @abs(theta[10]) <= 0.9)) return null;
+    if (which == .projective and !bounded(theta)) return null;
     return theta;
+}
+
+/// Whether the denominator stays above a tenth of its value at the map's middle over the whole
+/// map (the frame's c and r running from −1 to 1, it is at least 1 − |θ₉| − |θ₁₀|).
+pub fn bounded(theta: [N]f64) bool {
+    return @abs(theta[9]) + @abs(theta[10]) <= 0.9;
+}
+
+/// The weight of the slopes' prior in a fit whose points scatter about the plane by `chi2`
+/// (Σ rᵀ W r, W their inverse covariance up to the factor this says) over `dof` degrees of
+/// freedom: the prior's ½ λ (θ₉² + θ₁₀²) on the scale of ½ Σ rᵀ W r.
+pub fn slopeWeight(chi2: f64, dof: usize) f64 {
+    if (dof == 0) return 0;
+    return chi2 / @as(f64, @floatFromInt(dof)) / (slope_prior * slope_prior);
 }
 
 /// The model's unknowns as the plane P of the scan's own indices (Bruker's PCx): P = Θ T, T
