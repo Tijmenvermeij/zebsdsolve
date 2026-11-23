@@ -1623,7 +1623,7 @@ export class Zebsdsolve {
         v.setFloat32(j*32+16,result.amplitudes[index],true);v.setInt32(j*32+20,result.phase[index],true);
         v.setFloat32(j*32+24,result.proposal_ncc?.[index]??0,true);v.setFloat32(j*32+28,result.proposal_nmi?.[index]??0,true);
       }
-      const st=this.settings,[h,w]=this.shape(st.binning!==1&&st.full_resolution==="all"),px=h*w,out=f.alloc(5*px*4);
+      const [h,w]=this.shape(),px=h*w,out=f.alloc(5*px*4);
       const fitModel=result.fit_model??"source_dc_gain_v1";
       if(!["contrast_gain_v1","source_dc_gain_v1"].includes(fitModel))throw new RangeError(`unsupported overlap fit_model ${fitModel}`);
       if(fitModel==="contrast_gain_v1"||result.blur_gain){
