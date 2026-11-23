@@ -203,11 +203,11 @@
           <p class="readout" id="overlap-readout" role="status"></p>
           <div class="fields">
             <label class="field"><span>Primary NCC minimum</span><input id="overlap-primary-cutoff" type="number" min="-1" max="1" step="0.01" value="0" title="Inclusive acceptance of the original primary NCC. Controls the primary map and cells eligible for the next overlap run within the ROI; completed fits retain their execution cutoff."></label>
-            <label class="field"><span>Residual NCC minimum</span><input id="overlap-residual-cutoff" type="number" min="-1" max="1" step="0.01" value="0" title="Inclusive historical NCC of the refined residual-source orientation, before joint fitting or polishing. Controls overlap display only, independently of primary acceptance and computational screening."></label>
-            <label class="field wide"><span>Inspect</span><select id="overlap-component" title="Original indexed primary or a retained fit slot. Residual-source provenance is shown in the component table."><option value="primary">Primary</option><option value="1">Fit slot 1</option><option value="2">Fit slot 2</option></select></label>
+            <label class="field"><span>Residual map NCC minimum</span><input id="overlap-residual-cutoff" type="number" min="-1" max="1" step="0.01" value="0" title="Inclusive historical NCC of the refined residual-source orientation, before joint fitting or polishing. Filters the First accepted residual component map, independently of computational screening."></label>
+            <label class="field wide"><span>Inspect</span><select id="overlap-component" title="Inspect the original primary or a component in the final fit."><option value="primary">Original primary</option><option value="1">Fit component 1</option><option value="2">Fit component 2</option></select></label>
           </div>
           <div class="fields overlap-filter">
-            <label class="field wide"><span>Show only</span><select id="overlap-filter-metric"><option value="">All results</option></select></label>
+            <label class="field"><span>Show only</span><select id="overlap-filter-metric"><option value="">All results</option></select></label>
             <label class="field"><span>Minimum</span><input id="overlap-filter-value" type="number" step="0.01" value="0.1" disabled></label>
           </div>
           <div class="row"><button type="button" id="btn-overlap-export">Export results</button></div>
@@ -331,14 +331,14 @@
           <span class="grow"></span>
           <span class="meta" id="map-hover"></span>
           <button type="button" class="ghost mini" id="btn-zoom" disabled title="Scroll to zoom in on the map, drag to move it, double-click (or this) to show all of it">whole map</button>
-          <label class="check" title="The lattice of patterns the fits use (green once a fit has given them orientations)"><input type="checkbox" id="show-fit" checked> fit patterns</label>
+          <label class="check" title="Show the fit points on the map"><input type="checkbox" id="show-fit" checked> fit patterns</label>
           <button type="button" class="tool" id="btn-key" aria-pressed="true" title="Show or hide the key to the map's colours, on its right">key</button>
         </div>
         <div class="map-views">
           <div class="map-view">
-            <div class="pane-bar overlap-map-control" id="overlap-map-control" hidden><select id="overlap-map-component" aria-label="Left map component" title="Residual selects the first accepted residual-source orientation in each multi-component fit."><option value="primary">Primary</option><option value="residual">Residual</option><option value="1">Residual slot 1</option><option value="2">Residual slot 2</option></select><select id="overlap-map" aria-label="Left map metric">
+            <div class="pane-bar overlap-map-control" id="overlap-map-control" hidden><select id="overlap-map-component" aria-label="Left map component"><option value="primary">Original primary</option><option value="residual">First accepted residual component</option><option value="1">Fit component 1</option><option value="2">Fit component 2</option></select><select id="overlap-map" aria-label="Left map metric">
             <optgroup label="Selected component">
-              <option value="ipf_z">IPF Z</option><option value="ipf_x">IPF X</option><option value="phase">Phase</option>
+              <option value="ipf_z">IPF Z</option><option value="ipf_x">IPF X</option><option value="ipf_y">IPF Y</option><option value="phase">Phase</option>
               <option value="fraction">Contrast share</option><option value="proposal_ncc">Search NCC</option>
             </optgroup>
             <optgroup label="Mixture fit">
@@ -355,9 +355,9 @@
         </div>
           </div>
           <div class="map-view" id="overlap-map-view" hidden>
-            <div class="pane-bar overlap-map-control" id="overlap-map-control-2"><select id="overlap-map-component-2" aria-label="Right map component" title="Residual selects the first accepted residual-source orientation in each multi-component fit."><option value="primary">Primary</option><option value="residual" selected>Residual</option><option value="1">Residual slot 1</option><option value="2">Residual slot 2</option></select><select id="overlap-map-2" aria-label="Right map metric">
+            <div class="pane-bar overlap-map-control" id="overlap-map-control-2"><select id="overlap-map-component-2" aria-label="Right map component"><option value="primary">Original primary</option><option value="residual" selected>First accepted residual component</option><option value="1">Fit component 1</option><option value="2">Fit component 2</option></select><select id="overlap-map-2" aria-label="Right map metric">
             <optgroup label="Selected component">
-              <option value="ipf_z">IPF Z</option><option value="ipf_x">IPF X</option><option value="phase">Phase</option>
+              <option value="ipf_z">IPF Z</option><option value="ipf_x">IPF X</option><option value="ipf_y">IPF Y</option><option value="phase">Phase</option>
               <option value="fraction">Contrast share</option><option value="proposal_ncc">Search NCC</option>
             </optgroup>
             <optgroup label="Mixture fit">
@@ -540,7 +540,8 @@
           <figure><div class="well"><canvas id="overlap-target" width="1" height="1"></canvas></div><figcaption id="overlap-target-caption">Measured</figcaption></figure>
           <figure><div class="well"><canvas id="overlap-simulation" width="1" height="1"></canvas></div><figcaption id="overlap-simulation-caption">Reconstruction</figcaption></figure>
           <figure><div class="well"><canvas id="overlap-residual" width="1" height="1"></canvas></div><figcaption>Signed residual</figcaption></figure>
-          <div class="facts-cell"><span id="overlap-point-status" role="status"></span><table class="overlap-table"><thead><tr><th>Component</th><th>Phase</th><th id="overlap-weight-heading">Contrast share</th><th>Source NCC</th></tr></thead><tbody id="overlap-components"></tbody></table><dl class="facts" id="overlap-facts"></dl><details id="overlap-gain-panel" hidden><summary>Gain / blur</summary><figure><div class="well"><canvas id="overlap-gain" width="1" height="1"></canvas></div><figcaption id="overlap-gain-range"></figcaption></figure></details></div>
+          <figure id="overlap-gain-panel"><div class="well"><canvas id="overlap-gain" width="1" height="1" hidden></canvas><span id="overlap-gain-empty">Unavailable</span></div><figcaption>Gain profile<span id="overlap-gain-range"></span></figcaption></figure>
+          <div class="facts-cell"><span id="overlap-point-status" role="status"></span><table class="overlap-table"><thead><tr><th>Component</th><th>Phase</th><th id="overlap-weight-heading">Contrast share</th><th>Source NCC</th></tr></thead><tbody id="overlap-components"></tbody></table><dl class="facts" id="overlap-facts"></dl></div>
         </div>
       </section>
 

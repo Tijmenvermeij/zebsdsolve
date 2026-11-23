@@ -294,6 +294,7 @@ pub const Spherical = struct {
     seed_selector: peak_select.Selector,
     seed_numerator: Buf = .{},
     seed_denominator: Buf = .{},
+    seed_keys: Buf = .{},
     seed_pages: Buf = .{},
     seed_page: Buf = .{},
     seed_interpolated: Buf = .{},
@@ -309,7 +310,7 @@ pub const Spherical = struct {
 
     pub fn deinit(self: *Spherical) void {
         self.seed_selector.deinit();
-        inline for (.{ "items", "grid", "alm", "stats", "spec", "cand_v", "cand_i", "best", "peaks", "w_alm", "w_stats", "vol_f", "vol_f2", "seed_numerator", "seed_denominator", "seed_pages", "seed_page", "seed_interpolated" }) |f| self.g.release(&@field(self, f));
+        inline for (.{ "items", "grid", "alm", "stats", "spec", "cand_v", "cand_i", "best", "peaks", "w_alm", "w_stats", "vol_f", "vol_f2", "seed_numerator", "seed_denominator", "seed_keys", "seed_pages", "seed_page", "seed_interpolated" }) |f| self.g.release(&@field(self, f));
     }
 
     fn pipe(self: *Spherical, comptime module: []const u8, comptime entry: []const u8) u32 {
@@ -490,6 +491,87 @@ pub const Spherical = struct {
     fn peakQuat(p: [8]f32) rot.Quat {
         return .{ p[0], p[1], p[2], p[3] };
     }
+
+    const CandidateSlabs = struct {
+        ph: *const PhaseGpu,
+        rden: Bind,
+        rdiv: u32,
+        core_rows: u32,
+        row_bytes: u64,
+    };
+
+    fn scanCandidateSlabs(self: *Spherical, s: CandidateSlabs, item: u32, capacity: u32, after: ?peak_select.Key) !void {
+        const g = self.g;
+        const nb = self.t.n / 2 + 1;
+        const collect = capacity != 0;
+        if (!collect) self.seed_selector.setCursor(after);
+        var j: u32 = 0;
+        var slab: u32 = 0;
+        while (j < nb) : (j += s.core_rows) {
+            try self.candidateCancelled();
+            const first = j -| 1;
+            const end = @min(nb, j + s.core_rows + 1);
+            const rows = end - first;
+            const bytes = @as(u64, rows) * s.row_bytes;
+            g.ensure(&self.seed_numerator, bytes);
+            g.ensure(&self.seed_denominator, bytes);
+            self.candidateSlab(s.ph, item, first, rows, self.seed_numerator);
+            const offset = s.rden.offset + (@as(u64, item / s.rdiv) * nb + first) * s.row_bytes;
+            g.copy(.{ .id = s.rden.buf, .size = 0 }, offset, self.seed_denominator, 0, bytes);
+            self.seed_selector.slab(.{
+                .n = self.t.n,
+                .nc = s.ph.nc,
+                .nb = nb,
+                .first = first,
+                .rows = rows,
+                .core_first = j,
+                .core_rows = @min(s.core_rows, nb - j),
+                .cursor_set = @intFromBool(after != null),
+                .item = item,
+                .capacity = capacity,
+            }, self.seed_numerator, self.seed_denominator, if (collect) self.seed_keys else self.seed_pages, @as(u64, slab) * @sizeOf([8]peak_select.Key));
+            slab += 1;
+        }
+        if (!collect) self.seed_selector.reduce(self.seed_pages, slab * 8, self.seed_page, 0);
+    }
+
+    const CandidateState = struct {
+        keys: []peak_select.Key = &.{},
+        after: ?peak_select.Key = null,
+        count: u32 = 1,
+        exhausted: bool = false,
+    };
+
+    fn finishCandidatePages(self: *Spherical, s: CandidateSlabs, pages: []const [8]peak_select.Key, best_page: []peak_select.Key, proposed: [][8]f32) !bool {
+        const g = self.g;
+        const n_items: u32 = @intCast(pages.len);
+        const grid = Gpu.flat((n_items + 63) / 64);
+        var so = self.soParams(s.ph, n_items);
+        so.rden_div = s.rdiv;
+        so.grid_x = grid[0];
+        var rd = s.rden;
+        rd.slot = 8;
+        const peak_bytes = @as(u64, n_items) * @sizeOf([8]f32);
+        var ranks: usize = 0;
+        for (0..8) |rank| {
+            var any = false;
+            for (pages, best_page) |page, *key| {
+                const valid = page[rank].index != peak_select.missing.index;
+                // peak_finish needs a grid index even for unused lanes.
+                key.* = if (valid) page[rank] else .{ .value_bits = peak_select.missing.value_bits, .index = 0 };
+                any = any or valid;
+            }
+            if (!any) break;
+            g.writeSlice(self.best, 0, peak_select.Key, best_page);
+            g.dispatch(self.pipe("so3", "peak_finish"), grid[0], grid[1], 1, &.{ g.uniform(3, std.mem.asBytes(&so)), self.spec.at(7), rd, self.best.at(11), self.peaks.at(17) });
+            g.copy(self.peaks, 0, self.seed_interpolated, rank * peak_bytes, peak_bytes);
+            ranks += 1;
+        }
+        if (ranks == 0) return false;
+        g.read(self.seed_interpolated, 0, std.mem.sliceAsBytes(proposed[0 .. ranks * n_items]));
+        try g.wait();
+        return true;
+    }
     /// Overlap-only seed pool. Rank-major native peak rows; rank zero is the
     /// exact ordinary SI peak. Extra ranks are normalized quotient-grid local
     /// maxima, refined with the ordinary interpolation, separated under the
@@ -500,7 +582,9 @@ pub const Spherical = struct {
         const t = self.t;
         const lim = @min(g.lim.max_storage_binding, g.lim.max_buffer);
         if (ph.specBytes(t) > lim or ph.volumeCells(t) * 4 > lim) return error.BandwidthExceedsDeviceLimit;
-        if (@as(u64, n_items) * ph.specBytes(t) > lim) return error.SphericalCandidateTileTooLarge;
+        const spectrum_bytes = @as(u64, n_items) * ph.specBytes(t);
+        if (spectrum_bytes > lim) return error.SphericalCandidateTileTooLarge;
+        if (n_items == 0) return;
         try self.candidateCancelled();
         for (out) |*p| p.* = .{ 0, 0, 0, 0, -2, 0, 0, 0 };
         self.correlate(ph, n_items, rden, rden_div);
@@ -510,76 +594,112 @@ pub const Spherical = struct {
         const row_bytes = @as(u64, ph.nc) * t.n * 4;
         if (3 * row_bytes > lim) return error.BandwidthExceedsDeviceLimit;
         const core_rows: u32 = @intCast(@min(16, lim / row_bytes - 2));
-        const nb = t.n / 2 + 1;
-        const nslabs = (nb + core_rows - 1) / core_rows;
-        g.ensure(&self.seed_pages, @as(u64, nslabs) * 64);
-        g.ensure(&self.seed_page, 64);
-        g.ensure(&self.seed_interpolated, 8 * 32);
-        const rdiv = @max(1, rden_div);
+        const slabs: CandidateSlabs = .{
+            .ph = ph,
+            .rden = rden,
+            .rdiv = @max(1, rden_div),
+            .core_rows = core_rows,
+            .row_bytes = row_bytes,
+        };
+        const gpa = g.gpa;
+        const counts = try gpa.alloc(u32, n_items);
+        defer gpa.free(counts);
+        const states = try gpa.alloc(CandidateState, n_items);
+        defer gpa.free(states);
+        @memset(states, .{});
+        // Scale with grid size while limiting the extra buffer to 1/8 of
+        // the resident spectrum and at most 16 MiB per tile.
+        const key_bytes = @sizeOf(peak_select.Key);
+        const cells = ph.volumeCells(t);
+        const per_item = @min(cells, std.math.clamp(cells / 64, 4096, 1 << 20));
+        const key_budget = @min(16 << 20, spectrum_bytes / 8);
+        const capacity: u32 = @intCast(@min(per_item, key_budget / n_items / key_bytes));
+        if (capacity == 0) {
+            @memset(counts, 1); // Use the ordered pages when no key fits.
+        } else {
+            g.ensure(&self.seed_keys, @as(u64, n_items) * capacity * key_bytes);
+            self.seed_selector.beginCollection(n_items);
+            for (0..n_items) |item| try self.scanCandidateSlabs(slabs, @intCast(item), capacity, null);
+            g.read(self.seed_selector.counts, 0, std.mem.sliceAsBytes(counts));
+            try g.wait();
+        }
+
+        var total: usize = 0;
+        var overflow = false;
+        for (counts) |count| {
+            if (count > capacity) {
+                overflow = true;
+            } else total += count;
+        }
+        const keys = try gpa.alloc(peak_select.Key, total);
+        defer gpa.free(keys);
+        var offset: usize = 0;
+        for (counts, states, 0..) |count, *state, item| {
+            if (count == 0 or count > capacity) continue;
+            state.keys = keys[offset..][0..count];
+            offset += count;
+            g.read(self.seed_keys, @as(u64, item) * capacity * key_bytes, std.mem.sliceAsBytes(state.keys));
+        }
+        if (total != 0) try g.wait();
+        for (states) |state| std.mem.sortUnstable(peak_select.Key, state.keys, {}, peak_select.Key.before);
+        if (overflow) {
+            const nb = t.n / 2 + 1;
+            const nslabs = (nb + core_rows - 1) / core_rows;
+            g.ensure(&self.seed_pages, @as(u64, nslabs) * @sizeOf([8]peak_select.Key));
+            g.ensure(&self.seed_page, @sizeOf([8]peak_select.Key));
+        }
+        const pages = try gpa.alloc([8]peak_select.Key, n_items);
+        defer gpa.free(pages);
+        const best_page = try gpa.alloc(peak_select.Key, n_items);
+        defer gpa.free(best_page);
+        const proposed = try gpa.alloc([8]f32, @as(usize, n_items) * 8);
+        defer gpa.free(proposed);
+        g.ensure(&self.seed_interpolated, @as(u64, proposed.len) * @sizeOf([8]f32));
         const spacing = 2 * std.math.tau / @as(f64, @floatFromInt(t.n));
-        for (0..n_items) |item_index| {
-            const item: u32 = @intCast(item_index);
-            var count: u32 = 1;
-            var after: ?peak_select.Key = null;
-            while (count < keep_n) {
-                try self.candidateCancelled();
-                self.seed_selector.setCursor(after);
-                var j: u32 = 0;
-                var slab_index: u32 = 0;
-                while (j < nb) : (j += core_rows) {
-                    try self.candidateCancelled();
-                    const first = j -| 1;
-                    const end = @min(nb, j + core_rows + 1);
-                    const rows = end - first;
-                    const bytes = @as(u64, rows) * row_bytes;
-                    g.ensure(&self.seed_numerator, bytes);
-                    g.ensure(&self.seed_denominator, bytes);
-                    self.candidateSlab(ph, item, first, rows, self.seed_numerator);
-                    const offset = rden.offset + (@as(u64, item / rdiv) * nb + first) * row_bytes;
-                    g.copy(.{ .id = rden.buf, .size = 0 }, offset, self.seed_denominator, 0, bytes);
-                    self.seed_selector.slab(.{ .n = t.n, .nc = ph.nc, .nb = nb, .first = first, .rows = rows, .core_first = j, .core_rows = @min(core_rows, nb - j), .cursor_set = @intFromBool(after != null) }, self.seed_numerator, self.seed_denominator, self.seed_pages, @as(u64, slab_index) * 64);
-                    slab_index += 1;
+        while (true) {
+            try self.candidateCancelled();
+            var queued_page = false;
+            // A later overflow scan can be cancelled with earlier reads in flight.
+            errdefer if (queued_page) g.wait() catch {};
+            for (pages, counts, states, 0..) |*page, count, *state, item| {
+                page.* = @splat(peak_select.missing);
+                if (state.count == keep_n or state.exhausted) continue;
+                if (count > capacity) {
+                    try self.scanCandidateSlabs(slabs, @intCast(item), 0, state.after);
+                    g.read(self.seed_page, 0, std.mem.asBytes(page));
+                    queued_page = true;
+                } else {
+                    const take = @min(page.len, state.keys.len);
+                    @memcpy(page[0..take], state.keys[0..take]);
+                    state.keys = state.keys[take..];
                 }
-                self.seed_selector.reduce(self.seed_pages, nslabs * 8, self.seed_page, 0);
-                var page: [8]peak_select.Key = undefined;
-                g.read(self.seed_page, 0, std.mem.sliceAsBytes(&page));
+            }
+            if (queued_page) {
                 try g.wait();
-                var valid: usize = 0;
-                for (page) |key| {
-                    if (key.index == 0xffffffff) break;
-                    valid += 1;
-                }
-                if (valid == 0) break;
-                var so = self.soParams(ph, n_items);
-                so.rden_div = rdiv;
-                const grid = Gpu.flat((n_items + 63) / 64);
-                so.grid_x = grid[0];
-                var rd = rden;
-                rd.slot = 8;
-                for (page[0..valid], 0..) |key, rank| {
-                    g.writeSlice(self.best, @as(u64, item) * 8, peak_select.Key, &.{key});
-                    g.dispatch(self.pipe("so3", "peak_finish"), grid[0], grid[1], 1, &.{ g.uniform(3, std.mem.asBytes(&so)), self.spec.at(7), rd, self.best.at(11), self.peaks.at(17) });
-                    g.copy(self.peaks, @as(u64, item) * 32, self.seed_interpolated, @as(u64, rank) * 32, 32);
-                }
-                var proposed: [8][8]f32 = undefined;
-                g.read(self.seed_interpolated, 0, std.mem.sliceAsBytes(proposed[0..valid]));
-                try g.wait();
-                for (proposed[0..valid], page[0..valid]) |peak, key| {
-                    after = key;
+                queued_page = false;
+            }
+            if (!try self.finishCandidatePages(slabs, pages, best_page, proposed)) break;
+            for (pages, states, 0..) |page, *state, item| {
+                for (page, 0..) |key, rank| {
+                    if (state.count == keep_n) break;
+                    if (key.index == peak_select.missing.index) {
+                        state.exhausted = true;
+                        break;
+                    }
+                    const peak = proposed[rank * n_items + item];
+                    state.after = key;
                     var distinct = true;
-                    for (0..count) |rank| {
-                        if (sym.disorientation(peakQuat(peak), peakQuat(out[rank * n_items + item]), ops) <= spacing) {
+                    for (0..state.count) |accepted| {
+                        if (sym.disorientation(peakQuat(peak), peakQuat(out[accepted * n_items + item]), ops) <= spacing) {
                             distinct = false;
                             break;
                         }
                     }
                     if (distinct) {
-                        out[count * n_items + item] = peak;
-                        count += 1;
+                        out[state.count * n_items + item] = peak;
+                        state.count += 1;
                     }
-                    if (count == keep_n) break;
                 }
-                if (valid < 8) break;
             }
         }
     }

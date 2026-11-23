@@ -167,6 +167,13 @@ const Member = struct {
     single_theta: Theta = nuisance.identity,
     single_sse: f32 = nan,
 
+    fn indexed(record: core.Record, phase: usize, rank: i32) Member {
+        return .{
+            .source = .{ .q = record.q, .phase = @intCast(phase), .proposal_ncc = record.ncc, .proposal_nmi = record.nmi },
+            .rank = rank,
+        };
+    }
+
     fn valid(self: Member) bool {
         var squared: f32 = 0;
         for (self.source.q) |v| squared += v * v;
@@ -214,6 +221,11 @@ const Support = struct {
     fn positive(self: Support) bool {
         return self.k > 0 and assessed(self.state) and @popCount(self.activeMask()) == self.k;
     }
+};
+
+const SingletonSeed = struct {
+    state: overlap.State,
+    theta: Theta = nuisance.identity,
 };
 
 const Achieved = struct {
@@ -374,6 +386,8 @@ const Work = struct {
     band: ?*core.Band,
     pool: []core.Record,
     trial_states: gpu.Buf,
+    seed_target: gpu.Buf,
+    residual_seeds: []?SingletonSeed,
     cache: [4]Member = @splat(.{}),
 
     fn check(self: *Work) !void {
@@ -411,28 +425,40 @@ const Work = struct {
         self.model.profileFixedTheta(s.theta);
     }
 
-    fn fixed(self: *Work, s: *Support) !void {
-        try self.check();
+    fn queueFixedRead(self: *Work, s: *Support) void {
         self.queueFixed(s.*);
         self.model.trial.read(@as(*[1]overlap.State, @ptrCast(&s.state)));
+    }
+
+    fn fixed(self: *Work, s: *Support) !void {
+        try self.check();
+        self.queueFixedRead(s);
         try self.wait();
+    }
+
+    fn queueTheta(self: *Work, s: Support, full: bool, trial: *overlap.State, theta: *Theta) void {
+        self.stage(s);
+        var seeds: [4]Theta = undefined;
+        for (&seeds, 0..) |*t, j| t.* = s.members[@min(j, s.k - 1)].single_theta;
+        self.model.profileNuisance(s.theta, seeds, full);
+        self.model.readProfile(trial, theta);
+    }
+
+    fn retainTheta(s: *Support, trial: overlap.State, theta: Theta) void {
+        if (assessed(trial) and (!assessed(s.state) or improves(trial.sse, s.state.sse, trial.initial_sse))) {
+            s.state = trial;
+            s.theta = theta;
+        }
     }
 
     fn optimizeTheta(self: *Work, s: *Support, full: bool) !void {
         if (!self.model.optimize_enabled) return;
         try self.check();
-        self.stage(s.*);
-        var seeds: [4]Theta = undefined;
-        for (&seeds, 0..) |*t, j| t.* = s.members[@min(j, s.k - 1)].single_theta;
-        self.model.profileNuisance(s.theta, seeds, full);
         var trial: overlap.State = undefined;
         var theta: Theta = undefined;
-        self.model.readProfile(&trial, &theta);
+        self.queueTheta(s.*, full, &trial, &theta);
         try self.wait();
-        if (assessed(trial) and (!assessed(s.state) or improves(trial.sse, s.state.sse, trial.initial_sse))) {
-            s.state = trial;
-            s.theta = theta;
-        }
+        retainTheta(s, trial, theta);
     }
 
     // One six-neighbour poll, all at the same theta and incumbent support.
@@ -482,13 +508,26 @@ const Work = struct {
         }
     }
 
-    fn polish(self: *Work, input: Support) !Support {
+    fn polish(self: *Work, input: Support, prefit: bool) !Support {
         var seed = input;
-        try self.fixed(&seed);
-        try self.optimizeTheta(&seed, true);
+        try self.check();
+        if (!prefit) self.queueFixedRead(&seed);
+        // The nuisance search does not consume the fixed-fit result. Queue both
+        // reads before waiting, then compare once both host destinations are ready.
+        if (self.model.optimize_enabled) {
+            var trial: overlap.State = undefined;
+            var theta: Theta = undefined;
+            self.queueTheta(seed, true, &trial, &theta);
+            try self.wait();
+            retainTheta(&seed, trial, theta);
+        } else if (!prefit) try self.wait();
+        return self.polishFromSeed(seed);
+    }
+
+    fn polishFromSeed(self: *Work, seed: Support) !Support {
         if (self.options.flags & 1 == 0) return seed;
         var best = seed;
-        const starts: usize = if (input.k == 1) 3 else 1;
+        const starts: usize = if (seed.k == 1) 3 else 1;
         for (0..starts) |i| {
             var current = seed;
             if (i != 0) {
@@ -523,8 +562,13 @@ const Work = struct {
         f.residual(s.k, self.engine.pats[@intFromEnum(self.lv)], true);
     }
 
-    fn singleton(self: *Work, native: Member) !Support {
-        var result = try self.polish((Support{}).append(native));
+    fn singleton(self: *Work, native: Member, precomputed: ?SingletonSeed) !Support {
+        var seed = (Support{}).append(native);
+        var result = if (precomputed) |pre| result: {
+            seed.state = pre.state;
+            seed.theta = pre.theta;
+            break :result try self.polishFromSeed(seed);
+        } else try self.polish(seed, false);
         if (assessed(result.state)) {
             result.members[0].single_theta = result.theta;
             result.members[0].single_sse = result.state.sse;
@@ -537,7 +581,7 @@ const Work = struct {
         while (assessed(s.state) and !s.positive()) {
             const mask = s.activeMask();
             if (mask == 0) return .{};
-            s = try self.polish(s.subset(mask));
+            s = try self.polish(s.subset(mask), false);
         }
         return s;
     }
@@ -553,7 +597,7 @@ const Work = struct {
         }
     }
 
-    fn evaluate(self: *Work, baseline: Support, native: Member, battle: *Competition, req: *Request, index: usize) !void {
+    fn evaluate(self: *Work, baseline: Support, native: Member, battle: *Competition, req: *Request, index: usize, primary_fit: ?*?Support, precomputed: ?SingletonSeed) !void {
         var event = &req.events[index];
         if (!native.valid()) return;
         event.flags |= flag.native;
@@ -563,7 +607,9 @@ const Work = struct {
             battle.screened += 1;
             return;
         }
-        const single = try self.singleton(native);
+        const cached = if (primary_fit) |fit| fit.* else null;
+        const single = cached orelse try self.singleton(native, precomputed);
+        if (primary_fit) |fit| fit.* = single;
         if (baseline.k == 0) {
             battle.archive.remember(single, index, false);
         } else {
@@ -593,14 +639,17 @@ const Work = struct {
         // the same theta; a weak real component may fit only in the mixture.
         var seed = baseline.append(single.members[0]);
         seed.theta = baseline.theta;
-        try self.fixed(&seed);
-        if (!single.members[0].sameProjection(native)) {
-            var alt = seed;
+        try self.check();
+        self.queueFixedRead(&seed);
+        const compare_poses = !single.members[0].sameProjection(native);
+        var alt = seed;
+        if (compare_poses) {
             alt.members[baseline.k].delta = native.delta;
-            try self.fixed(&alt);
-            if (assessed(alt.state) and (!assessed(seed.state) or improves(alt.state.sse, seed.state.sse, alt.state.initial_sse))) seed = alt;
+            self.queueFixedRead(&alt);
         }
-        const joint = try self.polish(seed);
+        try self.wait();
+        if (compare_poses and assessed(alt.state) and (!assessed(seed.state) or improves(alt.state.sse, seed.state.sse, alt.state.initial_sse))) seed = alt;
+        const joint = try self.polish(seed, true);
         if (assessed(joint.state)) {
             // The prior embedded model is an achieved feasible nested trial.
             event.joint_sse = @min(baseline.state.sse, joint.state.sse);
@@ -629,7 +678,7 @@ const Work = struct {
                 try self.fixed(&reduced);
                 if (assessed(reduced.state) and improves(reduced.state.sse, lower.state.sse, reduced.state.initial_sse))
                     try self.optimizeTheta(&reduced, true);
-            } else reduced = try self.polish(subset);
+            } else reduced = try self.polish(subset, false);
             reduced = try self.compactFace(reduced);
             if (reduced.positive() and reduced.k == 1) {
                 reduced.members[0].single_sse = reduced.state.sse;
@@ -648,7 +697,39 @@ const Work = struct {
         if (battle.stage_reference_sse == null) saveLower(battle, lower, index);
     }
 
-    fn branch(self: *Work, primary: []const core.Record, stride: usize, k: u32, keep_n: u32, branch_id: u32, initial: Outcome, req: *Request) !Outcome {
+    fn prepareResidualSeeds(self: *Work, ranks: usize) !void {
+        @memset(self.residual_seeds, null);
+        if (ranks < 2 or self.residual_seeds.len == 0) return;
+        const g = &self.engine.g;
+        const bytes = @as(u64, self.model.fit.px) * 4;
+        const capacity: usize = @intCast(@min(ranks, self.seed_target.size / bytes));
+        if (capacity < 2) return;
+        var poses: [8]detector.Pose = undefined;
+        var rows: [8]usize = undefined;
+        var seeds: [8]?SingletonSeed = undefined;
+        for (0..self.engine.phases.items.len) |phase| {
+            var first: usize = 0;
+            while (first < ranks) : (first += capacity) {
+                const end = @min(first + capacity, ranks);
+                var n: usize = 0;
+                for (first..end) |rank| {
+                    const i = phase * ranks + rank;
+                    const member = Member.indexed(self.pool[i], phase, @intCast(rank + 1));
+                    if (!member.valid()) continue;
+                    if (self.options.flags & 2 != 0 and member.source.proposal_ncc < self.options.min_residual_ncc) continue;
+                    poses[n] = .{ .q = member.source.q, .t = self.t, .pat = 0 };
+                    rows[n] = i;
+                    n += 1;
+                }
+                if (n < 2) continue;
+                for (0..n) |i| g.copy(self.model.fit.original, 0, self.seed_target, i * bytes, bytes);
+                try fitSingletonSeeds(self.engine, self.lv, self.frame, phase, poses[0..n], self.seed_target, self.model.optimize_enabled, seeds[0..n]);
+                for (rows[0..n], seeds[0..n]) |row, seed| self.residual_seeds[row] = seed;
+            }
+        }
+    }
+
+    fn branch(self: *Work, primary: []const core.Record, stride: usize, k: u32, keep_n: u32, branch_id: u32, initial: Outcome, req: *Request, primary_fits: []?Support, primary_seeds: []const ?SingletonSeed) !Outcome {
         var out = initial;
         var replacements = [_]u32{0} ** 5;
         while (out.progress.stop_reason == 0) {
@@ -661,6 +742,7 @@ const Work = struct {
                 const nrec = self.engine.phases.items.len * ranks;
                 try self.engine.indexPreparedCandidates(&.{self.cell}, self.engine.searchOf(), self.band, ranks, self.pool[0..nrec]);
                 try self.check();
+                try self.prepareResidualSeeds(ranks);
             }
             var reference: ?f32 = null;
             if (order > 1 and self.options.min_stage_improvement != null) {
@@ -673,10 +755,7 @@ const Work = struct {
             var battle: Competition = .{ .lower = baseline, .archive = &out.archive, .stage_reference_sse = reference };
             for (0..self.engine.phases.items.len) |pi| for (0..ranks) |rank| {
                 const record = if (order == 1) primary[pi * stride + self.row] else self.pool[pi * ranks + rank];
-                const member: Member = .{
-                    .source = .{ .q = record.q, .phase = @intCast(pi), .proposal_ncc = record.ncc, .proposal_nmi = record.nmi },
-                    .rank = if (order == 1) 0 else @intCast(rank + 1),
-                };
+                const member = Member.indexed(record, pi, if (order == 1) 0 else @intCast(rank + 1));
                 const idx = try req.log(.{
                     .cell_index = self.row,
                     .branch = branch_id,
@@ -689,7 +768,16 @@ const Work = struct {
                     .baseline_sse = baseline.state.sse,
                     .result_order = baseline.k,
                 });
-                try self.evaluate(baseline, member, &battle, req, idx);
+                // Both trajectories start from exactly the same primary fits.
+                // Each still records its own candidates, ties and selection.
+                const primary_fit = if (order == 1 and primary_fits.len != 0) &primary_fits[pi] else null;
+                const precomputed = if (order == 1)
+                    if (primary_seeds.len != 0) primary_seeds[pi * stride + self.row] else null
+                else if (self.residual_seeds.len != 0)
+                    self.residual_seeds[pi * ranks + rank]
+                else
+                    null;
+                try self.evaluate(baseline, member, &battle, req, idx, primary_fit, precomputed);
             };
             try self.check();
             if (battle.valid > 0 and battle.screened == battle.valid) {
@@ -764,6 +852,67 @@ const Work = struct {
     }
 };
 
+/// Shared fixed-identity and blur/gain prefit. All lanes in a dispatch
+/// project the same master, each with its own pose and measured target.
+fn fitSingletonSeeds(e: *core.Engine, lv: core.Level, frame: spherical.Frame, phase: usize, poses: []const detector.Pose, target: gpu.Buf, optimize: bool, seeds: []?SingletonSeed) !void {
+    if (e.cancel.get()) return error.Cancelled;
+    const g = &e.g;
+    const px = frame.pat_h * frame.pat_w;
+    const count: u32 = @intCast(poses.len);
+    var fixed_states: [64]overlap.State = undefined;
+    var optimized_states: [64]overlap.State = undefined;
+    var theta: [64]Theta = undefined;
+    {
+        var fit = overlap.Fit.init(g, count, px, frame.pat_w, frame.mask, target);
+        defer fit.deinit();
+        var model = nuisance.Model.init(g, &e.prep, &fit);
+        defer model.deinit();
+        model.contrast = true;
+        model.optimize_enabled = optimize;
+        e.det.setPoses(poses);
+        e.det.project(e.phases.items[phase].det[@intFromEnum(lv)], frame, count);
+        g.copy(e.det.sims, 0, model.raw, 0, @as(u64, count) * px * 4);
+        model.singletonSeeds(fixed_states[0..count], optimized_states[0..count], theta[0..count]);
+    } // Retire the fit buffers with this submission; host read destinations stay live.
+    try g.wait();
+    if (e.cancel.get()) return error.Cancelled;
+    for (seeds, 0..) |*out, i| {
+        var seed: Support = .{ .state = fixed_states[i] };
+        if (optimize) Work.retainTheta(&seed, optimized_states[i], theta[i]);
+        // Let the scalar path retain its exact unavailable-state diagnostics.
+        out.* = if (assessed(seed.state)) .{ .state = seed.state, .theta = seed.theta } else null;
+    }
+}
+
+fn preparePrimarySeeds(e: *core.Engine, cells: []const u64, primary: []const core.Record, missing: []const u32, lv: core.Level, frame: spherical.Frame, frozen: gpu.Buf, target: gpu.Buf, optimize: bool, seeds: []?SingletonSeed) !void {
+    if (seeds.len == 0) return;
+    const g = &e.g;
+    const bytes = @as(u64, frame.pat_h) * frame.pat_w * 4;
+    const capacity: usize = @intCast(target.size / bytes);
+    var poses: [64]detector.Pose = undefined;
+    var rows: [64]usize = undefined;
+    var fit_seeds: [64]?SingletonSeed = undefined;
+    for (0..e.phases.items.len) |phase| {
+        const phase_records = primary[phase * cells.len ..][0..cells.len];
+        var first: usize = 0;
+        while (first < cells.len) : (first += capacity) {
+            const end = @min(first + capacity, cells.len);
+            var n: usize = 0;
+            for (first..end) |row| {
+                const record = phase_records[row];
+                if (missing[row] != 0 or !Member.indexed(record, phase, 0).valid()) continue;
+                poses[n] = .{ .q = record.q, .t = try e.positionOf(&e.geo, cells[row], lv), .pat = 0 };
+                rows[n] = row;
+                n += 1;
+            }
+            if (n < 2) continue;
+            for (rows[0..n], 0..) |row, i| g.copy(frozen, row * bytes, target, i * bytes, bytes);
+            try fitSingletonSeeds(e, lv, frame, phase, poses[0..n], target, optimize, fit_seeds[0..n]);
+            for (rows[0..n], fit_seeds[0..n]) |row, seed| seeds[phase * cells.len + row] = seed;
+        }
+    }
+}
+
 pub fn run(e: *core.Engine, cells: []const u64, k: u32, primary: []const core.Record, missing: []const u32, hw: [2]u32, outputs: core.Engine.OverlapTrajectoryPayload, optimize: bool, keep_n: u32, req: *Request) !void {
     const g = &e.g;
     const lv = e.levelOf(.search);
@@ -777,12 +926,28 @@ pub fn run(e: *core.Engine, cells: []const u64, k: u32, primary: []const core.Re
     var frozen = g.storage(n * bytes);
     defer g.release(&frozen);
     g.copy(e.pats[@intFromEnum(lv)], 0, frozen, 0, n * bytes);
+    const compare_pooled = k > 1 and keep_n > 1;
+    // The model, two fits and shared scratch hold about forty full
+    // patterns per lane. Check the largest individual binding too.
+    const lim = @min(g.lim.max_storage_binding, g.lim.max_buffer);
+    const budget = @as(u64, e.set.tile_mb) << 20;
+    const capacity = @min(64, lim / (4 * bytes), budget / (40 * bytes), @max(n, if (compare_pooled) keep_n else 1));
+    var seed_target: gpu.Buf = if (capacity >= 2) g.storage(capacity * bytes) else .{};
+    defer g.release(&seed_target);
+    const primary_seeds = try e.gpa.alloc(?SingletonSeed, if (capacity >= 2 and n > 1) primary.len else 0);
+    defer e.gpa.free(primary_seeds);
+    @memset(primary_seeds, null);
+    try preparePrimarySeeds(e, cells, primary, missing, lv, frame, frozen, seed_target, optimize, primary_seeds);
     var target = g.storage(bytes);
     defer g.release(&target);
     var trial_states = g.storage(6 * @sizeOf(overlap.State));
     defer g.release(&trial_states);
     const pool = try e.gpa.alloc(core.Record, e.phases.items.len * keep_n);
     defer e.gpa.free(pool);
+    const residual_seeds = try e.gpa.alloc(?SingletonSeed, if (capacity >= 2 and compare_pooled) pool.len else 0);
+    defer e.gpa.free(residual_seeds);
+    const primary_fits = try e.gpa.alloc(?Support, if (compare_pooled) e.phases.items.len else 0);
+    defer e.gpa.free(primary_fits);
     const prm = e.searchOf();
     const band = if (prm.method == .spherical) try e.band(prm.bandwidth, lv) else null;
     for (cells, 0..) |cell, i| {
@@ -800,7 +965,7 @@ pub fn run(e: *core.Engine, cells: []const u64, k: u32, primary: []const core.Re
         defer model.deinit();
         model.contrast = true;
         model.optimize_enabled = optimize;
-        var work: Work = .{ .engine = e, .model = &model, .options = req.options, .lv = lv, .frame = frame, .t = try e.positionOf(&e.geo, cell, lv), .row = @intCast(i), .cell = cell, .band = band, .pool = pool, .trial_states = trial_states };
+        var work: Work = .{ .engine = e, .model = &model, .options = req.options, .lv = lv, .frame = frame, .t = try e.positionOf(&e.geo, cell, lv), .row = @intCast(i), .cell = cell, .band = band, .pool = pool, .trial_states = trial_states, .seed_target = seed_target, .residual_seeds = residual_seeds };
         var states: [1]overlap.State = undefined;
         var progress: [1]overlap.Progress = undefined;
         fit.read(&states);
@@ -808,11 +973,12 @@ pub fn run(e: *core.Engine, cells: []const u64, k: u32, primary: []const core.Re
         try work.wait();
         const initial: Outcome = .{ .support = .{ .state = states[0] }, .progress = progress[0] };
         const begin = req.used;
-        const exact = try work.branch(primary, n, k, 1, 0, initial, req);
+        @memset(primary_fits, null);
+        const exact = try work.branch(primary, n, k, 1, 0, initial, req, primary_fits, primary_seeds);
         var selected = exact;
         var pooled: ?Outcome = null;
-        if (k > 1 and keep_n > 1) {
-            pooled = try work.branch(primary, n, k, keep_n, 1, initial, req);
+        if (compare_pooled) {
+            pooled = try work.branch(primary, n, k, keep_n, 1, initial, req, primary_fits, primary_seeds);
         }
         var source: i32 = -1;
         if (exact.archive.best(if (pooled) |branch| branch.archive else null)) |achieved| {

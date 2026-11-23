@@ -39,6 +39,20 @@ class ProfileProduction(unittest.TestCase):
         for row,cell in enumerate([1,2]):
             images=self.s.overlap_inspect(cell,new,row=row)
             self.assertAlmostEqual(float(np.sum(images['residual'].astype(float)**2)),float(new['sse'][row]),delta=5e-5)
+    def test_batched_primary_seeds_match_independent_stored_cells(self):
+        self.s.index()
+        cells = [4, 2, 1, 0]
+        options = dict(primary='stored', max_components=1, blur_gain=True, min_residual_ncc=0)
+        batch = self.s.overlap_cells(cells, **options)
+        self.assertEqual(batch['cells'].tolist(), cells)
+        self.assertTrue(np.all(batch['active_count'] == 1))
+        for row, cell in enumerate(cells):
+            independent = self.s.overlap_cells([cell], **options)
+            for field in ('phase', 'source_quaternions', 'quaternions', 'amplitudes',
+                          'component_norms', 'blur_gain_theta', 'sse'):
+                with self.subTest(cell=cell, field=field):
+                    np.testing.assert_array_equal(batch[field][row], independent[field][0])
+
     def test_screen_rollback_and_proposal_trace(self):
         one=self.s.overlap_cells([1,2],max_components=1,blur_gain=True,min_residual_ncc=1)
         screened=self.s.overlap_cells([1,2],max_components=2,blur_gain=True,min_residual_ncc=1)

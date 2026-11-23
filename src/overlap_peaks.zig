@@ -4,7 +4,16 @@
 const std = @import("std");
 const gpu = @import("gpu/gpu.zig");
 const shaders = @import("shaders");
-pub const Key = extern struct { value_bits: u32, index: u32 };
+pub const Key = extern struct {
+    value_bits: u32,
+    index: u32,
+
+    pub fn before(_: void, a: Key, b: Key) bool {
+        const av: f32 = @bitCast(a.value_bits);
+        const bv: f32 = @bitCast(b.value_bits);
+        return av > bv or (av == bv and a.index < b.index);
+    }
+};
 pub const missing = Key{ .value_bits = @bitCast(@as(f32, -3.4e38)), .index = 0xffffffff };
 pub const Params = extern struct {
     n: u32,
@@ -17,14 +26,15 @@ pub const Params = extern struct {
     grid_x: u32 = 1,
     input_count: u32 = 0,
     cursor_set: u32 = 0,
-    pad0: u32 = 0,
-    pad1: u32 = 0,
+    item: u32 = 0,
+    capacity: u32 = 0,
 };
 pub const Selector = struct {
     g: *gpu.Gpu,
     scores: gpu.Buf = .{},
     pole: gpu.Buf = .{},
     cursor: gpu.Buf = .{},
+    counts: gpu.Buf = .{},
     records: [2]gpu.Buf = .{ .{}, .{} },
     pub fn init(g: *gpu.Gpu) Selector {
         return .{ .g = g };
@@ -33,6 +43,7 @@ pub const Selector = struct {
         self.g.release(&self.scores);
         self.g.release(&self.pole);
         self.g.release(&self.cursor);
+        self.g.release(&self.counts);
         for (&self.records) |*r| self.g.release(r);
     }
     fn pipe(self: *Selector, comptime entry: []const u8) u32 {
@@ -42,9 +53,15 @@ pub const Selector = struct {
         self.g.ensure(&self.cursor, 8);
         self.g.writeSlice(self.cursor, 0, Key, &.{after orelse missing});
     }
+    pub fn beginCollection(self: *Selector, n_items: u32) void {
+        const bytes = @as(u64, n_items) * @sizeOf(u32);
+        self.g.ensure(&self.counts, bytes);
+        self.g.clearRange(self.counts, 0, bytes);
+    }
     /// Record one core plus its complete j halo. The numerator and reciprocal
     /// buffers contain only these rows, including complete a/c lines at poles.
-    /// Eight records land at out_offset. No volume is read back.
+    /// With a collection capacity, append each local maximum to its item's
+    /// bounded list. Otherwise eight ordered records land at out_offset.
     pub fn slab(self: *Selector, params: Params, numerator: gpu.Buf, reciprocal: gpu.Buf, out: gpu.Buf, out_offset: u64) void {
         const g = self.g;
         var p = params;
@@ -58,9 +75,13 @@ pub const Selector = struct {
         p.grid_x = f[0];
         g.dispatch(self.pipe("pole_groups"), f[0], f[1], 1, &.{ g.uniform(0, std.mem.asBytes(&p)), self.scores.at(1), self.pole.at(3) });
         const blocks = (p.core_rows * p.nc * p.n + 255) / 256;
-        g.ensure(&self.records[0], @as(u64, blocks) * 8 * 8);
         f = gpu.Gpu.flat(blocks);
         p.grid_x = f[0];
+        if (p.capacity != 0) {
+            g.dispatch(self.pipe("collect_maxima"), f[0], f[1], 1, &.{ g.uniform(0, std.mem.asBytes(&p)), self.scores.at(1), self.pole.at(3), out.at(5), self.counts.at(8) });
+            return;
+        }
+        g.ensure(&self.records[0], @as(u64, blocks) * 8 * 8);
         g.dispatch(self.pipe("block_maxima"), f[0], f[1], 1, &.{ g.uniform(0, std.mem.asBytes(&p)), self.scores.at(1), self.pole.at(3), self.records[0].at(5), self.cursor.at(6) });
         self.reduce(self.records[0], blocks * 8, out, out_offset);
     }

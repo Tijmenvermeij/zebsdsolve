@@ -57,15 +57,19 @@ export function mapDescription(kind,component,run) {
 export function acceptsPrimary(results,cell,cutoff,seedValid) {
   return seedValid===1 && results?.phase?.[cell]>=0 && Number.isFinite(results.ncc?.[cell]) && Number.isFinite(cutoff) && results.ncc[cell]>=cutoff;
 }
+/** Active components of the final fitted model, including single-component fits. */
+export function acceptsFitComponent(run,cell,component) {
+  if(!run?.completed?.[cell] || component<0 || component>=run.k)return false;
+  const slot=cell*run.k+component, a=run.arrays;
+  const minActiveAmplitude = run.metadata?.profile_version ? 0 : 1e-6;
+  return a.phase?.values[slot]>=0 && a.amplitudes?.values[slot]>minActiveAmplitude && a.objective_valid?.values[cell]!==0;
+}
 /** Historical residual-source score, never joint mixture NCC or a moved primary. */
 export function acceptsResidual(run,cell,component,cutoff=0) {
-  if(!run?.completed?.[cell] || component<0 || component>=run.k || !Number.isFinite(cutoff) || !(run.arrays.active_count?.values[cell]>=2))return false;
+  if(!acceptsFitComponent(run,cell,component) || !Number.isFinite(cutoff) || !(run.arrays.active_count?.values[cell]>=2))return false;
   const slot=cell*run.k+component, a=run.arrays;
-  const residualOrigin=a.winner_rank?.values[slot]>0;
   const score=a.proposal_ncc?.values[slot];
-  // Use the same activity threshold as the native support count in this fit path.
-  const minActiveAmplitude = run.metadata?.profile_version ? 0 : 1e-6;
-  return residualOrigin && a.phase?.values[slot]>=0 && a.amplitudes?.values[slot]>minActiveAmplitude && a.objective_valid?.values[cell]!==0 && Number.isFinite(score) && score>=cutoff;
+  return a.winner_rank?.values[slot]>0 && Number.isFinite(score) && score>=cutoff;
 }
 /** Display-only evaluation of the frozen GPU gain formula; sigma is not applied to G. */
 export function gainProfile(theta,w,h) {

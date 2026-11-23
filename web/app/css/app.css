@@ -556,7 +556,21 @@ a.batch-download:hover { background: var(--raise); }
 a.batch-download:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
 /* Overlap shares the map interactions and gives its inspection more room. */
-.app[data-tab="overlap"] .stage { grid-template-columns:minmax(280px,1fr) 4px minmax(300px,min(var(--overlap-w,26vw),380px)); grid-template-rows:minmax(0,1fr); grid-template-areas:"map sv pat"; }
+.panel[data-tab="overlap"] label,
+.panel[data-tab="overlap"] .field > span { color: var(--text); font-size: 12px; }
+.panel[data-tab="overlap"] .fields { row-gap: 7px; }
+.panel[data-tab="overlap"] .field { height: auto; }
+.panel[data-tab="overlap"] .field > span { white-space: normal; overflow: visible; text-overflow: clip; }
+.panel[data-tab="overlap"] .field:not(.wide) {
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: flex-end;
+  gap: 3px;
+}
+.panel[data-tab="overlap"] .field:not(.wide) > span { flex: none; }
+.panel[data-tab="overlap"] .field:not(.wide) > :is(input,select) { width: 100%; max-width: none; }
+.panel[data-tab="overlap"] .fields > .check { align-self: end; min-height: var(--ctl); white-space: normal; }
+.app[data-tab="overlap"] .stage { grid-template-columns:minmax(280px,1fr) 4px clamp(360px,var(--overlap-w,40%),calc(100% - 284px)); grid-template-rows:minmax(0,1fr); grid-template-areas:"map sv pat"; }
 .app[data-tab="overlap"] .dock-pane,.app[data-tab="overlap"] .split-h,.app[data-tab="overlap"] #pat-pane>.pane-bar .check,.app[data-tab="overlap"] label:has(#show-fit) { display:none; }
 .overlap-table { border-collapse:collapse; width:100%; font-size:11px; }
 .overlap-table th,.overlap-table td { padding:5px 4px; text-align:left; border-bottom:1px solid var(--line); }
@@ -566,26 +580,16 @@ a.batch-download:focus-visible { outline: 2px solid var(--accent); outline-offse
 .overlap-table button[aria-pressed="true"] { border-color:var(--accent); color:var(--accent); }
 .app[data-tab="overlap"] .map-views { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:1px; background:var(--line); }
 .overlap-map-control { flex-wrap:wrap; padding:5px 8px; gap:4px; }
-.overlap-map-control select { width:auto; min-width:0; max-width:100%; flex:1; }
-.overlap-map-control select:first-child { flex:0 1 112px; }
-.app[data-tab="overlap"] .overlap-pats { grid-template:repeat(3,minmax(100px,1fr)) minmax(145px,.8fr) / minmax(0,1fr); overflow:auto; }
+.overlap-map-control select { width:auto; min-width:0; max-width:100%; flex:1 1 7rem; }
+.overlap-map-control select:first-child { flex:0 1 auto; }
+.overlap-pats { grid-template:repeat(2,minmax(140px,1fr)) minmax(125px,.55fr) / repeat(2,minmax(0,1fr)); overflow:auto; }
+.overlap-pats .facts-cell { grid-column:1 / -1; min-width:0; }
+.overlap-pats figcaption { position:static; background:var(--bg); border-radius:0; white-space:normal; }
+#overlap-gain-empty { color:var(--muted); font-size:11px; }
 #overlap-progress { width:100%; }
 #overlap-point-status { font-size:12px; color:var(--muted); }
-@media(max-width:850px) { .app[data-tab="overlap"] .stage { overflow:auto; grid-template-columns:minmax(0,1fr);grid-template-rows:minmax(240px,1fr) minmax(420px,1.5fr);grid-template-areas:"map" "pat"; } .app[data-tab="overlap"] .split-v { display:none; } }
+@media(max-width:1100px) { .app[data-tab="overlap"] .stage { overflow:auto; grid-template-columns:minmax(0,1fr);grid-template-rows:minmax(240px,1fr) minmax(445px,1.5fr);grid-template-areas:"map" "pat"; } }
 .overlap-scale { display:inline-block; width:80px; height:8px; background:linear-gradient(90deg,#440154,#21918c,#fde725); }
 .overlap-filter { grid-template-columns:minmax(0,1fr)84px; }
-.overlap-filter .field.wide { grid-column:auto; }
 
 @media(max-width:1100px) { .app[data-tab="overlap"] .map-views { grid-template-columns:minmax(0,1fr);grid-template-rows:repeat(2,minmax(0,1fr)); } }
-
-#overlap-gain-panel { margin-top:12px; }
-#overlap-gain-panel summary { cursor:pointer; font-size:12px; }
-#overlap-gain-panel figure { margin:8px 0 0; min-height:180px; }
-#overlap-gain-panel .well { flex:none; height:160px; min-height:160px; }
-#overlap-gain { width:100%; height:160px; max-width:100%; max-height:160px; object-fit:contain; }
-#overlap-gain-range { font-size:11px; color:var(--muted); }
-
-#overlap-gain-panel figcaption { position:static; padding:3px 0; background:transparent; }
-
-.app[data-tab="overlap"] .overlap-pats:has(#overlap-gain-panel[open]:not([hidden])) { grid-template-rows:repeat(3,minmax(100px,1fr)) minmax(260px,1fr); }
-#overlap-gain-panel { flex-shrink:0; }

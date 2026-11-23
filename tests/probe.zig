@@ -532,7 +532,7 @@ fn checkOverlapDictionaryCandidates(g: *gpu.Gpu) !void {
     };
     std.debug.print("overlap DI candidates: exact top1/5/8 CPU oracle and ordinary top1 parity across chunks1/255/256/257/517, ties and zero scores\n", .{});
 }
-/// Native scalar-grid regression for bounded SO(3) pages. The four isolated
+/// Native scalar-grid regression for bounded SO(3) candidate lists. The four isolated
 /// extrema are specified independently of the GPU implementation, including
 /// source aliases at each pole and an exact seam tie. No crystal math here.
 fn checkSphericalSeedPages(g: *gpu.Gpu) !void {
@@ -557,16 +557,22 @@ fn checkSphericalSeedPages(g: *gpu.Gpu) !void {
         defer g.release(&pages);
         var answer = g.storage(64);
         defer g.release(&answer);
+        var collected = g.storage(2 * 8 * @sizeOf(peak.Key));
+        defer g.release(&collected);
         var selector = peak.Selector.init(g);
         defer selector.deinit();
         const ja = n / 4 - 1;
         const jb = nb - 4;
         const indices = [_]u32{ 3 * n + nc - 1, ja * nc * n, ((nb - 1) * nc + 6) * n + (11 % nc), (jb * nc + 4) * n + n / 2 };
-        for (0..7) |fixture| {
+        for (0..8) |fixture| {
             @memset(num, if (fixture >= 2 and fixture <= 4) @as(f32, 0.2) else -1);
             @memset(den, if (fixture == 3 or fixture == 4) @as(f32, 0) else 1);
             var expected: [4]peak.Key = undefined;
-            const values = if (fixture == 1) [_]f32{ -0.05, -0.1, -0.15, -0.2 } else [_]f32{ 0.95, 0.9, 0.85, 0.8 };
+            const values = switch (fixture) {
+                1 => [_]f32{ -0.05, -0.1, -0.15, -0.2 },
+                7 => [_]f32{ 0.95, 0.9, 0.9, 0.8 },
+                else => [_]f32{ 0.95, 0.9, 0.85, 0.8 },
+            };
             const count: usize = if (fixture == 6) 2 else if (fixture >= 2 and fixture <= 4) 0 else 4;
             if (fixture == 6) {
                 @memset(num, 0.5);
@@ -589,10 +595,16 @@ fn checkSphericalSeedPages(g: *gpu.Gpu) !void {
             for ([_]u32{ 1, 3, nb }) |core| {
                 const slabs = (nb + core - 1) / core;
                 g.ensure(&pages, @as(u64, slabs) * 64);
-                for (0..2) |cursor_pass| {
-                    const skip: usize = if (cursor_pass != 0 and count > 0) 2 else 0;
+                // Two paged scans, followed by complete and overflowing collections.
+                for (0..4) |pass| {
+                    const capacity: u32 = switch (pass) {
+                        2 => 8,
+                        3 => 2,
+                        else => 0,
+                    };
+                    const skip: usize = if (pass == 1 and count > 0) 2 else 0;
                     const after: ?peak.Key = if (skip > 0) expected[skip - 1] else null;
-                    selector.setCursor(after);
+                    if (capacity == 0) selector.setCursor(after) else selector.beginCollection(2);
                     var first: u32 = 0;
                     var si: u32 = 0;
                     while (first < nb) : (first += core) {
@@ -604,13 +616,35 @@ fn checkSphericalSeedPages(g: *gpu.Gpu) !void {
                         g.ensure(&slab_den, bytes);
                         g.copy(raw, @as(u64, lo) * nc * n * 4, slab_num, 0, bytes);
                         g.copy(reciprocal, @as(u64, lo) * nc * n * 4, slab_den, 0, bytes);
-                        selector.slab(.{ .n = n, .nc = nc, .nb = nb, .first = lo, .rows = rows, .core_first = first, .core_rows = @min(core, nb - first), .cursor_set = @intFromBool(after != null) }, slab_num, slab_den, pages, @as(u64, si) * 64);
+                        selector.slab(.{
+                            .n = n,
+                            .nc = nc,
+                            .nb = nb,
+                            .first = lo,
+                            .rows = rows,
+                            .core_first = first,
+                            .core_rows = @min(core, nb - first),
+                            .cursor_set = @intFromBool(after != null),
+                            .item = 1,
+                            .capacity = capacity,
+                        }, slab_num, slab_den, if (capacity == 0) pages else collected, @as(u64, si) * 64);
                         si += 1;
                     }
-                    selector.reduce(pages, slabs * 8, answer, 0);
                     var actual: [8]peak.Key = undefined;
-                    g.read(answer, 0, std.mem.sliceAsBytes(&actual));
-                    try g.wait();
+                    if (capacity == 0) {
+                        selector.reduce(pages, slabs * 8, answer, 0);
+                        g.read(answer, 0, std.mem.sliceAsBytes(&actual));
+                        try g.wait();
+                    } else {
+                        var counts: [2]u32 = undefined;
+                        g.read(selector.counts, 0, std.mem.asBytes(&counts));
+                        @memset(&actual, peak.missing);
+                        if (count != 0) g.read(collected, @as(u64, capacity) * @sizeOf(peak.Key), std.mem.sliceAsBytes(actual[0..@min(count, capacity)]));
+                        try g.wait();
+                        if (counts[0] != 0 or counts[1] != count) return error.SphericalSeedCollectionWrongCount;
+                        if (count > capacity) continue;
+                        std.mem.sortUnstable(peak.Key, actual[0..count], {}, peak.Key.before);
+                    }
                     for (actual, 0..) |key, i| {
                         if (i < count - skip) {
                             if (key.index != expected[skip + i].index or key.value_bits != expected[skip + i].value_bits) return error.SphericalSeedPageWrongExtremum;
@@ -620,7 +654,7 @@ fn checkSphericalSeedPages(g: *gpu.Gpu) !void {
             }
         }
     }
-    std.debug.print("overlap SI seed pages: poles/seams/ties/negative/flat/undefined and cursor/slab reductions pass\n", .{});
+    std.debug.print("overlap SI seed pages: poles/seams/ties/negative/flat/undefined, compact collection/overflow and cursor/slab reductions pass\n", .{});
 }
 
 /// Pure guard checks run before table generation or weight allocations. The

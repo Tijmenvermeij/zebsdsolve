@@ -3,7 +3,7 @@
 struct PeakP {
     n:u32, nc:u32, nb:u32, first:u32,
     rows:u32, core_first:u32, core_rows:u32, grid_x:u32,
-    input_count:u32, cursor_set:u32, pad0:u32, pad1:u32,
+    input_count:u32, cursor_set:u32, item:u32, capacity:u32,
 };
 @group(0) @binding(0) var<uniform> pp:PeakP;
 @group(0) @binding(1) var<storage,read_write> scores:array<f32>;
@@ -15,6 +15,7 @@ struct PeakP {
 @group(0) @binding(5) var<storage,read_write> output_page:array<vec2<u32>>;
 @group(0) @binding(6) var<storage,read> cursor:array<vec2<u32>>;
 @group(0) @binding(7) var<storage,read> numerator:array<f32>;
+@group(0) @binding(8) var<storage,read_write> counts:array<atomic<u32>>;
 const NEG:f32=-3.4e38;
 const MISSING:u32=0xffffffffu;
 fn finite_score(v:f32)->bool {return v==v && abs(v)<3.4e38;}
@@ -131,6 +132,19 @@ fn local_maximum(j:u32,c:u32,a:u32,key:vec2<u32>)->bool {
     // Defined local lexicographic convention: require at least one strictly
     // lower valid neighbor. Constant/isolated undefined fields yield no extras.
     return lower;
+}
+// The host orders the sparse keys with better()'s score/index comparison.
+// Continue counting past capacity so the host can recover every candidate
+// through the ordered page kernels if the list fills up.
+@compute @workgroup_size(256)
+fn collect_maxima(@builtin(workgroup_id) wid:vec3<u32>,@builtin(local_invocation_index) tid:u32) {
+    let i=(wid.y*pp.grid_x+wid.x)*256u+tid;
+    if(i>=pp.core_rows*pp.nc*pp.n){return;}
+    let a=i&(pp.n-1u);let c=(i/pp.n)&(pp.nc-1u);
+    let j=pp.core_first+i/(pp.n*pp.nc);let key=key_at(j,c,a);
+    if(!local_maximum(j,c,a,key)){return;}
+    let slot=atomicAdd(&counts[pp.item],1u);
+    if(slot<pp.capacity){output_page[pp.item*pp.capacity+slot]=key;}
 }
 var<workgroup> keys:array<vec2<u32>,256>;
 fn sort_keys(tid:u32) {

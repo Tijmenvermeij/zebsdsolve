@@ -486,41 +486,45 @@ throughput depends on the GPU and proposal-search settings.
 
 ## Focused maps and display filtering
 
-The two linked maps default to the original indexed primary and the second
-component's residual-source solution. The primary map is available before
-any overlap run and shows every available indexed primary across the scan,
-including outside the overlap ROI. Rejected or uncomputed overlaps do not hide
-primary solutions.
+The linked maps default to **Original primary** and **First accepted residual
+component**. Original primary is available before overlap indexing and covers
+the accepted indexed points across the scan, including outside the overlap ROI.
+When both maps show IPF colours, choosing X, Y or Z on either map updates both.
+Each map can also show its own metric.
 
-**Primary NCC minimum** gates the original primary map and the cells eligible
-for the next overlap run, intersected with the ROI. The execution cutoff is
-frozen in result metadata. **Residual NCC minimum** independently gates overlap
-display using the native proposal's score after residual-only indexing/refinement
-under the Index settings. Maps use the corresponding source orientation; final
-jointly polished poses remain available in the fitted-pattern inspector. Primary
-snapshots are tracked so reindexing invalidates old overlap results.
+**Fit component 1**, **Fit component 2**, and subsequent numbered maps show active
+components in the final fitted order using their final orientations. Component 1
+includes single-pattern fits and usually retains the original primary. The
+original primary stays available on its own map when a fit replaces it.
 
-The residual score precedes the joint fraction and blur/gain fit. It is not NCC
-against the final mixture residual, which is approximately orthogonal to active
-fitted templates. Mixture NCC remains a reconstruction diagnostic, not a display
-acceptance filter. **Show only** offers additional residual-source NCC, model
-weight and improvement filters on the overlap map only. All computed records are
-exported with both map thresholds; display filtering changes no coefficients.
+The **First accepted residual component** map shows the first eligible
+residual-derived component in fit order at each point of a multi-component fit.
+It uses that component's discovery orientation. **Residual map NCC minimum**
+filters this map using the score measured against the earlier search residual,
+after residual-only refinement and before joint fitting. **Source NCC** on a
+numbered fit map reports the score on that component's original search target.
+
+**Primary NCC minimum** controls the original primary map and which points in
+the ROI are eligible for the next overlap run. The execution cutoff is frozen in
+the result metadata. **Show only** applies additional weight or fit-improvement
+filters to the numbered and residual maps. Display filtering leaves the fitted
+results and exported records intact. Reindexing invalidates the earlier overlap
+results because it changes their primary snapshot. Mixture NCC measures the
+quality of the fitted reconstruction.
 The separate computational **Screen residual NCC** control retains its own
 frozen execution threshold; lowering a display threshold cannot restore
 proposals skipped during computation. Thresholds are user choices, not calibrated
 physical-presence confidence.
 
-The existing small map set and selected-pixel details remain; hover selectors,
-patterns and scores for definitions and units. Original primary inspection uses
-the existing index renderer without live reindexing, retaining the three-pattern
-column. Its signed difference is independent of the ordinary split-view control.
-Fitted-pattern inspection includes the actual frozen shared blur and gain. The
-collapsed **Gain / blur** panel shows the fitted spatial envelope and Gaussian
-sigma in effective fit pixels. Blur acts separately on simulated patterns before
-gain; it is never applied to the gain image. When inspecting the original primary,
-the gain panel is explicitly the computed mixture's fit, while the primary
-simulation itself remains unchanged.
+Hover over map selectors, patterns and scores for definitions and units. The
+inspector shows the target, simulation, signed residual and **Gain profile** in a
+2 × 2 grid, with the fit details below. The gain caption reports the range of the
+shared spatial envelope and the fitted Gaussian sigma in effective fit pixels.
+The fitted contribution uses the saved blur, gain and amplitude of the selected
+component. The reconstruction sums those contributions. Original primary
+inspection uses the index renderer without live reindexing, with a signed
+difference independent of the ordinary split-view control. In this view the gain
+profile still belongs to the computed mixture.
 
 ### Experimental checks and interpretation
 

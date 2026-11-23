@@ -107,6 +107,15 @@ try {
     const primaryPixels=document.getElementById('map').getContext('2d').getImageData(3,0,1,1).data;
     require(primaryPixels[0]!==primaryPixels[1] || primaryPixels[1]!==primaryPixels[2],'primary outside overlap ROI must be native colored');
     const limit=document.getElementById('overlap-limit');limit.value='4';limit.dispatchEvent(new Event('change'));
+    for(const id of ['overlap-map-component','overlap-map-component-2']) {
+      const selector=document.getElementById(id);
+      require(selector.options[1].textContent==='First accepted residual component','automatic residual label');
+      require(selector.options[4].textContent==='Fit component 3' && selector.options[5].textContent==='Fit component 4','numbered component labels');
+      require(selector.options[4].title.includes('final fit'),'component option tooltip');
+      selector.value='3';selector.dispatchEvent(new Event('change'));
+      require(selector.title===selector.options[4].title,'selected component tooltip');
+      selector.value=id.endsWith('-2')?'residual':'primary';selector.dispatchEvent(new Event('change'));
+    }
     document.getElementById('btn-overlap-run').click();
     await waitFor(()=>document.getElementById('app').dataset.busy==='0' && document.getElementById('overlap-readout').textContent.startsWith('Complete'),'overlap');console.log('overlap ready');
     require(document.getElementById('overlap-readout').textContent.includes('6 / 6'),'all ROI cells committed');
@@ -146,11 +155,14 @@ try {
     await waitFor(()=>document.getElementById('overlap-target').width>1,'primary fit slot inspector');
     c.value='2';c.dispatchEvent(new Event('change'));
     const map=document.getElementById('overlap-map');
-    require(map.options.length===7,'map selector grew beyond focused set');
+    require(map.options.length===8,'map selector grew beyond focused set');
     map.value='proposal_ncc';map.dispatchEvent(new Event('change'));
     const mapComponent=document.getElementById('overlap-map-component');mapComponent.value='2';mapComponent.dispatchEvent(new Event('change'));
+    require(map.selectedOptions[0].textContent==='Source NCC','numbered fit source NCC map label');
+    require(document.getElementById('map-well').title.includes('target used to discover'),'numbered fit NCC hover meaning');
+    mapComponent.value='residual';mapComponent.dispatchEvent(new Event('change'));
     require(map.selectedOptions[0].textContent==='Residual source NCC','residual NCC map label');
-    require(document.getElementById('map-well').title.includes('before this component was added'),'map hover meaning');
+    require(document.getElementById('map-well').title.includes('before this component was added'),'residual NCC hover meaning');
     require([...document.querySelectorAll('#overlap-facts dt')].every(el=>el.title.length>30),'metric hover explanations');
     await waitFor(()=>document.getElementById('overlap-residual').title.includes('Final signed residual'),'pattern hover meaning');
     const filter=document.getElementById('overlap-filter-metric');
@@ -181,13 +193,22 @@ try {
     });
     window.assertLinked=label=>{const [a,b]=mapGeometry();for(const key of ['width','height','left','top'])require(Math.abs(a[key]-b[key])<1.1,label+' '+key);};
     assertLinked('initial linked maps');
-    const figures=[...document.querySelectorAll('#overlap-pats > figure,.overlap-pats > .facts-cell')].map(el=>el.getBoundingClientRect());
-    require(figures.every((b,i)=>Math.abs(b.left-figures[0].left)<1 && (i===0 || b.top>=figures[i-1].bottom-1)),'patterns and fit facts must stack');
-    require($('pat-pane').getBoundingClientRect().width<=380,'inspector too wide');
+    const [target,simulation,residual,gain,facts]=[...$('overlap-pats').children].map(el=>el.getBoundingClientRect());
+    require(target.top===simulation.top && residual.top===gain.top && target.left===residual.left && simulation.left===gain.left && simulation.left>target.left && gain.top>target.top,'inspector images must form a 2 × 2 grid');
+    require(facts.top>=gain.bottom && facts.left===target.left && facts.right===gain.right,'fit facts must span both columns below the images');
+    require($('pat-pane').getBoundingClientRect().width>380,'the 2 × 2 inspector needs a wider default pane');
     const a=$('overlap-map'),b=$('overlap-map-2'),component=$('overlap-map-component-2');
-    require(a.options.length===7 && b.options.length===7,'map metrics must stay focused');
+    require(a.options.length===8 && b.options.length===8,'map metrics must stay focused');
     b.value='mixture_ncc';b.dispatchEvent(new Event('change'));
     require(a.value==='ipf_z' && $('overlap-map-legend').textContent.includes('Mixture NCC'),'independent metric');
+    a.value='ipf_y';a.dispatchEvent(new Event('change'));
+    require(b.value==='mixture_ncc','IPF axis change must preserve a non-IPF metric');
+    b.value='ipf_x';b.dispatchEvent(new Event('change'));
+    require(a.value==='ipf_x','right IPF axis must update the left map');
+    a.value='ipf_y';a.dispatchEvent(new Event('change'));
+    require(b.value==='ipf_y' && $('map-legend').textContent.includes('IPF Y') && $('overlap-map-legend').textContent.includes('IPF Y'),'left IPF Y must update both maps and legends');
+    b.value='mixture_ncc';b.dispatchEvent(new Event('change'));
+
     $('overlap-map-component').value='2';$('overlap-map-component').dispatchEvent(new Event('change'));
     a.value='mixture_ncc';a.dispatchEvent(new Event('change'));
     require(a.value===b.value,'same metric must be allowed');
@@ -212,6 +233,12 @@ try {
     require($('overlap-component').value==='2','right map click did not inspect its component');
     await waitFor(()=>$('overlap-target').width>1,'right map inspection');
     require($('map-over').innerHTML===$('overlap-map-over').innerHTML,'selection and ROI overlays differ');
+    const inspector=$('overlap-component');
+    inspector.value='1';inspector.dispatchEvent(new Event('change'));
+    well.focus();
+    well.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowRight',bubbles:true,cancelable:true}));
+    require($('pat-cell').textContent==='row 0, col 1' && inspector.value==='2','focused map arrows should inspect its numbered component');
+
     // Residual display filtering leaves the original primary source unchanged.
     $('overlap-map-component').value='primary';$('overlap-map-component').dispatchEvent(new Event('change'));
     a.value='ipf_z';a.dispatchEvent(new Event('change'));b.value='ipf_z';b.dispatchEvent(new Event('change'));
@@ -232,7 +259,7 @@ try {
     require($('overlap-map-view').hidden && $('overlap-map-control').hidden && !$('map-kind').hidden,'ordinary map controls not restored');
     require(getComputedStyle(document.querySelector('.map-views')).display==='flex','ordinary map layout not restored');
     $('tab-overlap').click();await pause(50);assertLinked('return to overlap');
-    return {defaults:true,independentSelectors:true,stackedInspector:true,linkedZoom:true,linkedPan:true,selection:true,sharedROI:true,independentAcceptance:true,indexRestore:true};
+    return {defaults:true,independentSelectors:true,patternGrid:true,linkedZoom:true,linkedPan:true,selection:true,sharedROI:true,independentAcceptance:true,indexRestore:true};
   `);
   if(process.env.OVERLAP_SCREENSHOT){
     const shot=await send("Page.captureScreenshot",{format:"png"},sessionId);
@@ -334,7 +361,7 @@ try {
   const nuisance=await evaluate(`
     document.getElementById('tab-overlap').click();
     const previousInspect=ze.overlapInspect.bind(ze);window.lastGuiReplay=null;
-    ze.overlapInspect=async(...args)=>{const images=await previousInspect(...args);window.lastGuiReplay={fit_model:args[1].fit_model,blur_gain:args[1].blur_gain,sse:images.residual.reduce((a,v)=>a+v*v,0)};return images;};
+    ze.overlapInspect=async(...args)=>{const images=await previousInspect(...args);window.lastGuiReplay={fit_model:args[1].fit_model,blur_gain:args[1].blur_gain,sse:images.residual.reduce((a,v)=>a+v*v,0),images};return images;};
     await configureUI({roi_x:0,roi_y:0,roi_w:1,roi_h:1});
     const checkbox=document.getElementById('overlap-blur-gain');checkbox.checked=true;checkbox.dispatchEvent(new Event('change'));
     require(document.getElementById('overlap-readout').textContent.startsWith('Context changed'),'fit model toggle did not invalidate inspection');
@@ -352,30 +379,39 @@ try {
     require(fitted.arrays.blur_gain_theta.stride===7 && fitted.arrays.blur_gain_theta.values.length===7,'frozen fit parameters missing');
     require(fitted.metadata.blur_gain_optimizer.sigma_units==='effective_fit_pixels','fit parameter units missing');
     document.getElementById('overlap-component').value='1';document.getElementById('overlap-component').dispatchEvent(new Event('change'));
-    await waitFor(()=>document.getElementById('overlap-target').width>1,'fitted inspector');
+    const inspection=document.getElementById('overlap-inspection');
+    inspection.value='component';inspection.dispatchEvent(new Event('change'));
+    await waitFor(()=>!document.getElementById('overlap-gain').hidden && document.getElementById('overlap-simulation-caption').textContent==='Fitted contribution','fitted component and gain profile');
     require([...document.querySelectorAll('#overlap-facts dt')].some(el=>el.textContent==='Blur σ'),'fitted parameter details missing');
-    require(!document.getElementById('overlap-gain-panel').hidden && !document.getElementById('overlap-gain-panel').open,'gain panel must start collapsed');
+    require(!document.getElementById('overlap-gain-panel').hidden && document.getElementById('overlap-gain-empty').hidden,'gain panel must display directly');
     require(JSON.stringify(JSON.parse(document.getElementById('overlap-gain').dataset.theta))===JSON.stringify(fitted.arrays.blur_gain_theta.values),'gain panel must use frozen theta');
-    require(document.getElementById('overlap-gain-range').textContent.includes('σ') && document.getElementById('overlap-gain-panel').title.includes('never to this gain image'),'gain/blur display semantics');
+    require(document.getElementById('overlap-gain-range').textContent.includes('σ') && document.getElementById('overlap-gain-panel').title.includes('The displayed fit includes this gain and blur.'),'gain/blur display semantics');
     await waitFor(()=>window.lastGuiReplay?.blur_gain===true && window.lastGuiReplay.fit_model==='contrast_gain_v1','GUI contrast replay model');
     require(Math.abs(window.lastGuiReplay.sse-fitted.arrays.sse.values[0])<5e-5,'GUI model replay SSE disagrees');
+    const {drawGray,quantiles}=await import('/web/app/js/draw.js');
+    const {shape:[h,w],conditional,selected_contribution}=window.lastGuiReplay.images;
+    const intensities=new Float32Array(2*h*w);
+    intensities.set(conditional);intensities.set(selected_contribution,h*w);
+    const [lo,hi]=quantiles(intensities,.005,.995);
+    const contribution=document.createElement('canvas');
+    drawGray(contribution,selected_contribution,w,h,{lo,hi});
+    require(document.getElementById('overlap-simulation').toDataURL()===contribution.toDataURL(),'display must use the corrected native contribution');
     const image=await ze.overlapInspect(0,{fit_model:fitted.metadata.fit_model,max_components:2,maxComponents:2,cells:[0],blur_gain:true,blur_gain_theta:Float32Array.from(fitted.arrays.blur_gain_theta.values),quaternions:Float32Array.from(fitted.arrays.quaternions.values),phase:Int32Array.from(fitted.arrays.phase.values),amplitudes:Float32Array.from(fitted.arrays.amplitudes.values)},0,1);
     const ss=image.residual.reduce((a,v)=>a+v*v,0);require(Math.abs(ss-fitted.arrays.sse.values[0])<5e-5,'fitted browser inspector SSE disagrees');
     keep.value='1';keep.dispatchEvent(new Event('change'));
     const frozen=await exportOverlap();require(frozen.metadata.keep_n===5 && frozen.context_current,'future search setting rewrote or invalidated completed fit');
     return {frozenParameters:true,inspector:true,hover:true,modelReplay:true,weightProvenance:true,candidatePool:true,frozenCandidateMetadata:true};
   `);
-  await evaluate(`
-    const panel=document.getElementById('overlap-gain-panel');panel.open=true;
-    await pause(80);const facts=panel.closest('.facts-cell');facts.scrollTop=facts.scrollHeight;await pause(80);
-    const box=document.getElementById('overlap-gain').getBoundingClientRect(),well=facts.getBoundingClientRect();
-    require(box.width>0 && box.height>0 && box.top>=well.top-1 && box.bottom<=well.bottom+1 && box.top>=0 && box.bottom<=innerHeight,'expanded gain profile is clipped '+JSON.stringify({box:box.toJSON(),well:well.toJSON(),height:innerHeight,scroll:facts.scrollTop,scrollHeight:facts.scrollHeight}));
-  `);
   if(process.env.OVERLAP_GAIN_SCREENSHOT){
     const shot=await send("Page.captureScreenshot",{format:"png"},sessionId);
     writeFileSync(process.env.OVERLAP_GAIN_SCREENSHOT,Buffer.from(shot.data,"base64"));
   }
-  await evaluate(`document.getElementById('overlap-gain-panel').open=false;`);
+  await evaluate(`
+    await waitFor(()=>{
+      const box=document.getElementById('overlap-gain').getBoundingClientRect();
+      return box.width>0 && box.height>0 && box.top>=0 && box.bottom<=innerHeight+1;
+    },'gain profile visible in viewport');
+  `);
   const histories=await evaluate(`
     const keep=document.getElementById('overlap-keep-n');keep.value='5';keep.dispatchEvent(new Event('change'));
     const limit=document.getElementById('overlap-limit');limit.value='4';limit.dispatchEvent(new Event('change'));
@@ -410,6 +446,16 @@ try {
     require(fitted.arrays.retained_order.values[0]===1,'screen did not preserve singleton');
     require(fitted.profile_events.some(e=>e.flags&2),'screened proposal diagnostic missing');
     require(fitted.profile_events.every(e=>e.cell===fitted.cells[0]),'tile events lost scan IDs');
+    const fitSelector=document.getElementById('overlap-component');
+    fitSelector.value='1';fitSelector.dispatchEvent(new Event('change'));
+    await waitFor(()=>document.getElementById('overlap-target').width>1 && document.querySelector('#overlap-components button'),'screened component inspector');
+    const buttons=document.querySelectorAll('#overlap-components button');
+    require(!buttons[0].disabled && buttons[1].disabled && fitSelector.options[2].disabled,'screened component disabled in both inspector controls');
+    buttons[1].click();
+    require(fitSelector.value==='1' && document.querySelector('#overlap-components button')===buttons[0],'unavailable component click cleared the fitted table');
+    fitSelector.value='2';fitSelector.dispatchEvent(new Event('change'));
+    require(fitSelector.value==='1' && document.querySelectorAll('#overlap-components tr').length===2,'unavailable selection must keep the fitted table');
+
     const target=await ze.overlapInspect(fitted.cells[0],{fit_model:fitted.metadata.fit_model,max_components:2,cells:fitted.cells,blur_gain:true,blur_gain_theta:Float32Array.from(fitted.arrays.blur_gain_theta.values),quaternions:Float32Array.from(fitted.arrays.quaternions.values),phase:Int32Array.from(fitted.arrays.phase.values),amplitudes:Float32Array.from(fitted.arrays.amplitudes.values)},0,0);
     require(Math.abs(target.residual.reduce((sum,x)=>sum+x*x,0)-fitted.arrays.sse.values[0])<5e-5,'profile inspector replay mismatch');
     polish.checked=false;polish.dispatchEvent(new Event('change'));

@@ -55,11 +55,19 @@ ui=createOverlap({st,busy:async(_,fn)=>{st.busy=true;try{await fn();}finally{st.
 ui.sync();redraw();
 assert.equal($('overlap-map-component').value,'primary');assert.equal($('overlap-map-component-2').value,'residual');
 assert.equal($('map').data[0],70);assert.equal($('map').data[8],50,'primary outside overlap ROI visible before overlap');
+$('overlap-polish').checked=true;
 $('overlap-primary-cutoff').value='.5';await $('btn-overlap-run').listeners.click();
 assert.deepEqual(requests,[[0]],'next overlap eligibility intersects primary acceptance and ROI');
 assert.equal(ui.result.metadata.primary_ncc_minimum,.5);assert.equal($('map').data[8],50,'outside ROI primary survives overlap');
 assert.equal($('overlap-map-canvas').data[0],30,'residual map uses the moved residual’s native source pose');
-assert.match(ui.hover(0,1),/Residual source slot 1/);
+const fitSource=$('overlap-map-component-2');
+fitSource.value='1';redraw();
+assert.equal($('overlap-map-canvas').data[0],20,'numbered map uses the final fitted orientation');
+fitSource.value='2';redraw();
+assert.equal($('overlap-map-canvas').data[0],90,'numbered map includes the retained original primary');
+fitSource.value='residual';redraw();
+
+assert.match(ui.hover(0,1),/Fit component 1/);
 ui.inspectMap(1,0);assert.equal($('overlap-component').value,'1','automatic source resolves to the clicked fit slot');
 const residual=$('overlap-map-canvas').data.slice();
 $('overlap-primary-cutoff').value='.95';$('overlap-primary-cutoff').listeners.input();
@@ -86,7 +94,12 @@ assert.deepEqual(requests,[[0],[0,1]],'next run excludes the same stale cell eve
 assert.equal(ui.hover(1,1),'No multi-component fit');
 assert.notEqual($('overlap-map-canvas').data[4],80,'replacement singleton stays off the residual map');
 ui.inspectMap(1,1);assert.equal($('overlap-component').value,'primary');
-$('overlap-map-component-2').value='1';
+$('overlap-map-component-2').value='1';redraw();
+assert.equal($('overlap-map-canvas').data[4],90,'numbered map includes a singleton fit');
+assert.match(ui.hover(1,1),/Fit component 1/);
+$('overlap-residual-cutoff').value='1';$('overlap-residual-cutoff').listeners.input();
+assert.equal($('overlap-map-canvas').data[4],90,'residual NCC cutoff only filters the residual-source map');
+$('overlap-residual-cutoff').value='0';$('overlap-residual-cutoff').listeners.input();
 ui.inspectMap(1,1);assert.equal($('overlap-component').value,'1','explicit fit slot remains inspectable');
 console.log('Overlap controller: native primary eligibility, residual provenance, singleton masking, independent cutoffs and frozen results pass');
 

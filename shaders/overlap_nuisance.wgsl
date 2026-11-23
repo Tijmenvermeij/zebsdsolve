@@ -41,6 +41,20 @@ fn initialize(@builtin(workgroup_id) w:vec3<u32>) {
  for(var j=0u;j<4u;j++){cells[ci(b,80u+j)]=main[b].initial_sse;}
 }
 @compute @workgroup_size(1)
+fn invalidate_sigma(@builtin(workgroup_id) w:vec3<u32>) {
+ let b=image_id(w);if(b<p.n){cells[ci(b,65u)]=-1.0;}
+}
+@compute @workgroup_size(1)
+fn share_primary_theta(@builtin(workgroup_id) w:vec3<u32>) {
+ let b=image_id(w);if(b>=p.n){return;}
+ for(var col=1u;col<4u;col++){
+  for(var i=0u;i<7u;i++){
+   cells[ci(b,90u+col*7u+i)]=cells[ci(b,90u+i)];
+   cells[ci(b,32u+col*7u+i)]=cells[ci(b,32u+i)];
+  }
+ }
+}
+@compute @workgroup_size(1)
 fn begin_order(@builtin(workgroup_id) w:vec3<u32>) {
  let b=image_id(w);if(b>=p.n){return;}
  cells[ci(b,193u)]=-1.0;
@@ -238,7 +252,7 @@ fn commit(@builtin(workgroup_id) w:vec3<u32>,@builtin(local_invocation_index) la
  for(var j=0u;j<k;j++){for(var i=lane;i<p.px;i+=64u){let ix=(j*p.n+b)*p.px+i;committed[ix]=raw[ix];transformed[ix]=bank[ix];}}
 }
 @compute @workgroup_size(1)
-fn read_theta(@builtin(workgroup_id) w:vec3<u32>){let b=image_id(w);if(b<p.n){for(var j=0u;j<7u;j++){theta_out[b*7u+j]=cells[ci(b,16u+j)];}}}
+fn read_theta(@builtin(workgroup_id) w:vec3<u32>){let b=image_id(w);if(b<p.n){for(var j=0u;j<7u;j++){theta_out[b*7u+j]=cells[ci(b,select(16u,8u,p.mode==1u)+j)];}}}
 @compute @workgroup_size(1)
 fn store_fixed_single(@builtin(workgroup_id) w:vec3<u32>){
  let b=image_id(w);if(b>=p.n){return;}cells[ci(b,80u+p.coord)]=min(best[b].sse,best[b].initial_sse);

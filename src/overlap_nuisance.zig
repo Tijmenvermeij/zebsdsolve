@@ -55,7 +55,7 @@ pub const Model = struct {
         self.trial.deinit();
         inline for (.{ "raw", "committed", "centered", "mid", "blurred", "cells", "best", "best_bank", "theta", "norms" }) |field| self.g.release(&@field(self, field));
     }
-    const Args = struct { mode: u32 = 0, coord: u32 = 0, phase: u32 = 0, seed: u32 = 0, step: f32 = 0, dc: f32 = 0 };
+    const Args = struct { mode: u32 = 0, coord: u32 = 0, phase: u32 = 0, seed: u32 = 0, step: f32 = 0, dc: f32 = 0, reuse_blur: bool = false };
     fn run(self: *Model, comptime entry: []const u8, a: Args, binds: []const gpu.Bind, pixels: bool) void {
         const f = self.fit;
         const count = if (pixels) (@as(u64, 4) * f.n * f.px + 255) / 256 else f.n;
@@ -83,20 +83,34 @@ pub const Model = struct {
         }
     }
     fn transformWithArgs(self: *Model, a: Args, normalize: bool) void {
-        const source = if (self.contrast) self.centered else self.raw;
-        self.run("blur_rows", a, &.{ source.at(1), self.mid.at(3), self.cells.at(5), self.fit.progress.at(9) }, true);
-        self.run("blur_cols", a, &.{ self.mid.at(3), self.blurred.at(4), self.cells.at(5), self.fit.progress.at(9) }, true);
-        self.run("cache_sigma", a, &.{self.cells.at(5)}, false);
-        if (self.contrast) self.run("mean_blurred", a, &.{ self.blurred.at(4), self.cells.at(5), self.fit.progress.at(9) }, false);
+        if (!a.reuse_blur) {
+            const source = if (self.contrast) self.centered else self.raw;
+            self.run("blur_rows", a, &.{ source.at(1), self.mid.at(3), self.cells.at(5), self.fit.progress.at(9) }, true);
+            self.run("blur_cols", a, &.{ self.mid.at(3), self.blurred.at(4), self.cells.at(5), self.fit.progress.at(9) }, true);
+            self.run("cache_sigma", a, &.{self.cells.at(5)}, false);
+            if (self.contrast) self.run("mean_blurred", a, &.{ self.blurred.at(4), self.cells.at(5), self.fit.progress.at(9) }, false);
+        }
         self.run("gain", a, &.{ self.trial.bank.at(2), self.blurred.at(4), self.cells.at(5), self.fit.progress.at(9) }, true);
-        if (normalize) self.prep.filter(self.trial.bank, 4 * self.fit.n, self.fit.px / self.fit.width, self.fit.width, .{ .mask = self.fit.mask });
+        if (normalize) {
+            // Profiled trials have a known column count and use only this prefix.
+            // Batched discovery may have a different count for each cell.
+            const columns = if (self.k == 0) 4 else if (a.mode == 1) 1 else self.k;
+            self.prep.filter(self.trial.bank, columns * self.fit.n, self.fit.px / self.fit.width, self.fit.width, .{ .mask = self.fit.mask });
+        }
     }
     fn evaluate(self: *Model, a: Args, singleton: bool) void {
         self.run("propose", a, &.{ self.cells.at(5), self.trial.state.at(6), self.fit.state.at(8), self.fit.progress.at(9) }, false);
-        self.transform(singleton);
+        self.transformWithArgs(.{ .mode = @intFromBool(singleton), .coord = self.single_column, .reuse_blur = a.reuse_blur }, true);
         self.trial.contrast = self.contrast;
         self.trial.nuisanceTrial(singleton, self.k);
         self.run("retain", .{ .mode = @intFromBool(singleton), .seed = a.seed }, &.{ self.trial.bank.at(2), self.cells.at(5), self.trial.state.at(6), self.best.at(7), self.fit.progress.at(9), self.best_bank.at(10) }, false);
+    }
+    // A sigma trial may leave its rejected blur in the cache. Refresh at
+    // the first gain trial, then every remaining gain trial uses the same sigma
+    // whether or not its gain is retained. Starting from new seeds also refreshes.
+    fn coordinatePair(self: *Model, singleton: bool, coord: u32, step: f32, reuse_first: bool) void {
+        self.evaluate(.{ .seed = 8, .coord = coord, .step = step, .reuse_blur = reuse_first }, singleton);
+        self.evaluate(.{ .seed = 8, .coord = coord, .step = -step, .reuse_blur = coord != 0 }, singleton);
     }
     fn optimize(self: *Model, singleton: bool) void {
         self.run("reset_search", .{}, &.{ self.cells.at(5), self.best.at(7), self.fit.state.at(8) }, false);
@@ -108,8 +122,7 @@ pub const Model = struct {
         for (0..seeds) |seed| self.evaluate(.{ .seed = @intCast(seed) }, singleton);
         const steps: Theta = .{ 1.5, 0.35, 2, 0.2, 0.2, 0.06, 0.06 };
         for ([_]f32{ 1, 0.5, 0.25 }) |scale| for (0..2) |_| for (steps, 0..) |step, j| {
-            self.evaluate(.{ .seed = 8, .coord = @intCast(j), .step = step * scale }, singleton);
-            self.evaluate(.{ .seed = 8, .coord = @intCast(j), .step = -step * scale }, singleton);
+            self.coordinatePair(singleton, @intCast(j), step * scale, j > 1);
         };
         if (singleton) {
             // Keep the current search's coarse singleton seeds for the joint
@@ -121,9 +134,8 @@ pub const Model = struct {
             for (9..13) |seed| self.evaluate(.{ .seed = @intCast(seed) }, false);
         }
         // Resolve weak radial gain without resetting the achieved NNLS incumbent.
-        for ([_]f32{ 0.04375, 0.021875, 0.0109375, 0.00546875 }) |step| {
-            self.evaluate(.{ .seed = 8, .coord = 1, .step = step }, singleton);
-            self.evaluate(.{ .seed = 8, .coord = 1, .step = -step }, singleton);
+        for ([_]f32{ 0.04375, 0.021875, 0.0109375, 0.00546875 }, 0..) |step, j| {
+            self.coordinatePair(singleton, 1, step, j > 0);
         }
     }
     pub fn candidate(self: *Model, patterns: gpu.Buf, phase: u32, dc: f32, seed: bool) void {
@@ -179,9 +191,13 @@ pub const Model = struct {
     // controller projects into raw with Detector.project. Raw and blur-cache
     // invalidation form one operation even if the next theta has the same sigma.
     pub fn profileRawChanged(self: *Model, k: u32) void {
-        std.debug.assert(self.fit.n == 1 and self.contrast and k > 0 and k <= 4);
+        std.debug.assert(self.contrast and k > 0 and k <= 4);
         self.k = k;
-        self.g.writeSlice(self.cells, 65 * 4, f32, &.{-1});
+        if (self.fit.n == 1) {
+            self.g.writeSlice(self.cells, 65 * 4, f32, &.{-1});
+        } else {
+            self.run("invalidate_sigma", .{}, &.{self.cells.at(5)}, false);
+        }
         self.run("validate", .{}, &.{ self.raw.at(1), self.cells.at(5) }, false);
         self.centerRaw();
     }
@@ -190,10 +206,38 @@ pub const Model = struct {
     /// Both its state and its normalized columns belong to this particular pose.
     pub fn profileFixedTheta(self: *Model, theta: Theta) void {
         self.g.writeSlice(self.cells, 24 * 4, f32, &theta);
+        self.fixedWarmTheta();
+    }
+
+    fn fixedWarmTheta(self: *Model) void {
         self.run("propose", .{ .seed = 1 }, &.{ self.cells.at(5), self.trial.state.at(6), self.fit.state.at(8), self.fit.progress.at(9) }, false);
         self.transform(false);
         self.trial.contrast = true;
         self.trial.nuisanceTrial(false, self.k);
+    }
+
+    fn optimizePrimaryTheta(self: *Model) void {
+        self.single_column = 0;
+        self.optimize(true);
+        self.run("store_fixed_single", .{}, &.{ self.cells.at(5), self.best.at(7) }, false);
+        // K1 uses its own singleton seed in every unoccupied slot.
+        self.run("share_primary_theta", .{}, &.{self.cells.at(5)}, false);
+        self.optimize(false);
+    }
+
+    /// Independent singleton seeds start with identity theta. Launch each
+    /// trial across the batch with one independent reduction per detector pattern.
+    pub fn singletonSeeds(self: *Model, fixed_states: []overlap.State, optimized_states: []overlap.State, theta: []Theta) void {
+        std.debug.assert(self.fit.n > 1);
+        self.profileRawChanged(1);
+        self.fixedWarmTheta();
+        self.trial.read(fixed_states);
+        if (self.optimize_enabled) {
+            self.optimizePrimaryTheta();
+            self.run("read_theta", .{ .mode = 1 }, &.{ self.cells.at(5), self.theta.at(12) }, false);
+            self.g.read(self.best, 0, std.mem.sliceAsBytes(optimized_states));
+            self.g.read(self.theta, 0, std.mem.sliceAsBytes(theta));
+        }
     }
 
     /// Full V4 bounded shared-theta search at a new support or at the final
@@ -204,26 +248,13 @@ pub const Model = struct {
         if (full) {
             self.g.writeSlice(self.cells, 32 * 4, Theta, &singles);
             self.g.writeSlice(self.cells, 90 * 4, Theta, &singles);
-            if (self.k == 1) {
-                self.single_column = 0;
-                self.optimize(true);
-                self.run("store_fixed_single", .{ .coord = 0 }, &.{ self.cells.at(5), self.best.at(7) }, false);
-                // The discovery K1 joint search uses its proposed singleton in
-                // every otherwise-unoccupied seed slot. Copy through a different
-                // buffer, since WebGPU disallows same-buffer copies.
-                self.g.copy(self.cells, 90 * 4, self.theta, 0, 7 * 4);
-                for (1..4) |j| self.g.copy(self.theta, 0, self.cells, (90 + j * 7) * 4, 7 * 4);
-                self.g.copy(self.cells, 32 * 4, self.theta, 0, 7 * 4);
-                for (1..4) |j| self.g.copy(self.theta, 0, self.cells, (32 + j * 7) * 4, 7 * 4);
-            }
-            self.optimize(false);
+            if (self.k == 1) self.optimizePrimaryTheta() else self.optimize(false);
         } else {
             self.run("reset_search", .{}, &.{ self.cells.at(5), self.best.at(7), self.fit.state.at(8) }, false);
             self.evaluate(.{ .seed = 1 }, false);
             const steps: Theta = .{ 0.375, 0.04375, 0.5, 0.05, 0.05, 0.015, 0.015 };
             for (steps, 0..) |step, j| {
-                self.evaluate(.{ .seed = 8, .coord = @intCast(j), .step = step }, false);
-                self.evaluate(.{ .seed = 8, .coord = @intCast(j), .step = -step }, false);
+                self.coordinatePair(false, @intCast(j), step, j > 1);
             }
         }
     }

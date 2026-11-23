@@ -1456,12 +1456,19 @@ function drawMapOverlay() {
   $("show-fit").closest("label").dataset.off = fitStep ? "0" : "1";
   if ($("show-fit").checked && fitStep) {
     const cells = st.fit ? st.fit.cells : fitLattice();
-    // (a few fit patterns are rings; a dense lattice, the plane's, a light dotting that leaves the map legible)
     const spacing = Math.sqrt((rows * cols) / Math.max(cells.length, 1));
     const dense = cells.length > 150;
-    const rad = dense ? Math.min(1.8 * u, 0.25 * spacing) : 3.5 * u;
+    const rad = dense ? Math.min(2.3 * u, 0.29 * spacing) : 5 * u;
+    const red = "#ff474d", outline = "#160b0b";
     for (const c of cells) {
-      over.append(svg("circle", { cx: (c % cols) + 0.5, cy: Math.floor(c / cols) + 0.5, r: rad, fill: st.fit ? "#7fbf6e" : "none", "fill-opacity": dense ? 0.75 : 1, stroke: dense ? "none" : st.fit ? "#0a0a0b" : "#9d9da4", "stroke-width": u }));
+      const marker = { cx: (c % cols) + 0.5, cy: Math.floor(c / cols) + 0.5, r: rad };
+      if (st.fit) {
+        over.append(svg("circle", { ...marker, fill: red, stroke: outline, "stroke-width": dense ? Math.min(0.7 * u, rad / 2) : 1.5 * u }));
+      } else {
+        const ring = (stroke, width) => svg("circle", { ...marker, fill: "none", stroke, "stroke-width": width });
+        const width = dense ? Math.min(u, rad / 2) : 2 * u;
+        over.append(ring(outline, 2 * width), ring(red, width));
+      }
     }
   }
   if (st.cell >= 0) {
@@ -2639,6 +2646,10 @@ function updateWiring() {
   // the arrow keys step the selection
   const surfaces=[{canvas:$("map"),well:$("map-well")},{canvas:$("overlap-map-canvas"),well:$("overlap-map-well")}];
   let gestureSurface=surfaces[0];
+  const selectMapCell = (surface,cell) => {
+    if(overlapUI?.active && surface)overlapUI.inspectMap(surfaces.indexOf(surface),cell);
+    selectCell(cell);
+  };
   for(const {well} of surfaces) {
     well.addEventListener("wheel", (e) => {
       if (!st.scan) return;
@@ -2663,7 +2674,7 @@ function updateWiring() {
     const { rows, cols } = st.scan;
     const k = e.shiftKey ? 10 : 1;
     const r = Math.max(0, Math.min(rows - 1, Math.floor(st.cell / cols) + k * d[0])), c = Math.max(0, Math.min(cols - 1, (st.cell % cols) + k * d[1]));
-    if (r * cols + c !== st.cell) selectCell(r * cols + c);
+    if (r * cols + c !== st.cell) selectMapCell(surfaces.find(({well})=>well.contains(t)), r * cols + c);
   });
   for(const [i,{canvas:map,well}] of surfaces.entries()) {
     map.addEventListener("dblclick", resetZoom);
@@ -2679,7 +2690,7 @@ function updateWiring() {
         return;
       }
       st.drag = { x: e.clientX, y: e.clientY, cx: st.view.cx, cy: st.view.cy, moved: false, pan: st.view.k > 1.0001 };
-      if (!st.drag.pan && p) { if(overlapUI?.active)overlapUI.inspectMap(i,p.cell);selectCell(p.cell); }
+      if (!st.drag.pan && p) selectMapCell(gestureSurface,p.cell);
       e.preventDefault();
     });
     map.addEventListener("mousemove", (e) => {
@@ -2703,7 +2714,7 @@ function updateWiring() {
         layoutMap();
       } else if (!d.pan) {
         const p = mapCellAt(e,map);
-        if (p && p.cell !== st.cell) selectCell(p.cell);
+        if (p && p.cell !== st.cell) selectMapCell(gestureSurface,p.cell);
       }
     }
     if (st.roiDrag) {
@@ -2716,7 +2727,7 @@ function updateWiring() {
     const d = st.drag;
     st.drag = null;
     well.dataset.pan = "0";
-    if (d && d.pan && !d.moved) { const p = mapCellAt(e,map); if (p) { if(overlapUI?.active)overlapUI.inspectMap(surfaces.indexOf(gestureSurface),p.cell);selectCell(p.cell); } }
+    if (d && d.pan && !d.moved) { const p = mapCellAt(e,map); if (p) selectMapCell(gestureSurface,p.cell); }
     const roi = st.roiDrag;
     if (!roi) return;
     st.roiDrag = null;

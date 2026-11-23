@@ -1,4 +1,4 @@
-import { METRICS, MAPS, metricValue, passesFilter, mapDescription, weightMetricKey, acceptsPrimary, acceptsResidual, gainProfile } from "./overlap-metrics.js";
+import { METRICS, MAPS, metricValue, passesFilter, mapDescription, weightMetricKey, acceptsPrimary, acceptsFitComponent, acceptsResidual, gainProfile } from "./overlap-metrics.js";
 import { drawGray, drawSigned, quantiles, viridis, download } from "./draw.js";
 
 const $ = id => document.getElementById(id);
@@ -6,6 +6,9 @@ const COLORS = ["#3b82f6", "#f59e0b", "#10b981", "#ef4444", "#8b5cf6", "#14b8a6"
 const STOP = ["Running", "Component limit", "Residual exhausted", "No proposal", "Unresolved addition", "Boundary fit", "Missing primary", "Flat pattern", "Attempt limit", "Invalid target", "Stale primary", "Residual screened", "Replacement limit", "Insufficient ΔSSE"];
 const IGNORE = new Set(["batch", "tile_mb", "refine_pixels", "wg_fft", "wg_refine", "ipf_colors", "ipf_lightness", "ipf_gray", "roi_x", "roi_y", "roi_w", "roi_h"]);
 const PRIMARY_MAP_DESCRIPTION = "Original indexed primary with a current stored seed and NCC at or above the primary minimum.";
+const RESIDUAL_MAP_LABEL = "First accepted residual component";
+const RESIDUAL_MAP_DESCRIPTION = "Shows the first component in fit order found by residual indexing that passes the display thresholds at each pixel.";
+const FIT_COMPONENT_MAP_DESCRIPTION = "Shows this component in the final fit, including original primary orientations retained by the fit.";
 const value = x => Number.isFinite(x) ? x.toFixed(4) : "—";
 
 export function roiCells(scan, settings) {
@@ -31,6 +34,7 @@ export function profileEventsForExport(events, cells) {
 /** Separate client-side result ownership. A completed tile is the commit unit. */
 export function createOverlap({ st, busy, runPrimary, selectTab, redraw, status, log, renderIpfKey, inspectPrimary }) {
   let active = false, run = null, launching = false, inspectSerial = 0, lastRanges = [[0,1],[0,1]], primaryColors=null;
+  let ipfKind = "ipf_z";
   const ordinaryMapTitle = $("map-well").title;
   const filterState = () => ({key:$("overlap-filter-metric").value,operator:"min",cutoff:$("overlap-filter-value").valueAsNumber});
   const primaryCutoff = () => $("overlap-primary-cutoff").valueAsNumber;
@@ -68,18 +72,21 @@ export function createOverlap({ st, busy, runPrimary, selectTab, redraw, status,
   const mapSelect = i => $(i ? "overlap-map-2" : "overlap-map");
   const componentSelect = i => $(i ? "overlap-map-component-2" : "overlap-map-component");
   const mapSource = i => componentSelect(i).value;
-  const mapSlot = i => +mapSource(i)-1;
   const primaryMap = i => mapSource(i)==="primary";
   const mapComponent = (source,cell,cutoff=residualCutoff(),filter=filterState()) => {
     if(!run?.completed[cell])return -1;
     if(source!=="residual") {
       const component = +source-1;
-      return visible(cell,component,cutoff,filter)?component:-1;
+      return acceptsFitComponent(run,cell,component) && passesFilter(run,cell,component,filter)?component:-1;
     }
     for(let component=0;component<run.k;component++)if(visible(cell,component,cutoff,filter))return component;
     return -1;
   };
-  const describeMap = i => primaryMap(i) ? PRIMARY_MAP_DESCRIPTION : mapDescription(mode(i),mapSlot(i),run);
+  const describeMap = i => {
+    if(primaryMap(i))return PRIMARY_MAP_DESCRIPTION;
+    if(mapSource(i)!=="residual" && mode(i)==="proposal_ncc")return METRICS.proposal_ncc.description;
+    return mapDescription(mode(i),-1,run);
+  };
   const mode = (i=0) => mapSelect(i).value;
   const colorContext = () => JSON.stringify([st.settings.ipf_colors,st.settings.ipf_lightness,st.settings.ipf_gray]);
   const clearCanvas = id => { const c = $(id); c.width = c.height = 1; c.getContext("2d").clearRect(0, 0, 1, 1); };
@@ -112,10 +119,16 @@ export function createOverlap({ st, busy, runPrimary, selectTab, redraw, status,
       const map = choice!==$("overlap-component");
       const old=choice.value;
       if (choice.options.length !== k+(map?2:1)) {
-        const sources = [new Option("Primary","primary")];
-        if(map)sources.push(new Option("Residual","residual"));
-        choice.replaceChildren(...sources,...Array.from({length:k}, (_,i) => new Option(`${map?"Residual slot":"Fit slot"} ${i+1}`,String(i+1))));
+        const sources = [new Option("Original primary","primary")];
+        if(map)sources.push(new Option(RESIDUAL_MAP_LABEL,"residual"));
+        choice.replaceChildren(...sources,...Array.from({length:k}, (_,i) => new Option(`Fit component ${i+1}`,String(i+1))));
         choice.value=sources.some(s=>s.value===old) || (+old>=1 && +old<=k)?old:choice===componentSelect(1)?"residual":"primary";
+      }
+      if(map) {
+        for(const option of choice.options) {
+          option.title=option.value==="primary"?PRIMARY_MAP_DESCRIPTION:option.value==="residual"?RESIDUAL_MAP_DESCRIPTION:FIT_COMPONENT_MAP_DESCRIPTION;
+        }
+        choice.title=choice.selectedOptions[0]?.title || "";
       }
     }
     $("overlap-readout").textContent = !run ? "" : `${fresh() ? run.state : "Context changed"} · ${run.completedCount.toLocaleString()} / ${run.requested.length.toLocaleString()} cells\n${run.fittedCount.toLocaleString()} candidate fits${run.unseededCount ? ` · ${run.unseededCount.toLocaleString()} missing primary` : ""}`;
@@ -123,15 +136,16 @@ export function createOverlap({ st, busy, runPrimary, selectTab, redraw, status,
       const source=mapSource(1), cutoff=residualCutoff(),filter=filterState();
       let shown=0;
       for(const cell of run.requested)if(mapComponent(source,cell,cutoff,filter)>=0)shown++;
-      $("overlap-readout").textContent+=`\n${shown.toLocaleString()} shown`;
+      $("overlap-readout").textContent+=`\n${shown.toLocaleString()} shown in right map`;
     }
     for(let i=0;i<2;i++) {
-      const primary=primaryMap(i),desc=describeMap(i),select=mapSelect(i);
+      const primary=primaryMap(i),select=mapSelect(i);
       for(const option of select.options)option.disabled=primary && !["ipf_x","ipf_y","ipf_z","phase","proposal_ncc"].includes(option.value);
-      if(primary && select.selectedOptions[0]?.disabled)select.value="ipf_z";
+      if(primary && select.selectedOptions[0]?.disabled)select.value=ipfKind;
+      const desc=describeMap(i);
       select.title=desc;$(i?"overlap-map-legend":"map-legend").title=desc;
       const searchOption=select.querySelector('option[value="proposal_ncc"]');
-      if(searchOption)searchOption.textContent=primary?"Primary NCC":"Residual source NCC";
+      if(searchOption)searchOption.textContent=primary?"Primary NCC":mapSource(i)==="residual"?"Residual source NCC":"Source NCC";
     }
     $("overlap-progress").hidden = !st.busy || !run || run.state !== "Running";
     $("overlap-progress").value = run ? run.completedCount / Math.max(1, run.requested.length) : 0;
@@ -140,7 +154,7 @@ export function createOverlap({ st, busy, runPrimary, selectTab, redraw, status,
   function newRun(k, requested, keepN, minStageImprovement) {
     const settings = structuredClone(st.ze.settings);
     return { k, requested, context: context(), colorContext:colorContext(), state: "Running", completedCount: 0, fittedCount:0, unseededCount:0,
-      completed: new Uint8Array(st.scan.rows * st.scan.cols), arrays: {}, rgba: {}, profileEvents: {},
+      completed: new Uint8Array(st.scan.rows * st.scan.cols), arrays: {}, rgba: {}, sourceRgba: {}, profileEvents: {},
       metadata: {schema:"zebsdsolve-overlap-candidates-v1", model:null, keep_n:keepN, blur_gain:$("overlap-blur-gain").checked, assessment:"unassessed_candidates",
         primary_ncc_minimum:primaryCutoff(), primary_snapshot:identity(st.results), orientation_polish:$("overlap-polish").checked, min_residual_ncc:$("overlap-screen").checked?$("overlap-screen-value").valueAsNumber:null,
         requested_min_stage_improvement:structuredClone(minStageImprovement), component_axis:"stable discovery order", stop_reasons:STOP, engine_version:st.ze.version, seed_source_roi:null, scan_name:st.scanName, quaternion_convention:"wxyz, sample to crystal", geometry:structuredClone(st.ze.geometry),
@@ -175,13 +189,21 @@ export function createOverlap({ st, busy, runPrimary, selectTab, redraw, status,
       }
       updates.push([target.arrays[key],array]);
     }
-    const colors = {};
-    for (const axis of ["x", "y", "z"]) colors[axis] = st.ze.orientationColors(result.source_quaternions || result.quaternions, result.phase, axis);
+    const colors = {}, sourceColors = {};
+    const separateSource = target.metadata.orientation_polish && result.source_quaternions;
+    for (const axis of ["x", "y", "z"]) {
+      colors[axis] = st.ze.orientationColors(result.quaternions, result.phase, axis);
+      if(separateSource)sourceColors[axis]=st.ze.orientationColors(result.source_quaternions,result.phase,axis);
+    }
     if(seedROI)target.metadata.seed_source_roi=seedROI;
     for (const [field,array] of updates) cells.forEach((cell,i) => field.values.set(array.subarray(i*field.stride,(i+1)*field.stride),cell*field.stride));
     for (const axis of ["x", "y", "z"]) {
       target.rgba[axis] ||= new Uint8ClampedArray(total * target.k * 4);
       cells.forEach((cell,i) => target.rgba[axis].set(colors[axis].subarray(i*target.k*4,(i+1)*target.k*4),cell*target.k*4));
+      if(separateSource) {
+        target.sourceRgba[axis] ||= new Uint8ClampedArray(total * target.k * 4);
+        cells.forEach((cell,i) => target.sourceRgba[axis].set(sourceColors[axis].subarray(i*target.k*4,(i+1)*target.k*4),cell*target.k*4));
+      }
     }
     if(result.profile_events){
       for(const cell of cells)target.profileEvents[cell]=[];
@@ -255,7 +277,10 @@ export function createOverlap({ st, busy, runPrimary, selectTab, redraw, status,
     if(primaryMap(i)) { drawPrimary(canvas,i);return; }
     if (!run || run.completed.length !== n || !fresh()) return;
     if(run.colorContext!==colorContext() && !st.busy) {
-      for(const axis of ["x","y","z"])run.rgba[axis]=st.ze.orientationColors((run.arrays.source_quaternions||run.arrays.quaternions).values,run.arrays.phase.values,axis);
+      for(const axis of ["x","y","z"]) {
+        run.rgba[axis]=st.ze.orientationColors(run.arrays.quaternions.values,run.arrays.phase.values,axis);
+        if(run.metadata.orientation_polish && run.arrays.source_quaternions)run.sourceRgba[axis]=st.ze.orientationColors(run.arrays.source_quaternions.values,run.arrays.phase.values,axis);
+      }
       run.colorContext=colorContext();
     }
     const kind = mode(i), source=mapSource(i),cutoff=residualCutoff(),filter=filterState(),ctx = canvas.getContext("2d"), image = ctx.createImageData(cols, rows);
@@ -270,7 +295,8 @@ export function createOverlap({ st, busy, runPrimary, selectTab, redraw, status,
       const at = cell*4, slot = cell*run.k + component;
       let color;
       if (kind.startsWith("ipf_")) {
-        color = run.rgba[kind.slice(-1)]?.subarray(slot*4,slot*4+4);
+        const axis=kind.slice(-1), rgba=source==="residual"?run.sourceRgba[axis]||run.rgba[axis]:run.rgba[axis];
+        color = rgba?.subarray(slot*4,slot*4+4);
         if (!color?.[3]) continue;
       } else if (kind === "phase") {
         const phase = run.arrays.phase?.values[slot];
@@ -314,7 +340,7 @@ export function createOverlap({ st, busy, runPrimary, selectTab, redraw, status,
     if (box.hidden) return;
     if(!primary && !fresh()){box.textContent="Context changed";return;}
     const title = document.createElement("span");
-    title.textContent = (primary?"Primary · ":"Residual source · ")+mapSelect(i).selectedOptions[0].textContent + (mode(i) === "fraction" ? " · 0–100%" : "");
+    title.textContent = (primary?"Original primary · ":mapSource(i)==="residual"?"Residual source · ":`Fit component ${mapSource(i)} · `)+mapSelect(i).selectedOptions[0].textContent + (mode(i) === "fraction" ? " · 0–100%" : "");
     box.append(title);
     if(["fraction","proposal_ncc","mixture_ncc","count","proposals","residual","improvement","single_improvement","condition"].includes(mode(i))) {
       const scale=document.createElement("span");scale.className="overlap-scale";box.append(scale);
@@ -333,18 +359,23 @@ export function createOverlap({ st, busy, runPrimary, selectTab, redraw, status,
   }
 
   function drawGain(cell,w,h,originalPrimary=false) {
-    const gainValue=x=>Number.isFinite(x)?x.toPrecision(7):"—";
-    $("overlap-gain-panel").hidden=true;
-    if(!fresh() || !run.completed[cell] || !run.metadata.blur_gain || run.arrays.objective_valid?.values[cell]!==1)return;
+    if(!fresh() || !run.completed[cell] || run.arrays.objective_valid?.values[cell]!==1)return;
+    if(!run.metadata.blur_gain) {
+      $("overlap-gain-empty").textContent="Fit disabled";
+      return;
+    }
     const theta=run.arrays.blur_gain_theta?.values.subarray(cell*7,cell*7+7),gain=gainProfile(theta,w,h);
     if(!gain)return;
-    $("overlap-gain-panel").hidden=false;
+    const canvas=$("overlap-gain"), lo=gain.min===gain.max?0:gain.min;
+    canvas.hidden=false;
+    $("overlap-gain-empty").hidden=true;
     // A constant envelope uses a range anchored at zero to avoid a false black image.
-    drawGray($("overlap-gain"),gain.values,w,h,{lo:gain.min===gain.max?0:gain.min,hi:gain.max});
-    $("overlap-gain-range").textContent=`G ${gainValue(gain.min)} – ${gainValue(gain.max)} · σ ${value(gain.sigma)} px`;
-    $("overlap-gain").dataset.theta=JSON.stringify(Array.from(theta));
-    $("overlap-gain").dataset.range=JSON.stringify([gain.min,gain.max]);
-    $("overlap-gain-panel").title=`Frozen fitted mixture gain G(x,y), black ${gainValue(gain.min===gain.max?0:gain.min)}, white ${gainValue(gain.max)}. Edge G = 1. Applied to each fitted blurred, zero-mean simulation; ${originalPrimary?"The original primary simulation above is unchanged.":"The fitted reconstruction above includes this gain."} Gaussian σ = ${value(gain.sigma)} effective fit pixels is applied separately to fitted simulations, never to this gain image.`;
+    drawGray(canvas,gain.values,w,h,{lo,hi:gain.max});
+    $("overlap-gain-range").textContent=` · ${gain.min.toFixed(2)}–${gain.max.toFixed(2)}× · σ ${gain.sigma.toFixed(2)} px`;
+    canvas.dataset.theta=JSON.stringify(Array.from(theta));
+    canvas.dataset.range=JSON.stringify([gain.min,gain.max]);
+    const view=originalPrimary?"Select a fitted component to see it with this gain and blur.":"The displayed fit includes this gain and blur.";
+    $("overlap-gain-panel").title=`Shared fitted gain. Black = ${lo.toPrecision(7)}×, white = ${gain.max.toPrecision(7)}×. Edge gain = 1. Gaussian blur σ = ${value(gain.sigma)} effective fit pixels is applied to each simulation before gain. ${view}`;
   }
 
   function stageStop(cell) {
@@ -361,8 +392,15 @@ export function createOverlap({ st, busy, runPrimary, selectTab, redraw, status,
     const serial = ++inspectSerial;++st.showRun;
     $("pat-cell").textContent = st.scan ? `row ${Math.floor(cell/st.scan.cols)}, col ${cell%st.scan.cols}` : "pattern";
     const table = $("overlap-components"); table.replaceChildren();
-    for (const id of ["overlap-target", "overlap-simulation", "overlap-residual"]) clearCanvas(id);
-    $("overlap-facts").replaceChildren();$("overlap-gain-panel").hidden=true;
+    for (const id of ["overlap-target", "overlap-simulation", "overlap-residual", "overlap-gain"]) clearCanvas(id);
+    $("overlap-facts").replaceChildren();
+    $("overlap-gain").hidden=true;
+    delete $("overlap-gain").dataset.theta;
+    delete $("overlap-gain").dataset.range;
+    $("overlap-gain-empty").hidden=false;
+    $("overlap-gain-empty").textContent="Unavailable";
+    $("overlap-gain-panel").title="";
+    $("overlap-gain-range").textContent="";
     const fallback=async()=>{
       if(serial!==inspectSerial)return;
       const seed=primarySeed(cell);
@@ -390,9 +428,17 @@ export function createOverlap({ st, busy, runPrimary, selectTab, redraw, status,
       const [h,w]=st.ze.shape(st.settings.binning!==1 && st.settings.full_resolution==="all");
       drawGain(cell,w,h,true);
     };
+    const inspector=$("overlap-component");
+    const fitCurrent=run?.completed[cell] && fresh();
+    const hasFit=j=>fitCurrent && acceptsFitComponent(run,cell,j);
+    for (const option of inspector.options) option.disabled=option.value!=="primary" && !hasFit(+option.value-1);
+    if (selected()>=0 && !hasFit(selected())) {
+      const residual=fitCurrent?mapComponent("residual",cell):-1;
+      const retained=Array.from(inspector.options).find(option=>option.value!=="primary" && !option.disabled);
+      inspector.value=hasFit(residual)?String(residual+1):retained?.value ?? "primary";
+    }
     $("pats").hidden=true;$("overlap-pats").hidden=false;$("overlap-pattern-control").hidden=selected()<0;
-    const slot=cell*(run?.k||1)+selected(), retainedFit=run?.completed[cell] && run.arrays.phase?.values[slot]>=0 && run.arrays.objective_valid?.values[cell]!==0;
-    if(selected()<0 || (!visible(cell) && !retainedFit && primaryVisible(cell))) { if(!st.busy && !st.gpuLost)await fallback();return; }
+    if(selected()<0) { if(!st.busy && !st.gpuLost)await fallback();return; }
     if (!run?.completed[cell] || !fresh() || st.busy || st.gpuLost) {
       $("overlap-point-status").textContent = !run?.completed[cell] ? "Uncomputed" : !fresh() ? "Context changed" : st.gpuLost ? "GPU unavailable" : "Running";
       if(primaryVisible(cell))await fallback();return;
@@ -401,17 +447,19 @@ export function createOverlap({ st, busy, runPrimary, selectTab, redraw, status,
     for (let j=0; j<k; j++) {
       const slot=cell*k+j, phase=get("phase")?.[slot], row=document.createElement("tr"), button=document.createElement("button");
       button.type="button"; button.textContent=String(j+1); button.setAttribute("aria-pressed",String(j===component));
-      button.addEventListener("click",()=>{$("overlap-component").value=String(j+1);$("overlap-inspection").value="component";redraw();showCell(cell);});
+      button.disabled=!hasFit(j);
+      button.addEventListener("click",()=>{if(button.disabled)return;inspector.value=String(j+1);$("overlap-inspection").value="component";redraw();showCell(cell);});
       const rank=get("winner_rank")?.[slot];
-      button.title=`Fit ${j+1}: ${rank===0?"original primary source":rank>0?`residual source, candidate rank ${rank}`:"source unavailable"}. Pattern inspection uses the final joint-fit orientation; residual maps use its discovery orientation.`;
+      button.title=button.disabled?`No fitted component ${j+1} at this point.`:`Fit ${j+1}: ${rank===0?"original primary source":rank>0?`residual source, candidate rank ${rank}`:"source unavailable"}. The fit map and inspector use the final fitted orientation. The residual-source map uses its discovery orientation.`;
       const first=document.createElement("td"); first.append(button); row.append(first);
-      const amplitude=get("amplitudes")?.[slot], fraction=get(weightMetricKey(run))?.[slot];
+      const fraction=get(weightMetricKey(run))?.[slot];
       for (const text of [phase>=0 ? run.metadata.phases[phase]?.name || String(phase) : "—", phase>=0 && Number.isFinite(fraction) ? `${(100*fraction).toFixed(1)}%` : "—", phase >= 0 ? value(get("proposal_ncc")?.[slot]) : "—"]) { const td=document.createElement("td");td.textContent=text;td.title=row.children.length===2?METRICS[weightMetricKey(run)].description:row.children.length===3?METRICS.proposal_ncc.description:"Candidate phase assigned to this retained component.";row.append(td); }
-      if (!(amplitude>1e-6)) row.classList.add("inactive"); table.append(row);
+      if (button.disabled) row.classList.add("inactive"); table.append(row);
     }
 
     const stop=get("stop_reason")?.[cell];
-    $("overlap-point-status").textContent=stageStop(cell) ?? ((STOP[stop] || "Candidate fit")+(visible(cell)?"":" · Outside residual display acceptance"));
+    const residualInMixture=get("winner_rank")?.[cell*k+component]>0 && get("active_count")?.[cell]>=2;
+    $("overlap-point-status").textContent=stageStop(cell) ?? ((STOP[stop] || "Candidate fit")+(residualInMixture && !visible(cell)?" · Hidden by residual map filters":""));
     for (const [label,key] of [["Mixture NCC","mixture_ncc"],["Residual SSE","sse"],["Incremental ΔSSE","incremental_improvement"],["ΔSSE over single","improvement_over_best_single"],["Condition ratio","relative_gram_condition"],["Active fits","active_count"]]) {
       const dt=document.createElement("dt"),dd=document.createElement("dd");dt.textContent=label;dd.textContent=key==="active_count"?String(get(key)?.[cell]??"—"):value(get(key)?.[cell]);dt.title=dd.title=key==="active_count"?mapDescription("count",selected(),run):METRICS[key]?.description||MAPS.count.description;$("overlap-facts").append(dt,dd);
     }
@@ -429,7 +477,10 @@ export function createOverlap({ st, busy, runPrimary, selectTab, redraw, status,
       const images=await st.ze.overlapInspect(cell,result,cell,component);
       if (!active || serial!==inspectSerial || !fresh() || st.cell!==cell) return;
       const [h,w]=images.shape, individual=$("overlap-inspection").value==="component";
-      const target=individual?images.conditional:images.measured, simulation=individual?images.selected_contribution:images.composite;
+      // Native inspection replays the saved nuisance parameters before applying
+      // the fitted amplitudes. Display that contribution in the target's units.
+      const target=individual?images.conditional:images.measured;
+      const simulation=individual?images.selected_contribution:images.composite;
       const pair=new Float32Array(target.length+simulation.length);pair.set(target);pair.set(simulation,target.length);
       const [lo,hi]=quantiles(pair,.005,.995);
       drawGray($("overlap-target"),target,w,h,{lo,hi});drawGray($("overlap-simulation"),simulation,w,h,{lo,hi});
@@ -459,7 +510,7 @@ export function createOverlap({ st, busy, runPrimary, selectTab, redraw, status,
   $("btn-overlap-export").addEventListener("click",exportRun);
   for(const key of ["prepared_fractions","improvement_over_best_single"]){const m=METRICS[key],option=new Option(m.label,key);option.title=m.description;if(key==="prepared_fractions")option.dataset.weight="";$("overlap-filter-metric").append(option);}
   for(let i=0;i<2;i++)for(const option of mapSelect(i).options)option.title=MAPS[option.value]?.description||"";
-  $("overlap-filter-metric").title="Additional display minimum for residual sources.";
+  $("overlap-filter-metric").title="Filters the numbered fit maps and the residual map.";
   $("overlap-filter-value").title="Inclusive minimum for the selected display metric. NCC and ΔSSE are dimensionless; model weight or contrast share is in percent.";
   const updateFilter = reset => {
     const m=METRICS[$("overlap-filter-metric").value],input=$("overlap-filter-value");input.disabled=!m;
@@ -470,27 +521,35 @@ export function createOverlap({ st, busy, runPrimary, selectTab, redraw, status,
   $("overlap-filter-metric").addEventListener("change",()=>updateFilter(true));
   $("overlap-filter-value").addEventListener("input",()=>updateFilter(false));
   for(const id of ["overlap-primary","overlap-limit","overlap-keep-n","overlap-blur-gain","overlap-polish","overlap-screen","overlap-screen-value","overlap-stage-2","overlap-stage-3","overlap-stage-4"])$(id).addEventListener("change",()=>{sync();redraw();if(active)showCell(st.cell);});
-  for(const id of ["overlap-component","overlap-map","overlap-map-2","overlap-map-component","overlap-map-component-2"])$(id).addEventListener("change",()=>{sync();redraw();if(active)showCell(st.cell);});
+  const updateView = () => {sync();redraw();if(active)showCell(st.cell);};
+  for(const id of ["overlap-component","overlap-map-component","overlap-map-component-2"])$(id).addEventListener("change",updateView);
+  for(let i=0;i<2;i++)mapSelect(i).addEventListener("change",()=>{
+    if(mode(i).startsWith("ipf_")) {
+      ipfKind=mode(i);
+      if(mode(1-i).startsWith("ipf_"))mapSelect(1-i).value=ipfKind;
+    }
+    updateView();
+  });
   $("overlap-inspection").addEventListener("change",()=>showCell(st.cell));
   return {get active(){return active;},get result(){return run;},sync,drawMap,drawLegend,showCell,
     inspectMap(i,cell){
       const source=mapSource(i);
       const component=source==="residual" && fresh()?mapComponent(source,cell):-1;
       $("overlap-component").value=source==="residual"?(component>=0?String(component+1):"primary"):source;
-      sync();redraw();
     },
     hover(cell,i=0){
       if(primaryMap(i)) {
         const seed=primarySeed(cell);
-        return seed?`Primary · NCC ${value(st.results.ncc[cell])}${primaryVisible(cell,seed)?"":" · Below primary minimum"}`:"Primary unavailable";
+        return seed?`Original primary · NCC ${value(st.results.ncc[cell])}${primaryVisible(cell,seed)?"":" · Below primary minimum"}`:"Primary unavailable";
       }
       if(!run?.completed[cell])return "Uncomputed";if(!fresh())return "Context changed";
-      if(run.arrays.active_count?.values[cell]<2)return "No multi-component fit";
-      const component=mapComponent(mapSource(i),cell);
-      if(component<0)return "No accepted residual source";
+      const source=mapSource(i);
+      if(source==="residual" && run.arrays.active_count?.values[cell]<2)return "No multi-component fit";
+      const component=mapComponent(source,cell);
+      if(component<0)return source==="residual"?"No accepted residual source":`No visible fit component ${source}`;
       const f=metricValue(run,cell,component,weightMetricKey(run))/100,info=MAPS[mode(i)],field=run.arrays[info?.field||mode(i)];
       const reading=field?.values[cell*field.stride+(field.stride===run.k?component:0)];
-      return `Residual source slot ${component+1}${Number.isFinite(f)?` · ${(100*f).toFixed(1)}%`:""}${mode(i)!=="fraction" && Number.isFinite(reading)?` · ${mapSelect(i).selectedOptions[0].textContent} ${value(reading)}`:""}`;
+      return `Fit component ${component+1}${Number.isFinite(f)?` · ${(100*f).toFixed(1)}%`:""}${mode(i)!=="fraction" && Number.isFinite(reading)?` · ${mapSelect(i).selectedOptions[0].textContent} ${value(reading)}`:""}`;
     },
     activate(on){active=on;++inspectSerial;++st.showRun;if(!on)$("map-well").title=ordinaryMapTitle;$("pats").hidden=on;$("overlap-pats").hidden=!on;$("overlap-pattern-control").hidden=!on;$("map-kind").hidden=on;$("overlap-map-control").hidden=!on;$("overlap-map-view").hidden=!on;sync();redraw();if(st.cell>=0){if(on)showCell(st.cell);}},
   };
