@@ -755,8 +755,8 @@ class Solver:
         is not a calibrated confidence threshold. Rejected proposals are retained
         in profile_events. Both controls are off by default, preserving V4/V5.
 
-        All stages must use the same resolution: binning=1, full_resolution='none',
-        or full_resolution='all'. Residuals stay signed and bypass all nonlinear
+        All stages must use the same resolution. Set binning=1 for stored pixels
+        or full_resolution='none' for reduced pixels. Residuals stay signed and bypass all nonlinear
         preprocessing. Start with small batches: the GPU moment solver is provisional.
         """
         profile = bool(polish) or min_residual_ncc is not None
@@ -1013,8 +1013,7 @@ class Solver:
             records[j].q[:]=result["quaternions"][row,j]
             records[j].phase=int(result["phase"][row,j])
             records[j].amplitude=float(result["amplitudes"][row,j])
-        full=self.settings["binning"]!=1 and self.settings["full_resolution"]=="all"
-        h,w=self.shape(full=full)
+        h,w=self.shape()
         images=np.empty((5,h,w),np.float32)
         fit_model=result.get("fit_model","source_dc_gain_v1")
         if fit_model not in ("contrast_gain_v1","source_dc_gain_v1"):

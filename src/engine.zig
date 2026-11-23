@@ -1016,7 +1016,6 @@ pub const Engine = struct {
             .none => .reduced,
             .scores => if (stage == .score) .full else .reduced,
             .refine => if (stage == .search) .reduced else .full,
-            .all => .full,
         };
     }
 
@@ -2364,7 +2363,7 @@ pub const Engine = struct {
         if (out.len != n * max_components or states.len != n or progress.len != n) return error.BadLength;
         if (self.phases.items.len == 0) return error.NoPhases;
         const lv = self.levelOf(.search);
-        if (self.levelOf(.refine) != lv or self.levelOf(.score) != lv) return error.OverlapRequiresSameResolutionUseFullResolutionNoneOrAll;
+        if (self.levelOf(.refine) != lv or self.levelOf(.score) != lv) return error.OverlapRequiresSameResolutionUseFullSizeForNothing;
         const info_ = try self.info();
         for (cells) |cell| if (cell >= @as(u64, info_.rows) * info_.cols) {
             return error.BadCell;
@@ -2702,7 +2701,7 @@ pub const Engine = struct {
         const info_ = try self.info();
         if (cell >= @as(u64, info_.rows) * info_.cols) return error.BadCell;
         const lv = self.levelOf(.search);
-        if (self.levelOf(.refine) != lv or self.levelOf(.score) != lv) return error.OverlapRequiresSameResolutionUseFullResolutionNoneOrAll;
+        if (self.levelOf(.refine) != lv or self.levelOf(.score) != lv) return error.OverlapRequiresSameResolutionUseFullSizeForNothing;
         const hw = try self.patternShape(lv);
         const px = @as(usize, hw[0]) * hw[1];
         if (out.len != 5 * px or px > 131072) return error.BadLength;

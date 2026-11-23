@@ -553,10 +553,12 @@ class NativeDiscovery(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.s.overlap_cells([0], max_components=k)
         self.assertEqual(self.s.overlap_cells([])['quaternions'].shape, (0,2,4))
-        # Explicitly supported all-full and all-reduced configurations.
-        for resolution in ['none', 'all']:
-            self.s.configure(binning=2, full_resolution=resolution)
-            self.assertEqual(self.s.overlap_cells([0], max_components=1)['phase'].shape, (1,1))
+        # Full-size and reduced fits both inspect at the resolution used for search.
+        for factor in [1, 2]:
+            self.s.configure(binning=factor, full_resolution='none')
+            result = self.s.overlap_cells([0], max_components=1)
+            self.assertEqual(result['phase'].shape, (1,1))
+            self.assertEqual(self.s.overlap_inspect(0, result)['residual'].shape, self.s.pattern_shape)
 
 
 if __name__ == '__main__':

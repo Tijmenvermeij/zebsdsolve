@@ -441,7 +441,7 @@ export function createOverlap({ st, busy, runPrimary, selectTab, redraw, status,
         displayFacts.push(facts[i].cloneNode(true));if(facts[i+1])displayFacts.push(facts[i+1].cloneNode(true));
       }
       $("overlap-facts").replaceChildren(...displayFacts);
-      const [h,w]=st.ze.shape(st.settings.binning!==1 && st.settings.full_resolution==="all");
+      const [h,w]=st.ze.shape();
       drawGain(cell,w,h,true);
     };
     const inspector=$("overlap-component");

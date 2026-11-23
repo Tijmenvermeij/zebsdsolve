@@ -245,8 +245,9 @@ stack is cached. The caller must freeze/validate result settings, geometry,
 acquisition and phase identity before inspection. Python equivalents are
 `orientation_colors(...)` and `overlap_inspect(cell, result, row, selected_component)`.
 
-All stages must use one effective resolution: `binning=1`,
-`full_resolution="none"` or `full_resolution="all"`; mixed levels fail up front.
+All stages must use one effective resolution. Set `binning=1` for stored
+pixels, or choose **Full size for → Nothing** (`full_resolution="none"`) with a
+reduction factor to use reduced pixels. Mixed levels fail up front.
 Patterns are bounded to 131,072 pixels (including the 256 × 311 Re acquisition). The four-component
 bank and state allocations are checked against device storage binding/buffer
 limits; use smaller batches for an oversized request. Moments use 64 lanes per
