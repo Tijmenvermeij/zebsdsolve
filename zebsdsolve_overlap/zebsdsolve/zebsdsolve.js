@@ -1464,9 +1464,12 @@ export class Zebsdsolve {
   /** Candidate overlap fit; flat arrays use [cell, discovery slot, quaternion].
    * Stored primary mode requires the exact current primary context. Missing cells
    * return stop_reason=6. Caller commits a batch only after successful resolution. */
-  overlapCells(cells, {maxComponents=2, primary="search",fitBlurGain=false,gainDomain="contrast",keepN=1,polish=false,minResidualNcc=null,minStageImprovement=null,polishRadiusDeg=1,residualBandwidth}={}) {
+  overlapCells(cells, {maxComponents=2, primary="search",fitBlurGain=false,gainDomain="contrast",keepN=1,polish=false,refitBlurGainAfterPolish=false,minResidualNcc=null,minStageImprovement=null,polishRadiusDeg=1,residualBandwidth}={}) {
     if(residualBandwidth!==undefined && (!Number.isInteger(residualBandwidth) || (residualBandwidth!==0 && (residualBandwidth<8 || residualBandwidth>256))))throw new RangeError("residualBandwidth must be 0 (primary) or an integer from 8 to 256");
     if(typeof polish!=="boolean")throw new RangeError("polish must be a boolean");
+    if(typeof refitBlurGainAfterPolish!=="boolean" || (refitBlurGainAfterPolish && (!polish || !fitBlurGain))){
+      throw new RangeError("Refitting blur/gain after polishing requires both polishing and blur/gain fitting");
+    }
     if(typeof polishRadiusDeg!=="number"||!Number.isFinite(polishRadiusDeg)||polishRadiusDeg<=0||polishRadiusDeg>5)throw new RangeError("polishRadiusDeg must be >0 and <=5 degrees");
     if(minResidualNcc!==null&&(typeof minResidualNcc!=="number"||!Number.isFinite(minResidualNcc)||minResidualNcc< -1||minResidualNcc>1))throw new RangeError("minResidualNcc must be null or finite in [-1,1]");
     const staged = minStageImprovement !== null;
@@ -1485,11 +1488,13 @@ export class Zebsdsolve {
     if(minResidualNcc!==null)minResidualNcc=Math.fround(minResidualNcc);
     polishRadiusDeg=Math.fround(polishRadiusDeg);
     const profile=polish||minResidualNcc!==null;
-    let selectionVersion = 1;
+    let profileVersion = 1, selectionVersion = 1;
     if(profile){
       if(gainDomain!=="contrast")throw new RangeError("overlap profiling requires contrast gain");
       if(!this.x.ze_overlap_cells_v6||!this.x.ze_overlap_profile_version||!this.x.ze_overlap_profile_trace_capacity)throw new Error("overlap profiling requires WASM V6 support; load a current module");
-      if(this.x.ze_overlap_profile_version()!==1)throw new Error("unsupported overlap profile version");
+      profileVersion = this.x.ze_overlap_profile_version();
+      if (![1, 2].includes(profileVersion)) throw new Error("unsupported overlap profile version");
+      if (polish && fitBlurGain && profileVersion < 2) throw new Error("Polishing with blur/gain requires an updated WASM module");
       selectionVersion = this.x.ze_overlap_profile_selection_version?.() ?? 1;
       if (![1, 2].includes(selectionVersion)) throw new Error("unsupported overlap selection version");
     }
@@ -1525,7 +1530,7 @@ export class Zebsdsolve {
           if(n&&(!Number.isSafeInteger(capacity)||capacity<=0))throw new Error("invalid V6 overlap trace capacity");
           const optionsSize = staged ? 28 : 16;
           const options=f.alloc(optionsSize),ov=new DataView(this.mem,options,optionsSize);
-          ov.setUint32(0,optionsSize,true);ov.setUint32(4,(polish?1:0)|(minResidualNcc!==null?2:0)|(selectionVersion===2?4:0),true);
+          ov.setUint32(0,optionsSize,true);ov.setUint32(4,(polish?1:0)|(minResidualNcc!==null?2:0)|(selectionVersion===2?4:0)|(refitBlurGainAfterPolish?8:0),true);
           ov.setFloat32(8,polishRadiusDeg,true);ov.setFloat32(12,minResidualNcc??0,true);
           if (staged) stageMinimum.forEach((v, i) => ov.setFloat32(16+4*i,v??0,true));
           const qp=f.alloc(n*k*16),ep=f.alloc(capacity*64),countp=f.alloc(4);
@@ -1549,7 +1554,7 @@ export class Zebsdsolve {
       Object.assign(out,overlapTrajectoryMetadata(out,new Uint8Array(this.mem,mp,n*32),keepN,k,trajectoryVersion));
       if(profile){
         const pv=new DataView(this.mem,mp,n*32);
-        Object.assign(out,{profile_version:1,selection_version:selectionVersion,orientation_polish:polish,polish_radius_deg:polishRadiusDeg,min_residual_ncc:minResidualNcc,
+        Object.assign(out,{profile_version:profileVersion,selection_version:selectionVersion,orientation_polish:polish,refit_blur_gain_after_polish:refitBlurGainAfterPolish,polish_radius_deg:polishRadiusDeg,min_residual_ncc:minResidualNcc,
           source_quaternions:sourceQ,profile_events:profileEvents,requested_min_residual_ncc:requestedMinResidualNcc,profile_precision:"f32",
           component_axis:"selected support order; source poses and events retain proposal provenance",
           trajectory_selection:selectionVersion===2?"profiled_achieved_supports_v2":"profiled_complete_trajectories_v1",
@@ -1584,9 +1589,10 @@ export class Zebsdsolve {
       }
       if(profile){
         Object.assign(metadata,{active_count_definition:"strictly_positive_compacted_support_size",fitted_count_definition:"amplitude_above_1e-6_display_only",
-          profile_optimizer:{version:1,enabled:polish,method:"bounded_crystal_frame_axis_poll_variable_projection",geometry:"fixed",trust_centre:"immutable_native_source_pose",radius_deg:polishRadiusDeg,
+          profile_optimizer:{version:profileVersion,enabled:polish,method:"bounded_crystal_frame_axis_poll_variable_projection",geometry:"fixed",trust_centre:"immutable_native_source_pose",radius_deg:polishRadiusDeg,
             singleton_starts_x_radius_factors:[0,.5,-.5],joint_starts:1,angular_step_radius_factors:[.5,.25,.125],max_sweeps_per_scale:2,
-            nuisance_schedule:"full_at_entry_and_after_final_pose_change; short_after_moving_scale",short_nuisance_max_evaluations:15,max_replacements_per_attempted_order:2,
+            nuisance_schedule:fitBlurGain?(refitBlurGainAfterPolish?"full_at_entry_and_after_final_pose_change":"full_at_entry"):"disabled",
+            max_replacements_per_attempted_order:2,
             best_single_scope:"strongest_achieved_across_eligible_supports_and_both_complete_histories"}});
         if(fitBlurGain){const optimizer=metadata.blur_gain_optimizer;
           optimizer.max_evaluations_per_inner_joint_search=optimizer.max_evaluations;delete optimizer.max_evaluations;

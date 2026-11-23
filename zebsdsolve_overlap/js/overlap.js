@@ -55,6 +55,8 @@ export function createOverlap({ st, busy, runPrimary, selectTab, redraw, status,
     if (!identities.has(object)) identities.set(object, nextIdentity++);
     return identities.get(object);
   };
+  const canRefitAfterPolish = () => $("overlap-polish").checked && $("overlap-blur-gain").checked;
+  const refitAfterPolish = () => canRefitAfterPolish() && $("overlap-refit-after-polish").checked;
   const context = () => {if(!st.ze || !st.scan)return "";try{return JSON.stringify({
     scan: identity(st.scan),
     primary_snapshot: identity(st.results),
@@ -67,6 +69,7 @@ export function createOverlap({ st, busy, runPrimary, selectTab, redraw, status,
     oxford_detector_attitude_version: st.ze.detectorAttitudeVersion ?? null,
     fit_blur_gain: $("overlap-blur-gain").checked,
     orientation_polish: $("overlap-polish").checked,
+    refit_blur_gain_after_polish: refitAfterPolish(),
     min_residual_ncc: $("overlap-screen").checked ? $("overlap-screen-value").valueAsNumber : null,
     min_stage_improvement: stageThresholds(),
     residual_bandwidth: residualBandwidth(),
@@ -102,6 +105,7 @@ export function createOverlap({ st, busy, runPrimary, selectTab, redraw, status,
     $("btn-overlap-settings").disabled = !!st.busy || launching;
     $("btn-overlap-export").disabled = !run?.completedCount;
     for (const id of ["overlap-primary", "overlap-limit", "overlap-keep-n", "overlap-blur-gain", "overlap-polish", "overlap-screen", "overlap-primary-cutoff"]) $(id).disabled = !!st.busy || launching;
+    $("overlap-refit-after-polish").disabled = !!st.busy || launching || !canRefitAfterPolish();
     const spherical = st.settings?.method === "spherical";
     $("overlap-spherical-bandwidth").hidden = !spherical;
     $("overlap-link-bandwidth").disabled = !spherical || !!st.busy || launching;
@@ -165,7 +169,7 @@ export function createOverlap({ st, busy, runPrimary, selectTab, redraw, status,
     return { k, requested, context: context(), colorContext:colorContext(), state: "Running", completedCount: 0, fittedCount:0, unseededCount:0,
       completed: new Uint8Array(st.scan.rows * st.scan.cols), arrays: {}, rgba: {}, sourceRgba: {}, profileEvents: {},
       metadata: {schema:"zebsdsolve-overlap-candidates-v1", model:null, keep_n:keepN, blur_gain:$("overlap-blur-gain").checked, assessment:"unassessed_candidates",
-        primary_ncc_minimum:primaryCutoff(), primary_snapshot:identity(st.results), orientation_polish:$("overlap-polish").checked, min_residual_ncc:$("overlap-screen").checked?$("overlap-screen-value").valueAsNumber:null,
+        primary_ncc_minimum:primaryCutoff(), primary_snapshot:identity(st.results), orientation_polish:$("overlap-polish").checked, refit_blur_gain_after_polish:refitAfterPolish(), min_residual_ncc:$("overlap-screen").checked?$("overlap-screen-value").valueAsNumber:null,
         requested_min_stage_improvement:structuredClone(minStageImprovement), component_axis:"stable discovery order", stop_reasons:STOP, engine_version:st.ze.version, seed_source_roi:null, scan_name:st.scanName, quaternion_convention:"wxyz, sample to crystal", geometry:structuredClone(st.ze.geometry),
         residual_bandwidth:settings.method==="spherical" ? bandwidth || settings.bandwidth : null,
         settings, phases:structuredClone(st.ze.phases), scan:structuredClone(st.scan), primary:"stored",
@@ -184,7 +188,7 @@ export function createOverlap({ st, busy, runPrimary, selectTab, redraw, status,
     if(result.blur_gain_parameter_names)target.metadata.blur_gain_parameter_names=Array.from(result.blur_gain_parameter_names);
     if(result.model)target.metadata.model=result.model;
     if(result.fit_model !== undefined)target.metadata.model=result.fit_model;
-    for(const key of ["oxford_detector_attitude_version","fit_model","gain_domain","weight_basis","contrast_basis_preparation","component_norm_definition","target_preparation","contrast_nnls_solver","contrast_anchor","contrast_target_centering","keep_n","candidate_method","candidate_seed_policy","trajectory_selection","trajectory_version","trajectory_source_names","profile_optimizer","active_count_definition","fitted_count_definition","profile_version","selection_version","orientation_polish","polish_radius_deg","min_residual_ncc","requested_min_residual_ncc","profile_precision","residual_screen","stage_gate","component_axis"])if(result[key] !== undefined)target.metadata[key]=structuredClone(result[key]);
+    for(const key of ["oxford_detector_attitude_version","fit_model","gain_domain","weight_basis","contrast_basis_preparation","component_norm_definition","target_preparation","contrast_nnls_solver","contrast_anchor","contrast_target_centering","keep_n","candidate_method","candidate_seed_policy","trajectory_selection","trajectory_version","trajectory_source_names","profile_optimizer","active_count_definition","fitted_count_definition","profile_version","selection_version","orientation_polish","refit_blur_gain_after_polish","polish_radius_deg","min_residual_ncc","requested_min_residual_ncc","profile_precision","residual_screen","stage_gate","component_axis"])if(result[key] !== undefined)target.metadata[key]=structuredClone(result[key]);
     // Prepare every copied field and color before changing the visible result map.
     const seedROI=result.seed_source_roi ? Array.from(result.seed_source_roi) : null;
     if(seedROI && target.metadata.seed_source_roi && JSON.stringify(seedROI)!==JSON.stringify(target.metadata.seed_source_roi))throw Error("Primary source context changed between tiles");
@@ -267,7 +271,7 @@ export function createOverlap({ st, busy, runPrimary, selectTab, redraw, status,
           for (let first = 0; first < requested.length && !st.stop; first += batch) {
             if (context() !== candidate.context) throw Error("Overlap context changed; completed tiles retained");
             const cells = requested.slice(first, first + batch);
-            const result = await st.ze.overlapCells(cells, {maxComponents:k, primary:"stored",keepN,fitBlurGain:$("overlap-blur-gain").checked,polish:$("overlap-polish").checked,minResidualNcc,minStageImprovement,residualBandwidth:bandwidth});
+            const result = await st.ze.overlapCells(cells, {maxComponents:k, primary:"stored",keepN,fitBlurGain:$("overlap-blur-gain").checked,polish:$("overlap-polish").checked,refitBlurGainAfterPolish:refitAfterPolish(),minResidualNcc,minStageImprovement,residualBandwidth:bandwidth});
             if (st.stop) { candidate.state = "Stopped"; break; }
             if (context() !== candidate.context) throw Error("Overlap context changed; tile not committed");
             commit(candidate, result, cells);
@@ -544,7 +548,7 @@ export function createOverlap({ st, busy, runPrimary, selectTab, redraw, status,
     customBandwidth=bandwidthInput.value;
     sync();redraw();if(active)showCell(st.cell);
   });
-  for(const id of ["overlap-primary","overlap-limit","overlap-keep-n","overlap-blur-gain","overlap-polish","overlap-screen","overlap-screen-value","overlap-stage-2","overlap-stage-3","overlap-stage-4"])$(id).addEventListener("change",()=>{sync();redraw();if(active)showCell(st.cell);});
+  for(const id of ["overlap-primary","overlap-limit","overlap-keep-n","overlap-blur-gain","overlap-polish","overlap-refit-after-polish","overlap-screen","overlap-screen-value","overlap-stage-2","overlap-stage-3","overlap-stage-4"])$(id).addEventListener("change",()=>{sync();redraw();if(active)showCell(st.cell);});
   const updateView = () => {sync();redraw();if(active)showCell(st.cell);};
   for(const id of ["overlap-component","overlap-map-component","overlap-map-component-2"])$(id).addEventListener("change",updateView);
   for(let i=0;i<2;i++)mapSelect(i).addEventListener("change",()=>{
