@@ -1,0 +1,11 @@
+{
+  "source_revision": "2a88103bb1424725b2e75df3793c8197f31c442c",
+  "source_dirty": true,
+  "sha256": {
+    "index.html": "a2aa1c1747fb4c70ace1f2045ae7f0b94682eeef56134cf63bc505d6cd200ffd",
+    "js/app.js": "505176d5b79b0aada82aed67b8e18a1b40627b574591675cb829cd2aedb6c41e",
+    "zebsdsolve/zebsdsolve.js": "4fd4a142ad47c0effcff1dcfea2ef87ce786a02f07acbeaf358b100099ad81aa",
+    "zebsdsolve/zebsdsolve.wasm": "e72158fd3350fe5592bfd522400d34170d044a077f6a176a9f331898fde07622"
+  },
+  "tracked_diff_sha256": "c62700803c64490709c21ab76287df51bef355da6cbe788c24a2047271865934"
+}
