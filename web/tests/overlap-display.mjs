@@ -114,6 +114,7 @@ console.log('Skipped primary renders leave the inspector clear');
 assert.equal(requestOptions[0].minStageImprovement,null);
 assert.equal($('overlap-stage-3-row').hidden,true);
 $('overlap-stage-2').value='0.01';
+$('overlap-screen').checked=false;
 await assert.rejects($('btn-overlap-run').listeners.click(),/Enable Screen residual NCC/);
 $('overlap-screen').checked=true;$('overlap-screen').listeners.change();
 $('overlap-stage-2').value='0.01';$('overlap-stage-2').listeners.change();

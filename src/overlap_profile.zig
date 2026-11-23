@@ -384,6 +384,7 @@ const Work = struct {
     cell: u64,
     row: u32,
     band: ?*core.Band,
+    search: core.Search,
     pool: []core.Record,
     trial_states: gpu.Buf,
     seed_target: gpu.Buf,
@@ -740,7 +741,7 @@ const Work = struct {
             if (order != 1) {
                 try self.residual(baseline);
                 const nrec = self.engine.phases.items.len * ranks;
-                try self.engine.indexPreparedCandidates(&.{self.cell}, self.engine.searchOf(), self.band, ranks, self.pool[0..nrec]);
+                try self.engine.indexPreparedCandidates(&.{self.cell}, self.search, self.band, ranks, self.pool[0..nrec]);
                 try self.check();
                 try self.prepareResidualSeeds(ranks);
             }
@@ -913,7 +914,7 @@ fn preparePrimarySeeds(e: *core.Engine, cells: []const u64, primary: []const cor
     }
 }
 
-pub fn run(e: *core.Engine, cells: []const u64, k: u32, primary: []const core.Record, missing: []const u32, hw: [2]u32, outputs: core.Engine.OverlapTrajectoryPayload, optimize: bool, keep_n: u32, req: *Request) !void {
+pub fn run(e: *core.Engine, cells: []const u64, k: u32, primary: []const core.Record, missing: []const u32, hw: [2]u32, outputs: core.Engine.OverlapTrajectoryPayload, optimize: bool, keep_n: u32, prm: core.Search, req: *Request) !void {
     const g = &e.g;
     const lv = e.levelOf(.search);
     const frame = try e.frame(lv);
@@ -948,7 +949,6 @@ pub fn run(e: *core.Engine, cells: []const u64, k: u32, primary: []const core.Re
     defer e.gpa.free(residual_seeds);
     const primary_fits = try e.gpa.alloc(?Support, if (compare_pooled) e.phases.items.len else 0);
     defer e.gpa.free(primary_fits);
-    const prm = e.searchOf();
     const band = if (prm.method == .spherical) try e.band(prm.bandwidth, lv) else null;
     for (cells, 0..) |cell, i| {
         if (e.cancel.get()) return error.Cancelled;
@@ -965,7 +965,7 @@ pub fn run(e: *core.Engine, cells: []const u64, k: u32, primary: []const core.Re
         defer model.deinit();
         model.contrast = true;
         model.optimize_enabled = optimize;
-        var work: Work = .{ .engine = e, .model = &model, .options = req.options, .lv = lv, .frame = frame, .t = try e.positionOf(&e.geo, cell, lv), .row = @intCast(i), .cell = cell, .band = band, .pool = pool, .trial_states = trial_states, .seed_target = seed_target, .residual_seeds = residual_seeds };
+        var work: Work = .{ .engine = e, .model = &model, .options = req.options, .lv = lv, .frame = frame, .t = try e.positionOf(&e.geo, cell, lv), .row = @intCast(i), .cell = cell, .band = band, .search = prm, .pool = pool, .trial_states = trial_states, .seed_target = seed_target, .residual_seeds = residual_seeds };
         var states: [1]overlap.State = undefined;
         var progress: [1]overlap.Progress = undefined;
         fit.read(&states);

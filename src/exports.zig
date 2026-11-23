@@ -742,6 +742,14 @@ export fn ze_overlap_cells(e: *Engine, cells: [*]const u64, n: usize, k: u32, ou
 }
 
 /// V2 keeps Component/State ABI and adds 32-byte per-cell Progress.
+/// Stage a bandwidth for the next overlap invocation. Zero clears the override.
+export fn ze_overlap_set_next_bandwidth(e: *Engine, bandwidth: u32) i32 {
+    if (bandwidth != 0 and (bandwidth < 8 or bandwidth > 256)) return failed(e, "overlap_bandwidth", error.BadSetting);
+    e.next_overlap_bandwidth = bandwidth;
+    if (e.set.method != .spherical) return 0;
+    return @intCast(if (bandwidth == 0) e.set.bandwidth else bandwidth);
+}
+
 export fn ze_overlap_cells_v2(e: *Engine, cells: [*]const u64, n: usize, k: u32, primary: u32, out: [*]engine.overlap.Component, len: usize, states: [*]engine.overlap.State, state_len: usize, progress: [*]engine.overlap.Progress, progress_len: usize) i32 {
     if (primary > 1) return failed(e, "overlap_cells", error.BadPrimaryMode);
     e.overlapCellsV2(cells[0..n], k, primary == 1, out[0..len], states[0..state_len], progress[0..progress_len]) catch |err| return failed(e, "overlap_cells", err);

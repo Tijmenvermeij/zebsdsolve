@@ -96,6 +96,14 @@ try {
     window.primary=ze.results();
     await configureUI({roi_x:0,roi_y:0,roi_w:3,roi_h:2});
     document.getElementById('tab-overlap').click();
+    const screen=document.getElementById('overlap-screen'),cutoff=document.getElementById('overlap-screen-value');
+    const blur=document.getElementById('overlap-blur-gain');
+    const link=document.getElementById('overlap-link-bandwidth'),bw=document.getElementById('overlap-bandwidth');
+    require(blur.checked && screen.checked && cutoff.valueAsNumber===0.1 && !cutoff.disabled,'new overlap defaults');
+    require(link.checked && bw.disabled && bw.valueAsNumber===ze.settings.bandwidth,'linked residual bandwidth default');
+    // Keep the existing unscreened/no-gain fixture for map and cancellation checks.
+    blur.checked=false;blur.dispatchEvent(new Event('change'));
+    screen.checked=false;screen.dispatchEvent(new Event('change'));
     require(document.getElementById('overlap-map-component').value==='primary' && document.getElementById('overlap-map-component-2').value==='residual','default components');
     require(JSON.stringify(Array.from(ze.storedPrimaryValidity(0,5)))==='[1,1,1,1,0]','ROI-only change preserved native seed provenance');
     let invalidSeedRange;
@@ -370,6 +378,7 @@ try {
     document.getElementById('btn-overlap-run').click();
     await waitFor(()=>document.getElementById('app').dataset.busy==='0' && document.getElementById('overlap-readout').textContent.startsWith('Complete'),'blur gain fit');
     const fitted=await exportOverlap();
+    require(fitted.metadata.residual_bandwidth===ze.settings.bandwidth,'linked bandwidth not exported');
     require(fitted.metadata.fit_model==='contrast_gain_v1' && fitted.metadata.blur_gain===true,'fitted model provenance');
     require(fitted.metadata.keep_n===5 && fitted.metadata.candidate_method==='spherical' && fitted.metadata.candidate_seed_policy,'candidate search provenance');
     require(fitted.arrays.winner_rank.stride===2 && fitted.arrays.winner_rank.values[0]===0,'primary candidate rank missing');
@@ -430,7 +439,12 @@ try {
     const limit=document.getElementById('overlap-limit');limit.value='2';limit.dispatchEvent(new Event('change'));
     const keep=document.getElementById('overlap-keep-n');keep.value='1';keep.dispatchEvent(new Event('change'));
     const polish=document.getElementById('overlap-polish'),screen=document.getElementById('overlap-screen'),cutoff=document.getElementById('overlap-screen-value');
-    require(!polish.checked && !screen.checked,'profile controls must be opt-in');
+    require(!polish.checked && !screen.checked,'fixture must start with profiling disabled');
+    const link=document.getElementById('overlap-link-bandwidth'),bw=document.getElementById('overlap-bandwidth');
+    const primaryBandwidth=ze.settings.bandwidth;
+    link.checked=false;link.dispatchEvent(new Event('change'));
+    require(!bw.disabled,'manual bandwidth not editable');
+    bw.value=String(primaryBandwidth+4);bw.dispatchEvent(new Event('change'));
     screen.checked=true;screen.dispatchEvent(new Event('change'));cutoff.value='1';cutoff.dispatchEvent(new Event('change'));
     polish.checked=true;polish.dispatchEvent(new Event('change'));
     document.getElementById('btn-overlap-run').click();
@@ -439,6 +453,14 @@ try {
     const left=document.getElementById('overlap-map-component');left.value='primary';left.dispatchEvent(new Event('change'));
     require(document.getElementById('map').toDataURL()!==document.getElementById('overlap-map-canvas').toDataURL(),'screened residual must leave original primary visible');
     require(fitted.metadata.primary_ncc_minimum===0,'primary execution cutoff missing');
+    require(fitted.metadata.residual_bandwidth===primaryBandwidth+4 && fitted.metadata.settings.bandwidth===primaryBandwidth,
+      'manual bandwidth must be distinct from the primary setting in the export');
+    require(ze.settings.bandwidth===primaryBandwidth && ze.storedPrimaryValidity(fitted.cells[0],1)[0]===1,
+      'residual search changed the indexed primary context');
+    link.checked=true;link.dispatchEvent(new Event('change'));
+    require(bw.disabled && bw.valueAsNumber===primaryBandwidth,'relink did not restore primary bandwidth');
+    link.checked=false;link.dispatchEvent(new Event('change'));
+    require(bw.valueAsNumber===primaryBandwidth+4,'custom bandwidth was not retained');
     require(fitted.metadata.profile_version===1 && fitted.metadata.orientation_polish===true,'profile provenance not exported');
     require(fitted.metadata.oxford_detector_attitude_version===0,'generic camera provenance not exported');
     require(fitted.metadata.residual_screen.enabled && fitted.metadata.min_residual_ncc===1,'computational screen not frozen');
@@ -476,6 +498,15 @@ try {
     document.getElementById('btn-overlap-primary').click();
     await waitFor(()=>document.getElementById('app').dataset.busy==='0' && document.getElementById('overlap-readout').textContent.startsWith('Context changed'),'same-geometry primary rerun invalidates overlap');
     require(!(await exportOverlap()).context_current,'reindexed primary retained old overlap');
+    const initialSettings=JSON.stringify(ze.settings);
+    const runUnscreened=(residualBandwidth)=>ze.overlapCells(fitted.cells,{primary:'stored',residualBandwidth});
+    const linkedFit=await runUnscreened(0), manualFit=await runUnscreened(8);
+    require(linkedFit.residual_bandwidth===primaryBandwidth && manualFit.residual_bandwidth===8,
+      'native unscreened bandwidth was not recorded');
+    require(manualFit.proposal_ncc[0]===linkedFit.proposal_ncc[0],'manual bandwidth changed the primary proposal');
+    require(!Object.is(manualFit.proposal_ncc[1],linkedFit.proposal_ncc[1]),
+      'changing bandwidth did not change the unscreened residual proposal on the fixture');
+    require(JSON.stringify(ze.settings)===initialSettings,'custom residual bandwidth leaked into project settings');
     return {primarySnapshotInvalidation:true,optIn:true,screenRollback:true,stageGate:true,events:true,proposalPoses:true,replay:true,cameraProvenance:true};
   `);
   if(process.env.OVERLAP_SCREENSHOT){

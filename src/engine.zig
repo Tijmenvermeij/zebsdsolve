@@ -702,6 +702,8 @@ pub const Engine = struct {
     fit_ncc: []f32 = &.{},
     tune: Tune = .{},
     cancel: @import("cancellation.zig").Flag = .{},
+    // One-shot browser request, consumed before overlap can suspend.
+    next_overlap_bandwidth: u32 = 0,
     err_buf: [1024]u8 = undefined,
     err_len: usize = 0,
 
@@ -2351,6 +2353,8 @@ pub const Engine = struct {
     }
 
     fn overlapCellsModel(self: *Engine, cells: []const u64, max_components: u32, stored: bool, out: []overlap.Component, states: []overlap.State, progress: []overlap.Progress, theta: ?[]overlap_nuisance.Theta, contrast: bool, optimize: bool, norms: ?[]f32, keep_n: u32, winner_ranks: ?[]i32, profile_request: ?*overlap_profile.Request) !void {
+        const bandwidth = self.next_overlap_bandwidth;
+        self.next_overlap_bandwidth = 0;
         if (theta) |values| {
             if (values.len != cells.len) return error.BadLength;
             @memset(values, overlap_nuisance.identity);
@@ -2379,7 +2383,8 @@ pub const Engine = struct {
         const scratch_bytes = @max(@as(u64, overlap.capacity) * ni * px * 4, @as(u64, ni) * @sizeOf(overlap.State));
         if (scratch_bytes > @min(g.lim.max_storage_binding, g.lim.max_buffer)) return error.OverlapBatchTooLargeUseSmallerBatches;
         const gpa = self.gpa;
-        const prm = self.searchOf();
+        var prm = self.searchOf();
+        if (bandwidth != 0 and prm.method == .spherical) prm.bandwidth = bandwidth;
         if (keep_n > 1 and prm.method == .pca) return error.MultiCandidatePcaUnsupported;
         if (self.phases.items.len * keep_n > (1 << 24)) return error.TooManyCandidateIdentities;
         // Reset before preflight can suspend; never clear cancellation after a wait.
@@ -2448,7 +2453,7 @@ pub const Engine = struct {
             try self.uploadCellsAs(cells, &.{lv}, .{});
         } else {
             // Fresh discovery preserves the existing first-search path exactly.
-            try self.indexCells(cells, prm, recs);
+            try self.indexCells(cells, self.searchOf(), recs);
         }
         if (self.cancel.get()) return error.Cancelled;
         if (profile_request) |req| {
@@ -2459,7 +2464,7 @@ pub const Engine = struct {
                 .theta = theta.?,
                 .norms = norms.?,
                 .ranks = winner_ranks.?,
-            }, optimize, keep_n, req);
+            }, optimize, keep_n, prm, req);
         }
         const protected = contrast and keep_n > 1 and max_components >= 3;
         if (!protected) return self.runPreparedTrajectory(cells, max_components, stored, recs, missing, primary_gates, hw, prm, out, states, progress, theta, contrast, optimize, norms, keep_n, winner_ranks);

@@ -486,6 +486,13 @@ throughput depends on the GPU and proposal-search settings.
 
 ## Focused maps and display filtering
 
+The Overlap tab enables **Fit blur / gain** and **Screen residual NCC** by
+default, using a minimum residual NCC of 0.10. Spherical residual indexing uses
+the primary indexing bandwidth by default. Clear **Use same as primary
+indexing** to set a separate bandwidth for residual search. The export records
+the executed value as `residual_bandwidth`. The controls are specific to spherical
+search. The API's blur/gain and screening defaults are unchanged.
+
 The linked maps default to **Original primary** and **First accepted residual
 component**. Original primary is available before overlap indexing and covers
 the accepted indexed points across the scan, including outside the overlap ROI.
