@@ -1,11 +1,10 @@
 {
-  "source_revision": "2a88103bb1424725b2e75df3793c8197f31c442c",
-  "source_dirty": true,
+  "source_revision": "18a14c56dd0f9296f210e97736bfb283e8e7ef71",
+  "source_dirty": false,
   "sha256": {
-    "index.html": "a2aa1c1747fb4c70ace1f2045ae7f0b94682eeef56134cf63bc505d6cd200ffd",
+    "index.html": "b6c447f7db3c1efa71ba8e76f1af0b2ef08edc69a6075a786710bf38c1a37bb1",
     "js/app.js": "505176d5b79b0aada82aed67b8e18a1b40627b574591675cb829cd2aedb6c41e",
-    "zebsdsolve/zebsdsolve.js": "4fd4a142ad47c0effcff1dcfea2ef87ce786a02f07acbeaf358b100099ad81aa",
-    "zebsdsolve/zebsdsolve.wasm": "e72158fd3350fe5592bfd522400d34170d044a077f6a176a9f331898fde07622"
-  },
-  "tracked_diff_sha256": "c62700803c64490709c21ab76287df51bef355da6cbe788c24a2047271865934"
+    "zebsdsolve/zebsdsolve.js": "170eba71a574b4d1f8b97443d1e716c37d87636b46a9de4f38b915b49a14e5e3",
+    "zebsdsolve/zebsdsolve.wasm": "e762b3f966e14be693fe3b31d4590ccce0acb0a4ed08170bef04be10fabd9f2d"
+  }
 }

@@ -524,7 +524,7 @@ export function decodeOverlapProfileEvents(bytes, cells, selectionVersion=1, sta
 
 // Exports that never wait (plain calls); every other function export may suspend (on the GPU
 // or on a file read) and is called through WebAssembly.promising.
-const SYNC_EXPORTS = new Set(["ze_alloc", "ze_free", "ze_version", "ze_overlap_optimizer_version", "ze_overlap_trajectory_version", "ze_overlap_profile_version", "ze_overlap_profile_selection_version", "ze_overlap_stage_gate_version", "ze_oxford_detector_attitude_version", "ze_overlap_profile_trace_capacity", "ze_create", "ze_destroy", "ze_adapter", "ze_error",
+const SYNC_EXPORTS = new Set(["ze_alloc", "ze_free", "ze_version", "ze_overlap_optimizer_version", "ze_overlap_trajectory_version", "ze_overlap_profile_version", "ze_overlap_profile_selection_version", "ze_overlap_stage_gate_version", "ze_overlap_set_next_bandwidth", "ze_oxford_detector_attitude_version", "ze_overlap_profile_trace_capacity", "ze_create", "ze_destroy", "ze_adapter", "ze_error",
   "ze_has_acquisition_calibration", "ze_configure", "ze_settings", "ze_events", "ze_cancel", "ze_close_scan", "ze_scan_info", "ze_scan_format", "ze_scan_overview_kind",
   "ze_get_geometry", "ze_set_geometry", "ze_clear_phases", "ze_phase_count", "ze_phase_info", "ze_pattern_shape", "ze_nlpar_view",
   "ze_seed_source_roi", "ze_stored_primary_validity", "ze_phase_generation", "ze_orientation_colors", "ze_pc_scores", "ze_fit_patterns", "ze_results", "ze_map", "ze_ipf_key", "ze_export", "ze_export_snapshot", "ze_export_oxford_snapshot", "ze_result_checkpoint", "ze_restore_result_checkpoint", "ze_result_chance", "ze_bunge", "ze_reduce", "ze_disorientation", "ze_shader",
@@ -1464,7 +1464,8 @@ export class Zebsdsolve {
   /** Candidate overlap fit; flat arrays use [cell, discovery slot, quaternion].
    * Stored primary mode requires the exact current primary context. Missing cells
    * return stop_reason=6. Caller commits a batch only after successful resolution. */
-  overlapCells(cells, {maxComponents=2, primary="search",fitBlurGain=false,gainDomain="contrast",keepN=1,polish=false,minResidualNcc=null,minStageImprovement=null,polishRadiusDeg=1}={}) {
+  overlapCells(cells, {maxComponents=2, primary="search",fitBlurGain=false,gainDomain="contrast",keepN=1,polish=false,minResidualNcc=null,minStageImprovement=null,polishRadiusDeg=1,residualBandwidth}={}) {
+    if(residualBandwidth!==undefined && (!Number.isInteger(residualBandwidth) || (residualBandwidth!==0 && (residualBandwidth<8 || residualBandwidth>256))))throw new RangeError("residualBandwidth must be 0 (primary) or an integer from 8 to 256");
     if(typeof polish!=="boolean")throw new RangeError("polish must be a boolean");
     if(typeof polishRadiusDeg!=="number"||!Number.isFinite(polishRadiusDeg)||polishRadiusDeg<=0||polishRadiusDeg>5)throw new RangeError("polishRadiusDeg must be >0 and <=5 degrees");
     if(minResidualNcc!==null&&(typeof minResidualNcc!=="number"||!Number.isFinite(minResidualNcc)||minResidualNcc< -1||minResidualNcc>1))throw new RangeError("minResidualNcc must be null or finite in [-1,1]");
@@ -1506,30 +1507,41 @@ export class Zebsdsolve {
     cells=Array.from(cells,Number);
     if(cells.some(c=>!Number.isSafeInteger(c)||c<0))throw new RangeError("cells must be nonnegative safe integers");
     return this._serial(()=>this._frame(async f=>{
+      const settings=this.settings;
+
       const n=cells.length,k=maxComponents,cp=f.alloc(n*k*32),sp=f.alloc(n*64),mp=f.alloc(n*32);
       const tp=fitBlurGain||contrast?f.alloc(n*7*4):0,np=contrast?f.alloc(n*k*4):0;
       const wp=profile||keepN>1&&k>1?f.alloc(n*k*4):0;
       let profileEvents=[],sourceQ=null;
       const trajectoryVersion=keepN>1&&k>=3&&this.x.ze_overlap_trajectory_version?this.x.ze_overlap_trajectory_version():0;
       if(![0,1].includes(trajectoryVersion))throw new Error(`unsupported overlap trajectory version ${trajectoryVersion}`);
-      if(profile){
-        const capacity=this.x.ze_overlap_profile_trace_capacity(this.e,n,k,keepN);
-        if(n&&(!Number.isSafeInteger(capacity)||capacity<=0))throw new Error("invalid V6 overlap trace capacity");
-        const optionsSize = staged ? 28 : 16;
-        const options=f.alloc(optionsSize),ov=new DataView(this.mem,options,optionsSize);
-        ov.setUint32(0,optionsSize,true);ov.setUint32(4,(polish?1:0)|(minResidualNcc!==null?2:0)|(selectionVersion===2?4:0),true);
-        ov.setFloat32(8,polishRadiusDeg,true);ov.setFloat32(12,minResidualNcc??0,true);
-        if (staged) stageMinimum.forEach((v, i) => ov.setFloat32(16+4*i,v??0,true));
-        const qp=f.alloc(n*k*16),ep=f.alloc(capacity*64),countp=f.alloc(4);
-        this._check(await this.x.ze_overlap_cells_v6(this.e,f.u64(cells),n,k,primary==="stored"?1:0,fitBlurGain?1:0,keepN,cp,n*k,sp,n,mp,n,tp,n,np,n*k,wp,n*k,options,qp,n*k,ep,capacity,countp),"overlap_cells_v6");
-        const count=new DataView(this.mem,countp,4).getUint32(0,true);
-        if(count>capacity)throw new Error("V6 overlap trace exceeds allocated capacity");
-        sourceQ=new Float32Array(this.mem,qp,n*k*4).slice();
-        profileEvents=decodeOverlapProfileEvents(new Uint8Array(this.mem,ep,count*64),cells,selectionVersion,staged);
-      }else if(contrast&&keepN>1&&k>1)this._check(await this.x.ze_overlap_cells_v5(this.e,f.u64(cells),n,k,primary==="stored"?1:0,fitBlurGain?1:0,keepN,cp,n*k,sp,n,mp,n,tp,n,np,n*k,wp,n*k),"overlap_cells_v5");
-      else if(contrast)this._check(await this.x.ze_overlap_cells_v4(this.e,f.u64(cells),n,k,primary==="stored"?1:0,fitBlurGain?1:0,cp,n*k,sp,n,mp,n,tp,n,np,n*k),"overlap_cells_v4");
-      else if(fitBlurGain)this._check(await this.x.ze_overlap_cells_v3(this.e,f.u64(cells),n,k,primary==="stored"?1:0,cp,n*k,sp,n,mp,n,tp,n),"overlap_cells");
-      else this._check(await this.x.ze_overlap_cells_v2(this.e,f.u64(cells),n,k,primary==="stored"?1:0,cp,n*k,sp,n,mp,n),"overlap_cells");
+      const setBandwidth=this.x.ze_overlap_set_next_bandwidth;
+      if(residualBandwidth && !setBandwidth)throw new Error("Custom residual bandwidth requires a current WASM module");
+      let usedBandwidth=settings.method==="spherical" ? settings.bandwidth : null;
+      try {
+        if(setBandwidth)usedBandwidth=this._check(setBandwidth(this.e,residualBandwidth??0),"overlap bandwidth") || null;
+        if(profile){
+          const capacity=this.x.ze_overlap_profile_trace_capacity(this.e,n,k,keepN);
+          if(n&&(!Number.isSafeInteger(capacity)||capacity<=0))throw new Error("invalid V6 overlap trace capacity");
+          const optionsSize = staged ? 28 : 16;
+          const options=f.alloc(optionsSize),ov=new DataView(this.mem,options,optionsSize);
+          ov.setUint32(0,optionsSize,true);ov.setUint32(4,(polish?1:0)|(minResidualNcc!==null?2:0)|(selectionVersion===2?4:0),true);
+          ov.setFloat32(8,polishRadiusDeg,true);ov.setFloat32(12,minResidualNcc??0,true);
+          if (staged) stageMinimum.forEach((v, i) => ov.setFloat32(16+4*i,v??0,true));
+          const qp=f.alloc(n*k*16),ep=f.alloc(capacity*64),countp=f.alloc(4);
+          this._check(await this.x.ze_overlap_cells_v6(this.e,f.u64(cells),n,k,primary==="stored"?1:0,fitBlurGain?1:0,keepN,cp,n*k,sp,n,mp,n,tp,n,np,n*k,wp,n*k,options,qp,n*k,ep,capacity,countp),"overlap_cells_v6");
+          const count=new DataView(this.mem,countp,4).getUint32(0,true);
+          if(count>capacity)throw new Error("V6 overlap trace exceeds allocated capacity");
+          sourceQ=new Float32Array(this.mem,qp,n*k*4).slice();
+          profileEvents=decodeOverlapProfileEvents(new Uint8Array(this.mem,ep,count*64),cells,selectionVersion,staged);
+        }else if(contrast&&keepN>1&&k>1)this._check(await this.x.ze_overlap_cells_v5(this.e,f.u64(cells),n,k,primary==="stored"?1:0,fitBlurGain?1:0,keepN,cp,n*k,sp,n,mp,n,tp,n,np,n*k,wp,n*k),"overlap_cells_v5");
+        else if(contrast)this._check(await this.x.ze_overlap_cells_v4(this.e,f.u64(cells),n,k,primary==="stored"?1:0,fitBlurGain?1:0,cp,n*k,sp,n,mp,n,tp,n,np,n*k),"overlap_cells_v4");
+        else if(fitBlurGain)this._check(await this.x.ze_overlap_cells_v3(this.e,f.u64(cells),n,k,primary==="stored"?1:0,cp,n*k,sp,n,mp,n,tp,n),"overlap_cells");
+        else this._check(await this.x.ze_overlap_cells_v2(this.e,f.u64(cells),n,k,primary==="stored"?1:0,cp,n*k,sp,n,mp,n),"overlap_cells");
+      } finally {
+        // Also clear on an ABI validation failure before the engine consumes it.
+        if(setBandwidth)setBandwidth(this.e,0);
+      }
       const out=decodeOverlapArrays(new Uint8Array(this.mem,cp,n*k*32).slice(),new Float32Array(this.mem,sp,n*16).slice(),new Uint8Array(this.mem,mp,n*32).slice(),cells,k);
       out.winner_rank=wp?new Int32Array(this.mem,wp,n*k).slice():Int32Array.from(out.phase,(phase,i)=>phase<0?-1:i%k===0?0:1);
       Object.assign(out,{keep_n:keepN,candidate_method:this.settings.method,
@@ -1583,7 +1595,8 @@ export class Zebsdsolve {
             best_single_refinement:"same_objective_bounded_pose_and_nuisance_profiles_when_enabled",joint_singleton_seeds:{k1:"separate_coarse_and_polished_theta_tables",k_gt_1:"same_achieved_member_theta_in_both_seed_tables"}});
         }
       }
-      return Object.assign(out,metadata,{primary,seed_source_roi,geometry:this.geometry,settings:this.settings,phases:this.phases,oxford_detector_attitude_version:this.detectorAttitudeVersion});
+      return Object.assign(out,metadata,{primary,seed_source_roi,geometry:this.geometry,settings,phases:this.phases,oxford_detector_attitude_version:this.detectorAttitudeVersion,
+        residual_bandwidth:usedBandwidth});
     }));
   }
 
