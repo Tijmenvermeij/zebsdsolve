@@ -2296,7 +2296,7 @@ pub const Engine = struct {
     /// Transactional V6 boundary: no partial components, ranks or diagnostics
     /// reach the caller if cancellation, allocation or device work fails.
     pub fn overlapCellsV6(self: *Engine, cells: []const u64, k: u32, stored: bool, outputs: OverlapTrajectoryPayload, optimize: bool, keep_n: u32, options: overlap_profile.Options, source_q: [][4]f32, events: []overlap_profile.Event) !usize {
-        if (!options.valid()) return error.BadProfileOptions;
+        if (!options.valid() or (options.flags & overlap_profile.refit_after_polish != 0 and !optimize)) return error.BadProfileOptions;
         const n = cells.len;
         const nk = try std.math.mul(usize, n, k);
         if (outputs.components.len != nk or outputs.states.len != n or outputs.progress.len != n or outputs.theta.len != n or

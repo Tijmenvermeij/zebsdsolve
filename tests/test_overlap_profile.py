@@ -22,6 +22,15 @@ class ProfileContract(unittest.TestCase):
         with self.assertRaisesRegex(Error,'native V6'):Solver.overlap_cells(old,[1],polish=True)
         with self.assertRaisesRegex(Error,'native V6'):Solver.overlap_cells(old,[1],min_residual_ncc=0)
         with self.assertRaisesRegex(ValueError,'contrast'):Solver.overlap_cells(old,[1],polish=True,gain_domain='source_dc')
+        older = SimpleNamespace(_lib=SimpleNamespace(
+            ze_overlap_cells_v6=True, ze_overlap_profile_version=lambda: 1,
+            ze_overlap_profile_trace_capacity=True))
+        with self.assertRaisesRegex(Error,'updated native library'):
+            Solver.overlap_cells(older,[1],polish=True,blur_gain=True)
+        for polish, blur_gain in [(False, True), (True, False)]:
+            with self.assertRaisesRegex(ValueError,'requires both'):
+                Solver.overlap_cells(old,[1],polish=polish,blur_gain=blur_gain,
+                                     refit_blur_gain_after_polish=True)
 
 class ProfileProduction(unittest.TestCase):
     def setUp(self):
@@ -32,13 +41,56 @@ class ProfileProduction(unittest.TestCase):
         old=self.s.overlap_cells([1,2],max_components=1,blur_gain=True)
         polished_one=self.s.overlap_cells([1,2],max_components=1,blur_gain=True,polish=True)
         new=self.s.overlap_cells([1,2],blur_gain=True,polish=True)
-        self.assertEqual(new['profile_version'],1)
+        self.assertEqual(new['profile_version'],2)
         self.assertTrue(np.all(polished_one['sse']<=old['sse']+3e-6),(old['sse'],polished_one['sse']))
         self.assertTrue(np.all(new['sse']<=polished_one['sse']+3e-6),(polished_one['sse'],new['sse']))
         self.assertEqual(new['source_quaternions'].shape,(2,2,4))
         for row,cell in enumerate([1,2]):
             images=self.s.overlap_inspect(cell,new,row=row)
             self.assertAlmostEqual(float(np.sum(images['residual'].astype(float)**2)),float(new['sse'][row]),delta=5e-5)
+    def test_polish_holds_entry_blur_gain_fixed(self):
+        self.s.configure(refine=False)  # Leave the coarse search pose for polishing to move.
+        options = dict(max_components=1, blur_gain=True, min_residual_ncc=0)
+        entry = self.s.overlap_cells([1,2], **options)
+        fixed = self.s.overlap_cells([1,2], polish=True, **options)
+        refit = self.s.overlap_cells([1,2], polish=True, refit_blur_gain_after_polish=True, **options)
+        self.assertTrue(np.any(fixed['sse'] < entry['sse'] - 1e-4))
+        np.testing.assert_array_equal(fixed['blur_gain_theta'], entry['blur_gain_theta'])
+        np.testing.assert_array_equal(refit['quaternions'], fixed['quaternions'])
+        self.assertTrue(np.all(refit['sse'] <= fixed['sse'] + 3e-6))
+        self.assertTrue(np.any(refit['sse'] < fixed['sse'] - 1e-5))
+        self.assertFalse(np.array_equal(refit['blur_gain_theta'], fixed['blur_gain_theta']))
+        self.assertFalse(fixed['refit_blur_gain_after_polish'])
+        self.assertTrue(refit['refit_blur_gain_after_polish'])
+        self.assertEqual(fixed['profile_optimizer']['nuisance_schedule'], 'full_at_entry')
+        self.assertEqual(refit['profile_optimizer']['nuisance_schedule'], 'full_at_entry_and_after_final_pose_change')
+
+    def test_batched_polishing_matches_scalar_with_distinct_scan_positions(self):
+        self.s.configure(refine=False, mask=True, mask_radius=.85)
+        self.s.set_patterns(np.zeros((1, 4, 96, 96), np.float32))
+        cells = [2, 1, 3, 0, 1]
+        q0, q1 = self.fixture.q[:2]
+        primary = fixtures.unit(self.s.simulate(np.tile(q0, (4, 1)), cells=np.arange(4), phase=0))
+        secondary = fixtures.unit(self.s.simulate(np.tile(q1, (4, 1)), cells=np.arange(4), phase=0))
+        mixture = primary + np.array([0, .6, .4, .2], np.float32)[:, None, None] * secondary
+        self.s.set_patterns(mixture[None])
+        self.s.index()
+        options = dict(primary='stored', max_components=2, min_residual_ncc=.1, blur_gain=True,
+                       polish=True, refit_blur_gain_after_polish=True)
+        batched = self.s.overlap_cells(cells, **options)
+        self.s.configure(tile_mb=8)  # Below the workspace needed for six 96 × 96 angles.
+        scalar = self.s.overlap_cells(cells, **options)
+        self.assertTrue(np.any(batched['retained_order'] == 2))
+        self.assertTrue(np.any(abs(batched['quaternions'] - batched['source_quaternions']) > 1e-4))
+        for field in ('phase', 'retained_order', 'stop_reason', 'winner_rank'):
+            np.testing.assert_array_equal(batched[field], scalar[field], err_msg=field)
+        for field in ('quaternions', 'amplitudes', 'blur_gain_theta', 'sse'):
+            np.testing.assert_allclose(batched[field], scalar[field], atol=1e-6, rtol=0, err_msg=field)
+        self.assertEqual(len(batched['profile_events']), len(scalar['profile_events']))
+        for a, b in zip(batched['profile_events'], scalar['profile_events']):
+            for key in ('cell', 'branch', 'order', 'attempt', 'phase', 'rank', 'flags', 'result_order'):
+                self.assertEqual(a[key], b[key])
+
     def test_batched_primary_seeds_match_independent_stored_cells(self):
         self.s.index()
         cells = [4, 2, 1, 0]
@@ -54,14 +106,17 @@ class ProfileProduction(unittest.TestCase):
                     np.testing.assert_array_equal(batch[field][row], independent[field][0])
 
     def test_screen_rollback_and_proposal_trace(self):
-        one=self.s.overlap_cells([1,2],max_components=1,blur_gain=True,min_residual_ncc=1)
-        screened=self.s.overlap_cells([1,2],max_components=2,blur_gain=True,min_residual_ncc=1)
+        options = dict(blur_gain=True, polish=True, refit_blur_gain_after_polish=True, min_residual_ncc=1)
+        one=self.s.overlap_cells([1,2],max_components=1,**options)
+        screened=self.s.overlap_cells([1,2],max_components=2,**options)
         np.testing.assert_array_equal(screened['sse'],one['sse'])
         np.testing.assert_array_equal(screened['quaternions'][:,0],one['quaternions'][:,0])
         np.testing.assert_array_equal(screened['amplitudes'][:,0],one['amplitudes'][:,0])
         np.testing.assert_array_equal(screened['blur_gain_theta'],one['blur_gain_theta'])
         self.assertTrue(np.all(screened['retained_order']==1))
-        self.assertTrue(any(e['flags']&2 for e in screened['profile_events']))
+        rejected = [e for e in screened['profile_events'] if e['flags'] & 2]
+        self.assertTrue(rejected)
+        self.assertTrue(all(np.isnan(e['joint_sse']) and np.isnan(e['lower_sse']) for e in rejected))
         self.assertTrue(all(e['cell'] in [1,2] for e in screened['profile_events']))
     def test_higher_orders_keep_coherent_complete_histories(self):
         from pathlib import Path

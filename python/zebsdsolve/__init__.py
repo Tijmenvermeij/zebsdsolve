@@ -727,7 +727,7 @@ class Solver:
                 "domain": "zero_mean_unit_norm_prepared_pattern",
                 "physical_fractions": False, "blur_gain_parity": False}
 
-    def overlap_cells(self, cells, max_components=2, primary="search", blur_gain=False, gain_domain="contrast", keep_n=1, polish=False, min_residual_ncc=None, polish_radius_deg=1.0, min_stage_improvement=None):
+    def overlap_cells(self, cells, max_components=2, primary="search", blur_gain=False, gain_domain="contrast", keep_n=1, polish=False, min_residual_ncc=None, polish_radius_deg=1.0, min_stage_improvement=None, refit_blur_gain_after_polish=False):
         """Discover one through four candidate components with the configured spherical,
         dictionary or PCA search, followed by GPU joint nonnegative projection fitting.
 
@@ -755,6 +755,10 @@ class Solver:
         is not a calibrated confidence threshold. Rejected proposals are retained
         in profile_events. Both controls are off by default, preserving V4/V5.
 
+        Blur/gain stays fixed during the angular search. To refit it once on
+        the best moved pose, enable refit_blur_gain_after_polish together with
+        polish and blur_gain.
+
         All stages must use the same resolution. Set binning=1 for stored pixels
         or full_resolution='none' for reduced pixels. Residuals stay signed and bypass all nonlinear
         preprocessing. Start with small batches: the GPU moment solver is provisional.
@@ -762,6 +766,8 @@ class Solver:
         profile = bool(polish) or min_residual_ncc is not None
         if not isinstance(polish, (bool, np.bool_)):
             raise ValueError("polish must be a boolean")
+        if not isinstance(refit_blur_gain_after_polish, (bool, np.bool_)) or (refit_blur_gain_after_polish and not (polish and blur_gain)):
+            raise ValueError("Refitting blur/gain after polishing requires both polishing and blur/gain fitting")
         if isinstance(polish_radius_deg, (bool, np.bool_)) or not np.isfinite(polish_radius_deg) or not 0 < polish_radius_deg <= 5:
             raise ValueError("polish_radius_deg must be finite, greater than zero and at most 5 degrees")
         if min_residual_ncc is not None and (isinstance(min_residual_ncc, (bool, np.bool_)) or not np.isfinite(min_residual_ncc) or not -1 <= min_residual_ncc <= 1):
@@ -796,8 +802,11 @@ class Solver:
                 raise ValueError("overlap profiling requires gain_domain='contrast'")
             if not all(hasattr(self._lib, name) for name in ("ze_overlap_cells_v6", "ze_overlap_profile_version", "ze_overlap_profile_trace_capacity")):
                 raise Error("overlap profiling requires native V6 support; load a current library")
-            if int(self._lib.ze_overlap_profile_version()) != 1:
+            profile_version = int(self._lib.ze_overlap_profile_version())
+            if profile_version not in (1, 2):
                 raise Error("unsupported overlap profile version")
+            if polish and blur_gain and profile_version < 2:
+                raise Error("Polishing with blur/gain requires an updated native library")
             selection_version = int(self._lib.ze_overlap_profile_selection_version()) if hasattr(self._lib, "ze_overlap_profile_selection_version") else 1
             if selection_version not in (1, 2):
                 raise Error("unsupported overlap selection version")
@@ -842,7 +851,7 @@ class Solver:
                 raise Error("invalid V6 overlap trace capacity")
             events = (_n.OverlapProfileEvent * capacity)()
             count = _n.SZ()
-            options = _n.OverlapProfileOptions(16, int(polish) | (2 if min_residual_ncc is not None else 0) | (4 if selection_version == 2 else 0), float(polish_radius_deg), float(min_residual_ncc or 0))
+            options = _n.OverlapProfileOptions(16, int(polish) | (2 if min_residual_ncc is not None else 0) | (4 if selection_version == 2 else 0) | (8 if refit_blur_gain_after_polish else 0), float(polish_radius_deg), float(min_residual_ncc or 0))
             if staged:
                 options.size = ctypes.sizeof(_n.OverlapStageOptions)
                 stage_options = _n.OverlapStageOptions(options, (ctypes.c_float * 3)(*(v or 0 for v in stage_minimum)))
@@ -933,7 +942,7 @@ class Solver:
             provenance = np.array([m._pad for m in progress],np.uint32)
             if np.any(~np.isin(provenance,[0,1,0xffffffff])):
                 raise Error("invalid V6 overlap trajectory provenance")
-            diagnostics.update(profile_version=1, selection_version=selection_version, orientation_polish=bool(polish),
+            diagnostics.update(profile_version=profile_version, selection_version=selection_version, orientation_polish=bool(polish), refit_blur_gain_after_polish=bool(refit_blur_gain_after_polish),
                 polish_radius_deg=float(polish_radius_deg), min_residual_ncc=min_residual_ncc,
                 requested_min_residual_ncc=requested_min_residual_ncc, profile_precision="f32",
                 source_quaternions=source_q, profile_events=profile_events,
@@ -965,12 +974,13 @@ class Solver:
             diagnostics.update(
                 active_count_definition="strictly_positive_compacted_support_size",
                 fitted_count_definition="amplitude_above_1e-6_display_only",
-                profile_optimizer={"version":1,"enabled":bool(polish),"method":"bounded_crystal_frame_axis_poll_variable_projection",
+                profile_optimizer={"version":profile_version,"enabled":bool(polish),"method":"bounded_crystal_frame_axis_poll_variable_projection",
                     "geometry":"fixed","trust_centre":"immutable_native_source_pose","radius_deg":polish_radius_deg,
                     "singleton_starts_x_radius_factors":[0,.5,-.5],"joint_starts":1,
                     "angular_step_radius_factors":[.5,.25,.125],"max_sweeps_per_scale":2,
-                    "nuisance_schedule":"full_at_entry_and_after_final_pose_change; short_after_moving_scale",
-                    "short_nuisance_max_evaluations":15,"max_replacements_per_attempted_order":2,
+                    "nuisance_schedule":("disabled" if not blur_gain else
+                        "full_at_entry_and_after_final_pose_change" if refit_blur_gain_after_polish else "full_at_entry"),
+                    "max_replacements_per_attempted_order":2,
                     "best_single_scope":"strongest_achieved_across_eligible_supports_and_both_complete_histories"})
             if blur_gain:
                 optimizer=diagnostics["blur_gain_optimizer"]

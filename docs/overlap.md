@@ -11,7 +11,9 @@ replace ordinary stored indexing results or change the acquisition.
 ## Optional orientation profiling and residual screening (V6)
 
 The Overlap tab exposes **Polish orientations** and **Screen residual NCC**.
-Both are off by default. Direct C V6 calls require at least one option flag;
+**Polish orientations** and **Refit blur / gain after polishing** are off by
+default. **Screen residual NCC** is on by default in the Overlap tab.
+Direct C V6 calls require polishing, screening, or both;
 use the existing V4/V5 entry points when both controls are off.
 Screening requires an explicitly entered threshold;
 **Show only** remains a separate display filter. The numerical controls are also
@@ -34,7 +36,18 @@ const result = await ze.overlapCells(cells, {
 V6 keeps the detector geometry fixed and evaluates orientation changes using the
 same shared gain/blur and nonnegative amplitude objective as the final mixture.
 The experimental target is prepared once. No new background filter is applied
-while polishing or forming residuals. V6 compacts zero coefficients: `active_count` is the strictly positive support
+while polishing or forming residuals. Each support gets its initial shared
+blur/gain fit before angular trials. During polishing, blur/gain stays fixed and
+the nonnegative amplitudes are refitted at each trial. When both fitting and
+polishing are enabled, **Refit blur / gain after polishing** optionally runs one
+more shared fit at the best moved pose. The equivalent API options are
+`refit_blur_gain_after_polish` in Python, `refitBlurGainAfterPolish` in JavaScript,
+and flag value 8 in C. Orientation polishing with blur/gain requires V6 profile
+version 2. The GPU scores the six neighbors of an angle together and reuses
+the unchanged prepared components and their inner products. Initial primary
+polishing can batch independent scan points. Later residual searches still
+follow each point's accepted support.
+V6 compacts zero coefficients: `active_count` is the strictly positive support
 size, while `fitted_count` retains the legacy `>1e-6` display convention. Inner
 nuisance-search evaluation bounds are not bounds on the whole profiled run.
 The search is bounded around immutable

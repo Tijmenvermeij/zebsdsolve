@@ -1066,7 +1066,7 @@ export fn ze_overlap_trajectory_version() u32 {
 /// including source_q (one four-float quaternion per output component) and
 /// events (one 64-byte Event per slot). A failing call publishes zero events.
 export fn ze_overlap_profile_version() u32 {
-    return 1;
+    return 2;
 }
 
 export fn ze_overlap_profile_selection_version() u32 {
@@ -1081,7 +1081,7 @@ export fn ze_overlap_profile_trace_capacity(e: *Engine, n: usize, k: u32, keep_n
     return engine.overlap_profile.traceCapacity(n, e.phases.items.len, k, keep_n) catch 0;
 }
 
-/// Explicit opt-in. At least one of the two Options flags must be set.
+/// Explicit opt-in. Enable orientation polishing, residual screening, or both.
 /// Call V4/V5 for the legacy fixed-pose, unscreened overlap trajectory.
 export fn ze_overlap_cells_v6(e: *Engine, cells: [*]const u64, n: usize, k: u32, primary: u32, optimize: u32, keep_n: u32, out: [*]engine.overlap.Component, len: usize, states: [*]engine.overlap.State, state_len: usize, progress: [*]engine.overlap.Progress, progress_len: usize, theta: [*]engine.overlap_nuisance.Theta, theta_len: usize, norms: [*]f32, norms_len: usize, winner_ranks: [*]i32, rank_len: usize, options: *const engine.overlap_profile.WireOptions, source_q: [*][4]f32, source_len: usize, events: [*]engine.overlap_profile.Event, event_capacity: usize, event_count: *usize) i32 {
     event_count.* = 0;

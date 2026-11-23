@@ -100,6 +100,14 @@ try {
     const blur=document.getElementById('overlap-blur-gain');
     const link=document.getElementById('overlap-link-bandwidth'),bw=document.getElementById('overlap-bandwidth');
     require(blur.checked && screen.checked && cutoff.valueAsNumber===0.1 && !cutoff.disabled,'new overlap defaults');
+    const polish=document.getElementById('overlap-polish'),refit=document.getElementById('overlap-refit-after-polish');
+    require(!refit.checked && refit.disabled,'endpoint refit must default off and require polishing');
+    polish.checked=true;polish.dispatchEvent(new Event('change'));
+    require(!refit.disabled,'endpoint refit must be available with blur/gain and polishing enabled');
+    blur.checked=false;blur.dispatchEvent(new Event('change'));
+    require(refit.disabled,'endpoint refit must require blur/gain fitting');
+    polish.checked=false;polish.dispatchEvent(new Event('change'));
+    blur.checked=true;blur.dispatchEvent(new Event('change'));
     require(link.checked && bw.disabled && bw.valueAsNumber===ze.settings.bandwidth,'linked residual bandwidth default');
     // Keep the existing unscreened/no-gain fixture for map and cancellation checks.
     blur.checked=false;blur.dispatchEvent(new Event('change'));
@@ -461,7 +469,8 @@ try {
     require(bw.disabled && bw.valueAsNumber===primaryBandwidth,'relink did not restore primary bandwidth');
     link.checked=false;link.dispatchEvent(new Event('change'));
     require(bw.valueAsNumber===primaryBandwidth+4,'custom bandwidth was not retained');
-    require(fitted.metadata.profile_version===1 && fitted.metadata.orientation_polish===true,'profile provenance not exported');
+    require(fitted.metadata.profile_version===2 && fitted.metadata.orientation_polish===true,'profile provenance not exported');
+    require(fitted.metadata.refit_blur_gain_after_polish===false,'disabled endpoint refit must be frozen');
     require(fitted.metadata.oxford_detector_attitude_version===0,'generic camera provenance not exported');
     require(fitted.metadata.residual_screen.enabled && fitted.metadata.min_residual_ncc===1,'computational screen not frozen');
     require(fitted.arrays.source_quaternions.stride===8,'native proposal poses missing');

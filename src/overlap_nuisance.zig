@@ -58,7 +58,8 @@ pub const Model = struct {
     const Args = struct { mode: u32 = 0, coord: u32 = 0, phase: u32 = 0, seed: u32 = 0, step: f32 = 0, dc: f32 = 0, reuse_blur: bool = false };
     fn run(self: *Model, comptime entry: []const u8, a: Args, binds: []const gpu.Bind, pixels: bool) void {
         const f = self.fit;
-        const count = if (pixels) (@as(u64, 4) * f.n * f.px + 255) / 256 else f.n;
+        const columns: u64 = if (a.mode == 3) 1 else 4;
+        const count = if (pixels) (columns * f.n * f.px + 255) / 256 else f.n;
         const grid = gpu.Gpu.flat(@intCast(count));
         const p: P = .{ .n = f.n, .px = f.px, .width = f.width, .grid_x = grid[0], .mode = a.mode, .coord = a.coord, .phase = a.phase, .seed = a.seed, .step = a.step, .dc = a.dc, .k = self.k, .contrast = @intFromBool(self.contrast), .mask = .{ f.mask[0], f.mask[1], f.mask[2], 0 } };
         var all: [10]gpu.Bind = undefined;
@@ -73,13 +74,13 @@ pub const Model = struct {
     fn transform(self: *Model, singleton: bool) void {
         self.transformWithArgs(.{ .mode = @intFromBool(singleton), .coord = self.single_column }, true);
     }
-    fn centerRaw(self: *Model) void {
+    fn centerRaw(self: *Model, a: Args) void {
         // A full-image constant shift is exact preconditioning for the
         // constant-preserving Gaussian followed by masked centering. Keep a
         // separate dispatch/buffer so large DC cannot be reassociated into gain.
         if (self.contrast) {
-            self.run("raw_median", .{}, &.{ self.raw.at(1), self.cells.at(5) }, false);
-            self.run("center_raw", .{}, &.{ self.raw.at(1), self.centered.at(15), self.cells.at(5) }, true);
+            self.run("raw_median", a, &.{ self.raw.at(1), self.cells.at(5) }, false);
+            self.run("center_raw", a, &.{ self.raw.at(1), self.centered.at(15), self.cells.at(5) }, true);
         }
     }
     fn transformWithArgs(self: *Model, a: Args, normalize: bool) void {
@@ -145,7 +146,7 @@ pub const Model = struct {
         self.g.copy(self.fit.progress, 0, self.trial.progress, 0, @as(u64, self.fit.n) * @sizeOf(overlap.Progress));
         self.run("stage", .{ .dc = dc }, &.{ self.raw.at(1), self.cells.at(5), self.fit.progress.at(9), self.committed.at(11), patterns.at(13) }, false);
         self.run("validate", .{}, &.{ self.raw.at(1), self.cells.at(5) }, false);
-        self.centerRaw();
+        self.centerRaw(.{});
         self.single_column = 0;
         // Discovery singleton is the proposed final column.
         self.run("set_single_column", .{}, &.{ self.cells.at(5), self.fit.progress.at(9) }, false);
@@ -159,7 +160,7 @@ pub const Model = struct {
     pub fn readNorms(self: *Model, out: [][4]f32, committed: bool) void {
         self.run("prepare_final", .{ .seed = @intFromBool(committed) }, &.{ self.raw.at(1), self.cells.at(5), self.fit.progress.at(9), self.committed.at(11) }, false);
         self.run("validate", .{}, &.{ self.raw.at(1), self.cells.at(5) }, false);
-        self.centerRaw();
+        self.centerRaw(.{});
         self.transformWithArgs(.{ .mode = 2 }, false);
         self.run("component_norms", .{ .mode = 2 }, &.{ self.trial.bank.at(2), self.fit.progress.at(9), self.norms.at(14) }, false);
         self.g.read(self.norms, 0, std.mem.sliceAsBytes(out));
@@ -169,7 +170,7 @@ pub const Model = struct {
         self.g.writeSlice(self.raw, 0, f32, templates);
         self.g.copy(self.fit.progress, 0, self.trial.progress, 0, @as(u64, self.fit.n) * @sizeOf(overlap.Progress));
         self.run("validate", .{}, &.{ self.raw.at(1), self.cells.at(5) }, false);
-        self.centerRaw();
+        self.centerRaw(.{});
         for (0..k) |j| {
             self.single_column = @intCast(j);
             self.optimize(true);
@@ -199,21 +200,46 @@ pub const Model = struct {
             self.run("invalidate_sigma", .{}, &.{self.cells.at(5)}, false);
         }
         self.run("validate", .{}, &.{ self.raw.at(1), self.cells.at(5) }, false);
-        self.centerRaw();
+        self.centerRaw(.{});
     }
 
     /// Exactly one shared-theta evaluation, with the V4 GPU active-set NNLS.
     /// Both its state and its normalized columns belong to this particular pose.
     pub fn profileFixedTheta(self: *Model, theta: Theta) void {
+        self.prepareFixedTheta(theta);
+        self.trial.contrast = true;
+        self.trial.nuisanceTrial(false, self.k);
+    }
+
+    /// Normalize the current support into trial.bank at a shared, fixed theta.
+    pub fn prepareFixedTheta(self: *Model, theta: Theta) void {
         self.g.writeSlice(self.cells, 24 * 4, f32, &theta);
-        self.fixedWarmTheta();
+        self.prepareWarmTheta();
+    }
+
+    fn prepareWarmTheta(self: *Model) void {
+        self.run("propose", .{ .seed = 1 }, &.{ self.cells.at(5), self.trial.state.at(6), self.fit.state.at(8), self.fit.progress.at(9) }, false);
+        self.transform(false);
     }
 
     fn fixedWarmTheta(self: *Model) void {
-        self.run("propose", .{ .seed = 1 }, &.{ self.cells.at(5), self.trial.state.at(6), self.fit.state.at(8), self.fit.progress.at(9) }, false);
-        self.transform(false);
+        self.prepareWarmTheta();
         self.trial.contrast = true;
         self.trial.nuisanceTrial(false, self.k);
+    }
+
+    /// Transform one projected column per lane at its own theta. The lane-major
+    /// prefix of trial.bank is ready for a fixed-theta contrast fit.
+    pub fn preparePolishColumns(self: *Model, raw: gpu.Buf, theta: []const Theta) void {
+        std.debug.assert(self.contrast and theta.len == self.fit.n);
+        self.k = 1;
+        if (raw.id != self.raw.id) self.g.copy(raw, 0, self.raw, 0, @as(u64, self.fit.n) * self.fit.px * 4);
+        self.g.writeSlice(self.theta, 0, Theta, theta);
+        const a: Args = .{ .mode = 3 };
+        self.run("stage_polish_theta", a, &.{ self.cells.at(5), self.theta.at(12) }, false);
+        self.run("validate", a, &.{ self.raw.at(1), self.cells.at(5) }, false);
+        self.centerRaw(a);
+        self.transformWithArgs(a, true);
     }
 
     fn optimizePrimaryTheta(self: *Model) void {
@@ -240,23 +266,12 @@ pub const Model = struct {
         }
     }
 
-    /// Full V4 bounded shared-theta search at a new support or at the final
-    /// pose. A short search between angular levels always starts at the achieved
-    /// theta. Per-member singleton nuisance seeds are isolated to this support.
-    pub fn profileNuisance(self: *Model, warm: Theta, singles: [4]Theta, full: bool) void {
+    /// Fit shared blur/gain for a support at fixed orientations.
+    pub fn profileNuisance(self: *Model, warm: Theta, singles: [4]Theta) void {
         self.g.writeSlice(self.cells, 24 * 4, f32, &warm);
-        if (full) {
-            self.g.writeSlice(self.cells, 32 * 4, Theta, &singles);
-            self.g.writeSlice(self.cells, 90 * 4, Theta, &singles);
-            if (self.k == 1) self.optimizePrimaryTheta() else self.optimize(false);
-        } else {
-            self.run("reset_search", .{}, &.{ self.cells.at(5), self.best.at(7), self.fit.state.at(8) }, false);
-            self.evaluate(.{ .seed = 1 }, false);
-            const steps: Theta = .{ 0.375, 0.04375, 0.5, 0.05, 0.05, 0.015, 0.015 };
-            for (steps, 0..) |step, j| {
-                self.coordinatePair(false, @intCast(j), step, j > 1);
-            }
-        }
+        self.g.writeSlice(self.cells, 32 * 4, Theta, &singles);
+        self.g.writeSlice(self.cells, 90 * 4, Theta, &singles);
+        if (self.k == 1) self.optimizePrimaryTheta() else self.optimize(false);
     }
 
     /// Read a single achieved state and theta together, after profileNuisance.
@@ -279,7 +294,7 @@ pub const Model = struct {
         self.g.writeSlice(self.cells, 0, f32, &theta);
         self.g.writeSlice(self.cells, 64 * 4, f32, &.{ dc, -1 });
         self.run("validate", .{}, &.{ self.raw.at(1), self.cells.at(5) }, false);
-        self.centerRaw();
+        self.centerRaw(.{});
         self.transform(false);
         return self.trial.bank;
     }

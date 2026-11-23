@@ -27,8 +27,10 @@ pub const WireStageOptions = extern struct {
     min_stage_improvement: [3]f32,
 };
 
+pub const refit_after_polish: u32 = 8;
+
 pub const Options = struct {
-    flags: u32 = 1, // 1 polish pose, 2 screen residual NCC, 4 emit publication witness
+    flags: u32 = 1, // 1 polish pose, 2 screen residual NCC, 4 emit publication witness, 8 refit blur/gain after polishing
     radius_deg: f32 = 1,
     min_residual_ncc: f32 = 0,
     min_stage_improvement: ?[3]f32 = null,
@@ -57,7 +59,8 @@ pub const Options = struct {
             if (self.flags & 2 == 0) return false;
             for (limits) |v| if (!std.math.isFinite(v) or v < 0 or v > 1) return false;
         }
-        return self.flags & 3 != 0 and self.flags & ~@as(u32, 7) == 0 and
+        return self.flags & 3 != 0 and self.flags & ~@as(u32, 15) == 0 and
+            (self.flags & refit_after_polish == 0 or self.flags & 1 != 0) and
             std.math.isFinite(self.radius_deg) and self.radius_deg > 0 and self.radius_deg <= 5 and
             std.math.isFinite(self.min_residual_ncc) and @abs(self.min_residual_ncc) <= 1;
     }
@@ -158,6 +161,109 @@ pub fn applyPoseOffset(g: *gpu.Gpu, poses: gpu.Buf, delta: Offset) void {
     g.dispatch(pipe, 1, 1, 1, &.{ u, poses.at(1) });
 }
 
+const poll_angles = 6;
+const max_angle_lanes = 60;
+const angle_scales = [_]f32{ 0.5, 0.25, 0.125 };
+const sweeps_per_scale = 2;
+const singleton_starts = 3;
+
+fn angleNeighbors(centre: Offset, step: f32, radius: f32) [poll_angles]Offset {
+    var deltas: [poll_angles]Offset = undefined;
+    for (&deltas, 0..) |*delta, i| {
+        delta.* = centre;
+        delta[i / 2] += if (i % 2 == 0) step else -step;
+        const norm = @sqrt(delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]);
+        if (norm > radius) for (delta) |*v| {
+            v.* *= radius / norm;
+        };
+    }
+    return deltas;
+}
+
+fn retainAngle(state: *overlap.State, delta: *Offset, states: []const overlap.State, deltas: []const Offset) ?usize {
+    var kept: ?usize = null;
+    for (states, deltas, 0..) |trial, angle, i| {
+        if (!assessed(trial) or (assessed(state.*) and !improves(trial.sse, state.sse, trial.initial_sse))) continue;
+        state.* = trial;
+        delta.* = angle;
+        kept = i;
+    }
+    return kept;
+}
+
+const AngleBatch = struct {
+    fit: overlap.Fit,
+    model: nuisance.Model,
+    target: gpu.Buf,
+    offsets: gpu.Buf,
+    incumbent: gpu.Buf,
+    moments: gpu.Buf,
+    cached: ?Support = null,
+
+    fn laneCapacity(e: *core.Engine, bytes: u64) usize {
+        const limit = @min(e.g.lim.max_storage_binding, e.g.lim.max_buffer);
+        // The batched model owns a bank and transform buffers in addition to its
+        // fit, detector projections, offsets and a copy of the measured patterns.
+        const budget = @as(u64, e.set.tile_mb) << 20;
+        return @intCast(@min(max_angle_lanes, limit / (4 * bytes), budget / (48 * bytes)));
+    }
+
+    fn init(self: *AngleBatch, e: *core.Engine, frame: spherical.Frame, n: u32) void {
+        const g = &e.g;
+        const px = frame.pat_h * frame.pat_w;
+        const bytes = @as(u64, px) * 4;
+        self.target = g.storage(n * bytes);
+        g.clear(self.target);
+        self.offsets = g.storage(n * 16);
+        self.incumbent = g.storage(overlap.capacity * bytes);
+        self.moments = g.storage(overlap.polish_moment_count * @sizeOf(f32));
+        self.fit = overlap.Fit.init(g, n, px, frame.pat_w, frame.mask, self.target);
+        self.fit.contrast = true;
+        self.model = nuisance.Model.init(g, &e.prep, &self.fit);
+        self.model.contrast = true;
+        self.cached = null;
+    }
+
+    fn deinit(self: *AngleBatch) void {
+        const g = self.fit.g;
+        self.model.deinit();
+        self.fit.deinit();
+        inline for (.{ "target", "offsets", "incumbent", "moments" }) |field| g.release(&@field(self, field));
+    }
+
+    fn setTargets(self: *AngleBatch, source: gpu.Buf, rows: []const usize) void {
+        const bytes = @as(u64, self.fit.px) * 4;
+        std.debug.assert(rows.len * poll_angles == self.fit.n);
+        for (rows, 0..) |row, i| for (0..poll_angles) |angle| {
+            self.fit.g.copy(source, row * bytes, self.target, (i * poll_angles + angle) * bytes, bytes);
+        };
+        self.fit.resetTarget(self.target);
+        self.cached = null;
+    }
+
+    fn project(self: *AngleBatch, e: *core.Engine, lv: core.Level, frame: spherical.Frame, phase: usize, poses: []const detector.Pose, deltas: []const Offset, theta: []const Theta) void {
+        const g = &e.g;
+        std.debug.assert(poses.len == self.fit.n and deltas.len == poses.len and theta.len == poses.len);
+        var packed_offsets: [max_angle_lanes][4]f32 = undefined;
+        for (deltas, packed_offsets[0..deltas.len]) |delta, *slot| slot.* = .{ delta[0], delta[1], delta[2], 0 };
+        e.det.setPoses(poses);
+        g.writeSlice(self.offsets, 0, [4]f32, packed_offsets[0..deltas.len]);
+        const pipe = g.pipeline("overlap_profile/profile_poses", shaders.overlap_profile, "profile_poses") catch gpu.NO_PIPE;
+        g.dispatch(pipe, (self.fit.n + 63) / 64, 1, 1, &.{ e.det.poses.at(1), self.offsets.at(2) });
+        e.det.project(e.phases.items[phase].det[@intFromEnum(lv)], frame, self.fit.n);
+        self.model.preparePolishColumns(e.det.sims, theta);
+    }
+
+    fn sameIncumbent(self: *const AngleBatch, support: Support) bool {
+        const cached = self.cached orelse return false;
+        if (cached.k != support.k or !std.mem.eql(f32, &cached.theta, &support.theta)) return false;
+        for (cached.members[0..cached.k], support.members[0..support.k]) |a, b| {
+            if (!a.sameProjection(b)) return false;
+        }
+        return true;
+    }
+};
+
 const Member = struct {
     source: overlap.Component = .{},
     rank: i32 = -1,
@@ -223,9 +329,15 @@ const Support = struct {
     }
 };
 
+const PolishedSingleton = struct {
+    state: overlap.State,
+    delta: Offset = @splat(0),
+};
+
 const SingletonSeed = struct {
     state: overlap.State,
     theta: Theta = nuisance.identity,
+    polished: ?PolishedSingleton = null,
 };
 
 const Achieved = struct {
@@ -387,6 +499,7 @@ const Work = struct {
     search: core.Search,
     pool: []core.Record,
     trial_states: gpu.Buf,
+    angles: ?*AngleBatch,
     seed_target: gpu.Buf,
     residual_seeds: []?SingletonSeed,
     cache: [4]Member = @splat(.{}),
@@ -437,11 +550,11 @@ const Work = struct {
         try self.wait();
     }
 
-    fn queueTheta(self: *Work, s: Support, full: bool, trial: *overlap.State, theta: *Theta) void {
+    fn queueTheta(self: *Work, s: Support, trial: *overlap.State, theta: *Theta) void {
         self.stage(s);
         var seeds: [4]Theta = undefined;
         for (&seeds, 0..) |*t, j| t.* = s.members[@min(j, s.k - 1)].single_theta;
-        self.model.profileNuisance(s.theta, seeds, full);
+        self.model.profileNuisance(s.theta, seeds);
         self.model.readProfile(trial, theta);
     }
 
@@ -452,12 +565,12 @@ const Work = struct {
         }
     }
 
-    fn optimizeTheta(self: *Work, s: *Support, full: bool) !void {
+    fn optimizeTheta(self: *Work, s: *Support) !void {
         if (!self.model.optimize_enabled) return;
         try self.check();
         var trial: overlap.State = undefined;
         var theta: Theta = undefined;
-        self.queueTheta(s.*, full, &trial, &theta);
+        self.queueTheta(s.*, &trial, &theta);
         try self.wait();
         retainTheta(s, trial, theta);
     }
@@ -467,45 +580,61 @@ const Work = struct {
     // centre of the trust ball even when a component persists across orders.
     fn poll(self: *Work, s: *Support, column: usize, step: f32, radius: f32) !bool {
         try self.check();
-        var deltas: [6]Offset = undefined;
-        var states: [6]overlap.State = undefined;
-        for (&deltas, 0..) |*delta, i| {
-            delta.* = s.members[column].delta;
-            delta[i / 2] += if (i % 2 == 0) step else -step;
-            const norm = @sqrt(delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]);
-            if (norm > radius) for (delta) |*v| {
-                v.* *= radius / norm;
-            };
+        const deltas = angleNeighbors(s.members[column].delta, step, radius);
+        var states: [poll_angles]overlap.State = undefined;
+        if (self.angles) |batch| {
+            const e = self.engine;
+            const bytes = @as(u64, batch.fit.px) * 4;
+            if (s.k > 1 and !batch.sameIncumbent(s.*)) {
+                self.stage(s.*);
+                self.model.prepareFixedTheta(s.theta);
+                e.g.copy(self.model.trial.bank, 0, batch.incumbent, 0, s.k * bytes);
+                batch.cached = s.*;
+            }
+            const member = s.members[column];
+            const pose: detector.Pose = .{ .q = member.source.q, .t = self.t, .pat = 0 };
+            const poses = [_]detector.Pose{pose} ** poll_angles;
+            const theta = [_]Theta{s.theta} ** poll_angles;
+            batch.project(e, self.lv, self.frame, @intCast(member.source.phase), &poses, &deltas, &theta);
+            const candidates = batch.model.trial.bank;
+            if (s.k == 1) {
+                batch.fit.polishSingletons(candidates);
+            } else {
+                batch.fit.polishMoments(s.k, @intCast(column), batch.incumbent, batch.moments);
+                batch.fit.polishTrials(s.k, @intCast(column), batch.incumbent, candidates, batch.moments);
+            }
+            batch.fit.read(&states);
+            try self.wait();
+            if (retainAngle(&s.state, &s.members[column].delta, &states, &deltas)) |winner| {
+                if (s.k > 1) {
+                    e.g.copy(candidates, winner * bytes, batch.incumbent, column * bytes, bytes);
+                    batch.cached = s.*;
+                }
+                return true;
+            }
+            return false;
+        }
+        for (deltas, 0..) |delta, i| {
             var trial = s.*;
-            trial.members[column].delta = delta.*;
+            trial.members[column].delta = delta;
             self.queueFixed(trial);
             self.engine.g.copy(self.model.trial.state, 0, self.trial_states, i * @sizeOf(overlap.State), @sizeOf(overlap.State));
         }
         self.engine.g.read(self.trial_states, 0, std.mem.asBytes(&states));
         try self.wait();
-        var moved = false;
-        for (states, deltas) |state, delta| {
-            if (!assessed(state) or (assessed(s.state) and !improves(state.sse, s.state.sse, state.initial_sse))) continue;
-            s.state = state;
-            s.members[column].delta = delta;
-            moved = true;
-        }
-        return moved;
+        return retainAngle(&s.state, &s.members[column].delta, &states, &deltas) != null;
     }
 
     fn polishStart(self: *Work, s: *Support) !void {
         const radius = std.math.degreesToRadians(self.options.radius_deg);
-        for ([_]f32{ 0.5, 0.25, 0.125 }) |scale| {
-            var moved = false;
-            for (0..2) |_| {
+        for (angle_scales) |scale| {
+            for (0..sweeps_per_scale) |_| {
                 var changed = false;
                 for (0..s.k) |j| if (try self.poll(s, j, scale * radius, radius)) {
                     changed = true;
                 };
-                moved = moved or changed;
                 if (!changed) break;
             }
-            if (moved) try self.optimizeTheta(s, false);
         }
     }
 
@@ -518,7 +647,7 @@ const Work = struct {
         if (self.model.optimize_enabled) {
             var trial: overlap.State = undefined;
             var theta: Theta = undefined;
-            self.queueTheta(seed, true, &trial, &theta);
+            self.queueTheta(seed, &trial, &theta);
             try self.wait();
             retainTheta(&seed, trial, theta);
         } else if (!prefit) try self.wait();
@@ -528,7 +657,7 @@ const Work = struct {
     fn polishFromSeed(self: *Work, seed: Support) !Support {
         if (self.options.flags & 1 == 0) return seed;
         var best = seed;
-        const starts: usize = if (seed.k == 1) 3 else 1;
+        const starts: usize = if (seed.k == 1) singleton_starts else 1;
         for (0..starts) |i| {
             var current = seed;
             if (i != 0) {
@@ -542,12 +671,17 @@ const Work = struct {
             try self.polishStart(&current);
             if (assessed(current.state) and (!assessed(best.state) or improves(current.state.sse, best.state.sse, current.state.initial_sse))) best = current;
         }
-        var changed = false;
-        for (best.members[0..best.k], seed.members[0..seed.k]) |a, b| if (!a.sameProjection(b)) {
-            changed = true;
-        };
-        if (changed) try self.optimizeTheta(&best, true);
+        try self.refitPolished(&best, seed);
         return best;
+    }
+
+    fn refitPolished(self: *Work, best: *Support, seed: Support) !void {
+        if (self.options.flags & refit_after_polish == 0) return;
+        for (best.members[0..best.k], seed.members[0..seed.k]) |a, b| {
+            if (a.sameProjection(b)) continue;
+            try self.optimizeTheta(best);
+            return;
+        }
     }
 
     fn residual(self: *Work, s: Support) !void {
@@ -568,6 +702,13 @@ const Work = struct {
         var result = if (precomputed) |pre| result: {
             seed.state = pre.state;
             seed.theta = pre.theta;
+            if (pre.polished) |polished| {
+                var best = seed;
+                best.state = polished.state;
+                best.members[0].delta = polished.delta;
+                try self.refitPolished(&best, seed);
+                break :result best;
+            }
             break :result try self.polishFromSeed(seed);
         } else try self.polish(seed, false);
         if (assessed(result.state)) {
@@ -678,7 +819,7 @@ const Work = struct {
             {
                 try self.fixed(&reduced);
                 if (assessed(reduced.state) and improves(reduced.state.sse, lower.state.sse, reduced.state.initial_sse))
-                    try self.optimizeTheta(&reduced, true);
+                    try self.optimizeTheta(&reduced);
             } else reduced = try self.polish(subset, false);
             reduced = try self.compactFace(reduced);
             if (reduced.positive() and reduced.k == 1) {
@@ -885,7 +1026,80 @@ fn fitSingletonSeeds(e: *core.Engine, lv: core.Level, frame: spherical.Frame, ph
     }
 }
 
-fn preparePrimarySeeds(e: *core.Engine, cells: []const u64, primary: []const core.Record, missing: []const u32, lv: core.Level, frame: spherical.Frame, frozen: gpu.Buf, target: gpu.Buf, optimize: bool, seeds: []?SingletonSeed) !void {
+// Initial singleton poses from different scan points can advance together.
+fn polishPrimaryBatch(e: *core.Engine, lv: core.Level, frame: spherical.Frame, phase: usize, frozen: gpu.Buf, poses: []const detector.Pose, rows: []const usize, seeds: []?SingletonSeed, radius_deg: f32) !void {
+    const n = poses.len;
+    const lanes = n * poll_angles;
+    var batch: AngleBatch = undefined;
+    batch.init(e, frame, @intCast(lanes));
+    defer batch.deinit();
+    batch.setTargets(frozen, rows);
+    var trial_poses: [max_angle_lanes]detector.Pose = undefined;
+    var theta: [max_angle_lanes]Theta = undefined;
+    var deltas: [max_angle_lanes]Offset = undefined;
+    var states: [max_angle_lanes]overlap.State = undefined;
+    var best: [max_angle_lanes / poll_angles]PolishedSingleton = undefined;
+    for (poses, seeds, 0..) |pose, seed, i| {
+        const at = i * poll_angles;
+        @memset(trial_poses[at..][0..poll_angles], pose);
+        @memset(theta[at..][0..poll_angles], if (seed) |valid| valid.theta else nuisance.identity);
+        if (seed) |valid| best[i] = .{ .state = valid.state };
+    }
+    const radius = std.math.degreesToRadians(radius_deg);
+    for (0..singleton_starts) |start| {
+        var current: [max_angle_lanes / poll_angles]PolishedSingleton = undefined;
+        for (seeds, 0..) |seed, i| if (seed) |valid| {
+            current[i] = .{ .state = valid.state };
+        };
+        if (start != 0) {
+            const offset: Offset = .{ if (start == 1) radius * 0.5 else -radius * 0.5, 0, 0 };
+            @memset(deltas[0..lanes], offset);
+            try scorePrimaryAngles(e, &batch, lv, frame, phase, trial_poses[0..lanes], deltas[0..lanes], theta[0..lanes], states[0..lanes]);
+            for (seeds, 0..) |seed, i| if (seed != null) {
+                current[i] = .{ .state = states[i * poll_angles], .delta = offset };
+            };
+        }
+        for (angle_scales) |scale| {
+            var active: [max_angle_lanes / poll_angles]bool = @splat(false);
+            for (seeds, 0..) |seed, i| active[i] = seed != null;
+            for (0..sweeps_per_scale) |_| {
+                var any = false;
+                for (active[0..n], 0..) |work, i| {
+                    const at = deltas[i * poll_angles ..][0..poll_angles];
+                    if (work) {
+                        at.* = angleNeighbors(current[i].delta, scale * radius, radius);
+                        any = true;
+                    } else @memset(at, @as(Offset, @splat(0)));
+                }
+                if (!any) break;
+                try scorePrimaryAngles(e, &batch, lv, frame, phase, trial_poses[0..lanes], deltas[0..lanes], theta[0..lanes], states[0..lanes]);
+                for (active[0..n], 0..) |*work, i| {
+                    if (!work.*) continue;
+                    const at = i * poll_angles;
+                    work.* = retainAngle(&current[i].state, &current[i].delta, states[at..][0..poll_angles], deltas[at..][0..poll_angles]) != null;
+                }
+            }
+        }
+        for (seeds, 0..) |seed, i| {
+            if (seed == null or !assessed(current[i].state)) continue;
+            if (improves(current[i].state.sse, best[i].state.sse, current[i].state.initial_sse)) best[i] = current[i];
+        }
+    }
+    for (seeds, 0..) |*seed, i| {
+        if (seed.*) |*valid| valid.polished = best[i];
+    }
+}
+
+fn scorePrimaryAngles(e: *core.Engine, batch: *AngleBatch, lv: core.Level, frame: spherical.Frame, phase: usize, poses: []const detector.Pose, deltas: []const Offset, theta: []const Theta, states: []overlap.State) !void {
+    if (e.cancel.get()) return error.Cancelled;
+    batch.project(e, lv, frame, phase, poses, deltas, theta);
+    batch.fit.polishSingletons(batch.model.trial.bank);
+    batch.fit.read(states);
+    try e.g.wait();
+    if (e.cancel.get()) return error.Cancelled;
+}
+
+fn preparePrimarySeeds(e: *core.Engine, cells: []const u64, primary: []const core.Record, missing: []const u32, lv: core.Level, frame: spherical.Frame, frozen: gpu.Buf, target: gpu.Buf, optimize: bool, options: Options, seeds: []?SingletonSeed) !void {
     if (seeds.len == 0) return;
     const g = &e.g;
     const bytes = @as(u64, frame.pat_h) * frame.pat_w * 4;
@@ -909,6 +1123,15 @@ fn preparePrimarySeeds(e: *core.Engine, cells: []const u64, primary: []const cor
             if (n < 2) continue;
             for (rows[0..n], 0..) |row, i| g.copy(frozen, row * bytes, target, i * bytes, bytes);
             try fitSingletonSeeds(e, lv, frame, phase, poses[0..n], target, optimize, fit_seeds[0..n]);
+            const polish_capacity = AngleBatch.laneCapacity(e, bytes) / poll_angles;
+            if (options.flags & 1 != 0 and polish_capacity >= 2) {
+                var batch_start: usize = 0;
+                while (batch_start < n) : (batch_start += polish_capacity) {
+                    const batch_end = @min(n, batch_start + polish_capacity);
+                    if (batch_end - batch_start < 2) break;
+                    try polishPrimaryBatch(e, lv, frame, phase, frozen, poses[batch_start..batch_end], rows[batch_start..batch_end], fit_seeds[batch_start..batch_end], options.radius_deg);
+                }
+            }
             for (rows[0..n], fit_seeds[0..n]) |row, seed| seeds[phase * cells.len + row] = seed;
         }
     }
@@ -938,7 +1161,7 @@ pub fn run(e: *core.Engine, cells: []const u64, k: u32, primary: []const core.Re
     const primary_seeds = try e.gpa.alloc(?SingletonSeed, if (capacity >= 2 and n > 1) primary.len else 0);
     defer e.gpa.free(primary_seeds);
     @memset(primary_seeds, null);
-    try preparePrimarySeeds(e, cells, primary, missing, lv, frame, frozen, seed_target, optimize, primary_seeds);
+    try preparePrimarySeeds(e, cells, primary, missing, lv, frame, frozen, seed_target, optimize, req.options, primary_seeds);
     var target = g.storage(bytes);
     defer g.release(&target);
     var trial_states = g.storage(6 * @sizeOf(overlap.State));
@@ -950,6 +1173,10 @@ pub fn run(e: *core.Engine, cells: []const u64, k: u32, primary: []const core.Re
     const primary_fits = try e.gpa.alloc(?Support, if (compare_pooled) e.phases.items.len else 0);
     defer e.gpa.free(primary_fits);
     const band = if (prm.method == .spherical) try e.band(prm.bandwidth, lv) else null;
+    var angle_batch: AngleBatch = undefined;
+    const angles = if (req.options.flags & 1 != 0 and AngleBatch.laneCapacity(e, bytes) >= poll_angles) &angle_batch else null;
+    if (angles) |batch| batch.init(e, frame, poll_angles);
+    defer if (angles) |batch| batch.deinit();
     for (cells, 0..) |cell, i| {
         if (e.cancel.get()) return error.Cancelled;
         const first = i * k;
@@ -959,13 +1186,14 @@ pub fn run(e: *core.Engine, cells: []const u64, k: u32, primary: []const core.Re
             continue;
         }
         g.copy(frozen, i * bytes, target, 0, bytes);
+        if (angles) |batch| batch.setTargets(frozen, &.{i});
         var fit = overlap.Fit.init(g, 1, px, hw[1], frame.mask, target);
         defer fit.deinit();
         var model = nuisance.Model.init(g, &e.prep, &fit);
         defer model.deinit();
         model.contrast = true;
         model.optimize_enabled = optimize;
-        var work: Work = .{ .engine = e, .model = &model, .options = req.options, .lv = lv, .frame = frame, .t = try e.positionOf(&e.geo, cell, lv), .row = @intCast(i), .cell = cell, .band = band, .search = prm, .pool = pool, .trial_states = trial_states, .seed_target = seed_target, .residual_seeds = residual_seeds };
+        var work: Work = .{ .engine = e, .model = &model, .options = req.options, .lv = lv, .frame = frame, .t = try e.positionOf(&e.geo, cell, lv), .row = @intCast(i), .cell = cell, .band = band, .search = prm, .pool = pool, .trial_states = trial_states, .angles = angles, .seed_target = seed_target, .residual_seeds = residual_seeds };
         var states: [1]overlap.State = undefined;
         var progress: [1]overlap.Progress = undefined;
         fit.read(&states);

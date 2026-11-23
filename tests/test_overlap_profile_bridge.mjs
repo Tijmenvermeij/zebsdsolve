@@ -40,6 +40,8 @@ const x={ze_create:()=>1,ze_overlap_profile_version:()=>1,ze_overlap_profile_sel
 const legacyV6=x.ze_overlap_cells_v6;
 const solver=new Zebsdsolve(x,{memory});solver._serial=task=>task();solver._frame=task=>task(frame);solver._check=rc=>{assert.equal(rc,0);};
 Object.defineProperties(solver,{settings:{get:()=>({method:'spherical',binning:1,full_resolution:'none',master_smooth:0,clahe:false,bandpass:false})},geometry:{get:()=>({})},phases:{get:()=>[{}]}});
+assert.throws(()=>solver.overlapCells([123],{polish:true,fitBlurGain:true}),/updated WASM module/);
+assert.throws(()=>solver.overlapCells([123],{polish:true,refitBlurGainAfterPolish:true}),/requires both/);
 const result=await solver.overlapCells([123],{polish:true,minResidualNcc:1});
 assert.equal(called,1);assert.equal(result.profile_version,1);assert.equal(result.stop_reason_name[0],'residual_screen');
 assert.equal(result.profile_events[0].cell,123);assert.equal(result.source_quaternions[0],1);assert.equal(result.residual_screen.confidence_calibrated,false);
