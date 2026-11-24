@@ -280,6 +280,8 @@ body[data-resize="col"] * { cursor: col-resize !important; }
 .pane-bar { min-height: var(--bar); flex: none; display: flex; align-items: center; gap: 4px 8px; padding: 0 8px; background: var(--panel); border-bottom: 1px solid var(--line); user-select: none; overflow: hidden; }
 .meta { color: var(--faint); font: 11px var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .map-pane .pane-bar { flex-wrap: wrap; column-gap: 6px; padding-block: 4px; }
+#map-hover { flex: none; width: 52ch; max-width: 100%; }
+.app[data-scan="0"] #map-hover { display: none; }
 .map-pane .seg button, #btn-overview { padding-inline: 6px; }
 .ttl { font-size: 10.5px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
 .meta.cell { color: var(--muted); }
