@@ -185,7 +185,7 @@
           <div class="fields">
             <label class="field wide"><span>Primary</span><select id="overlap-primary"><option value="stored">Existing results</option><option value="index">Index first</option></select></label>
             <label class="field"><span>Maximum components</span><select id="overlap-limit"><option>2</option><option>3</option><option>4</option></select></label>
-            <label class="field"><span>Search candidates</span><input id="overlap-keep-n" type="number" min="1" max="8" step="1" value="1" title="Orientations retained per phase for each residual search in the next overlap run. Each is refined against the same residual, then compared by fitting all components to the original pattern. The primary indexing step is unchanged. For 3–4 components, the single-candidate sequence is also checked to prevent a worse final fit."></label>
+            <label class="field"><span>Search candidates</span><input id="overlap-keep-n" type="number" min="1" max="8" step="1" value="1" title="Orientations retained per phase for each residual search. Candidates are refined against the residual and compared by fitting all components to the original pattern. With multiple candidates, screening or polishing also checks a separate rank-one search for any component limit. When both are off, this comparison applies at limits of 3 or 4."></label>
           </div>
           <div class="fields" id="overlap-spherical-bandwidth">
             <label class="check"><input type="checkbox" id="overlap-link-bandwidth" checked> Use same as primary indexing</label>
