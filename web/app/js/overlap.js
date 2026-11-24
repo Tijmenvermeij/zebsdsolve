@@ -35,6 +35,7 @@ export function profileEventsForExport(events, cells) {
 export function createOverlap({ st, busy, runPrimary, selectTab, redraw, status, log, renderIpfKey, inspectPrimary }) {
   let active = false, run = null, launching = false, inspectSerial = 0, lastRanges = [[0,1],[0,1]], primaryColors=null;
   let ipfKind = "ipf_z", customBandwidth = null;
+  let rightMapCount = null;
   const ordinaryMapTitle = $("map-well").title;
   const filterState = () => ({key:$("overlap-filter-metric").value,operator:"min",cutoff:$("overlap-filter-value").valueAsNumber});
   const primaryCutoff = () => $("overlap-primary-cutoff").valueAsNumber;
@@ -144,12 +145,23 @@ export function createOverlap({ st, busy, runPrimary, selectTab, redraw, status,
         choice.title=choice.selectedOptions[0]?.title || "";
       }
     }
-    $("overlap-readout").textContent = !run ? "" : `${fresh() ? run.state : "Context changed"} · ${run.completedCount.toLocaleString()} / ${run.requested.length.toLocaleString()} cells\n${run.fittedCount.toLocaleString()} candidate fits${run.unseededCount ? ` · ${run.unseededCount.toLocaleString()} missing primary` : ""}`;
-    if(run && fresh() && !primaryMap(1)) {
+    const current = fresh();
+    $("overlap-readout").textContent = !run ? "" : `${current ? run.state : "Context changed"} · ${run.completedCount.toLocaleString()} / ${run.requested.length.toLocaleString()} cells\n${run.fittedCount.toLocaleString()} candidate fits${run.unseededCount ? ` · ${run.unseededCount.toLocaleString()} missing primary` : ""}`;
+    if(current && !primaryMap(1)) {
       const source=mapSource(1), cutoff=residualCutoff(),filter=filterState();
-      let shown=0;
-      for(const cell of run.requested)if(mapComponent(source,cell,cutoff,filter)>=0)shown++;
-      $("overlap-readout").textContent+=`\n${shown.toLocaleString()} shown in right map`;
+      if (rightMapCount?.run !== run || rightMapCount.source !== source || !Object.is(rightMapCount.cutoff, cutoff) ||
+          rightMapCount.filter.key !== filter.key || rightMapCount.filter.operator !== filter.operator ||
+          !Object.is(rightMapCount.filter.cutoff, filter.cutoff)) {
+        rightMapCount = {run, source, cutoff, filter, counted:0, shown:0};
+      }
+      // Tiles commit in request order, so completedCount bounds the committed prefix.
+      for (let i = rightMapCount.counted; i < run.completedCount; i++) {
+        if (mapComponent(source,run.requested[i],cutoff,filter)>=0) rightMapCount.shown++;
+      }
+      rightMapCount.counted = run.completedCount;
+      $("overlap-readout").textContent+=`\n${rightMapCount.shown.toLocaleString()} shown in right map`;
+    } else {
+      rightMapCount = null;
     }
     for(let i=0;i<2;i++) {
       const primary=primaryMap(i),select=mapSelect(i);
@@ -309,7 +321,8 @@ export function createOverlap({ st, busy, runPrimary, selectTab, redraw, status,
     let lo = kind === "proposal_ncc" ? -1 : 0, hi = kind === "fraction" ? 1 : kind === "count" || kind === "proposals" ? run.k : 1;
     if (["residual","improvement","single_improvement"].includes(kind) && data) [lo, hi] = quantiles(Float32Array.from(run.completed, (v,i) => v ? data.values[i*data.stride] : NaN), 0, 1);
     lastRanges[i]=[lo,hi];
-    for (const cell of run.requested) {
+    for (let row = 0; row < run.completedCount; row++) {
+      const cell = run.requested[row];
       const component = mapComponent(source,cell,cutoff,filter);
       if (component<0) continue;
       const at = cell*4, slot = cell*run.k + component;
@@ -491,10 +504,13 @@ export function createOverlap({ st, busy, runPrimary, selectTab, redraw, status,
     }
     if(!(get("retained_order")?.[cell]>0))return;
     try {
-      const result = Object.fromEntries(Object.entries(run.arrays).map(([key,field])=>[key,field.values]));
-      result.max_components=k;result.maxComponents=k;result.blur_gain=run.metadata.blur_gain;result.blur_gain_optimizer=run.metadata.blur_gain_optimizer;result.model=run.metadata.model;result.fit_model=run.metadata.fit_model;result.gain_domain=run.metadata.gain_domain;
-      result.cells=Uint32Array.from({length:run.completed.length},(_,i)=>i);
-      const images=await st.ze.overlapInspect(cell,result,cell,component);
+      const {blur_gain, blur_gain_optimizer, model, fit_model, gain_domain} = run.metadata;
+      const result = {cells:Uint32Array.of(cell), max_components:k, blur_gain, blur_gain_optimizer, model, fit_model, gain_domain};
+      for (const key of ["quaternions","amplitudes","phase","proposal_ncc","proposal_nmi","blur_gain_theta"]) {
+        const field = run.arrays[key];
+        if (field) result[key] = field.values.subarray(cell*field.stride,(cell+1)*field.stride);
+      }
+      const images=await st.ze.overlapInspect(cell,result,0,component);
       if (!active || serial!==inspectSerial || !fresh() || st.cell!==cell) return;
       const [h,w]=images.shape, individual=$("overlap-inspection").value==="component";
       // Native inspection replays the saved nuisance parameters before applying

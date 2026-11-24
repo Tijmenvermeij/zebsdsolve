@@ -2165,17 +2165,22 @@ pub const Engine = struct {
         @memset(out, .{ .q = @splat(0), .ncc = -2, .nmi = 0, .step = 0, .z = 0 });
         const items = try self.gpa.alloc(spherical.Item, n);
         defer self.gpa.free(items);
-        const poses = try self.gpa.alloc(detector.Pose, n);
+        // Keep at least the former per-rank capacity. Small requests can
+        // refine several ranks at once within the detector scratch budget.
+        const scratch_per_pose = @as(u64, detector.NS) * 1024 * @sizeOf(f32);
+        const limit = @min(g.lim.max_storage_binding, g.lim.max_buffer, @as(u64, self.set.tile_mb) << 20);
+        const capacity = @max(n, @as(u32, @intCast(@min(limit / scratch_per_pose, keep_n))));
+        const poses = try self.gpa.alloc(detector.Pose, capacity);
         defer self.gpa.free(poses);
-        const source_rows = try self.gpa.alloc(usize, n);
-        defer self.gpa.free(source_rows);
-        const refined = try self.gpa.alloc(Record, n);
+        const source_slots = try self.gpa.alloc(usize, capacity);
+        defer self.gpa.free(source_slots);
+        const refined = try self.gpa.alloc(Record, capacity);
         defer self.gpa.free(refined);
         const peaks = try self.gpa.alloc([8]f32, @as(usize, n) * keep_n);
         defer self.gpa.free(peaks);
         const scores = try self.gpa.alloc([2]u32, @as(usize, n) * keep_n);
         defer self.gpa.free(scores);
-        var records = g.storage(@as(u64, n) * @sizeOf(Record));
+        var records = g.storage(@as(u64, capacity) * @sizeOf(Record));
         defer g.release(&records);
         for (cells, 0..) |cell, b| {
             const t = try self.positionOf(&self.geo, cell, lv);
@@ -2227,24 +2232,27 @@ pub const Engine = struct {
                     peaks[i][4] = @bitCast(hit[0]);
                 }
             }
-            for (0..keep_n) |rank| {
+            const phase_out = out[pi * peaks.len ..][0..peaks.len];
+            var first: usize = 0;
+            while (first < peaks.len) {
                 if (self.cancel.get()) return error.Cancelled;
-                var valid_count: usize = 0;
-                for (0..n) |b| {
-                    const peak = peaks[rank * n + b];
+                var count: usize = 0;
+                while (first < peaks.len and count < capacity) : (first += 1) {
+                    const peak = peaks[first];
                     var norm: f32 = 0;
                     for (peak[0..4]) |v| norm += v * v;
                     if (!std.math.isFinite(norm) or @abs(norm - 1) > 0.01 or !std.math.isFinite(peak[4]) or peak[4] < -1) continue;
-                    poses[valid_count] = .{ .t = items[b][0..3].*, .pat = @floatFromInt(b), .q = peak[0..4].* };
-                    source_rows[valid_count] = b;
-                    valid_count += 1;
+                    const b = first % n;
+                    poses[count] = .{ .t = items[b][0..3].*, .pat = @floatFromInt(b), .q = peak[0..4].* };
+                    source_slots[count] = first;
+                    count += 1;
                 }
-                if (valid_count == 0) continue;
-                self.det.setPoses(poses[0..valid_count]);
-                self.det.refine(phase.det[@intFromEnum(lv)], fr, self.pats[@intFromEnum(lv)], @intCast(valid_count), options, records, 0);
-                g.read(records, 0, std.mem.sliceAsBytes(refined[0..valid_count]));
+                if (count == 0) continue;
+                self.det.setPoses(poses[0..count]);
+                self.det.refine(phase.det[@intFromEnum(lv)], fr, self.pats[@intFromEnum(lv)], @intCast(count), options, records, 0);
+                g.read(records, 0, std.mem.sliceAsBytes(refined[0..count]));
                 try g.wait();
-                for (0..valid_count) |j| out[(pi * keep_n + rank) * n + source_rows[j]] = refined[j];
+                for (source_slots[0..count], refined[0..count]) |slot, record| phase_out[slot] = record;
             }
         }
     }
@@ -2384,12 +2392,12 @@ pub const Engine = struct {
         const gpa = self.gpa;
         var prm = self.searchOf();
         if (bandwidth != 0 and prm.method == .spherical) prm.bandwidth = bandwidth;
-        if (keep_n > 1 and prm.method == .pca) return error.MultiCandidatePcaUnsupported;
+        if (max_components > 1 and keep_n > 1 and prm.method == .pca) return error.MultiCandidatePcaUnsupported;
         if (self.phases.items.len * keep_n > (1 << 24)) return error.TooManyCandidateIdentities;
         // Reset before preflight can suspend; never clear cancellation after a wait.
         self.cancel.set(false);
         // Fail on unsupported one-item SI allocations before ordinary fresh K1.
-        if (keep_n > 1 and prm.method == .spherical) {
+        if (max_components > 1 and keep_n > 1 and prm.method == .spherical) {
             if (comptime !@hasDecl(spherical.Spherical, "candidatePeaks")) return error.MultiCandidateSphericalUnavailable;
             const candidate_band = try self.band(prm.bandwidth, lv);
             const limit = @min(g.lim.max_storage_binding, g.lim.max_buffer);
@@ -2443,9 +2451,9 @@ pub const Engine = struct {
             // only resources needed for future residual proposals; upload once.
             self.det.chunk_px = self.set.refine_pixels;
             self.det.wg = self.set.wg_refine;
-            if (prm.method == .spherical) _ = try self.band(prm.bandwidth, lv);
+            if (max_components > 1 and prm.method == .spherical) _ = try self.band(prm.bandwidth, lv);
             try self.prepareMasters(&.{lv});
-            if (prm.method == .pca) {
+            if (max_components > 1 and prm.method == .pca) {
                 const t = try self.translationOf(&self.geo, lv);
                 for (self.phases.items) |*phase| try self.preparePca(phase, prm.dict_grid, lv, try self.frame(lv), .{ @floatCast(t[0]), @floatCast(t[1]), @floatCast(t[2]) });
             }
@@ -2583,7 +2591,7 @@ pub const Engine = struct {
         fit.writeProgress(progress);
         const poses = try gpa.alloc(detector.Pose, n);
         defer gpa.free(poses);
-        const bd = if (prm.method == .spherical) try self.band(prm.bandwidth, lv) else null;
+        const bd = if (max_components > 1 and prm.method == .spherical) try self.band(prm.bandwidth, lv) else null;
         const fr = try self.frame(lv);
         for (0..max_components) |pass| {
             if (self.cancel.get()) return error.Cancelled;
@@ -2673,9 +2681,11 @@ pub const Engine = struct {
                 for (final_norms, 0..) |row, b| for (0..max_components) |j| {
                     values[b * max_components + j] = row[j];
                 };
-            } else model.readTheta(theta.?);
-            try g.wait();
-            if (self.cancel.get()) return error.Cancelled;
+            } else {
+                model.readTheta(theta.?);
+                try g.wait();
+                if (self.cancel.get()) return error.Cancelled;
+            }
         }
         for (missing, states, progress) |reason, *state, *m| if (reason != 0) {
             state.* = .{ .sse = std.math.nan(f32), .initial_sse = std.math.nan(f32), .correlation = std.math.nan(f32), .condition = std.math.nan(f32), .single_sse = @splat(std.math.nan(f32)), .best_single_sse = std.math.nan(f32), .trial_sse = std.math.nan(f32) };
@@ -2821,16 +2831,17 @@ pub const Engine = struct {
             model.contrast = contrast;
             model.optimize_enabled = optimize;
             model.fixed(templates, k);
-            model.readTheta(values);
             if (norms) |norm_values| {
+                // Reserve both host destinations before queuing either readback.
                 const final_norms = try self.gpa.alloc([4]f32, n);
                 defer self.gpa.free(final_norms);
+                model.readTheta(values);
                 model.readNorms(final_norms, false);
                 try g.wait();
                 for (final_norms, 0..) |row, b| for (0..k) |j| {
                     norm_values[b * k + j] = row[j];
                 };
-            }
+            } else model.readTheta(values);
         } else {
             g.writeSlice(fit.bank, 0, f32, templates);
             self.prep.filter(fit.bank, k * n, h, w, .{ .mask = mask });

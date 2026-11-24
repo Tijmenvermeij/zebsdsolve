@@ -453,6 +453,18 @@ try {
     link.checked=false;link.dispatchEvent(new Event('change'));
     require(!bw.disabled,'manual bandwidth not editable');
     bw.value=String(primaryBandwidth+4);bw.dispatchEvent(new Event('change'));
+    const validity=ze.storedPrimaryValidity();
+    const cells=[];
+    for(let i=0;i<validity.length && cells.length<2;i++)if(validity[i]===1)cells.push(i);
+    require(cells.length===2 && ze.phases.length===1,'fixture requires two stored seeds in one phase');
+    const screenOptions={primary:'stored',maxComponents:2,fitBlurGain:true,minResidualNcc:.1};
+    const batched=await ze.overlapCells(cells,screenOptions);
+    require(batched.profile_events.some(event=>event.order===2),'batched residual searches were not exercised');
+    for(const [row,cell] of cells.entries()){
+      const scalar=await ze.overlapCells([cell],screenOptions);
+      require(batched.stop_reason[row]===scalar.stop_reason[0] && Math.abs(batched.sse[row]-scalar.sse[0])<1e-6,
+        'WebGPU residual batch differs from the one-cell fit');
+    }
     screen.checked=true;screen.dispatchEvent(new Event('change'));cutoff.value='1';cutoff.dispatchEvent(new Event('change'));
     polish.checked=true;polish.dispatchEvent(new Event('change'));
     document.getElementById('btn-overlap-run').click();

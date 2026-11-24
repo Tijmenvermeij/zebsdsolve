@@ -338,6 +338,12 @@ const SingletonSeed = struct {
     state: overlap.State,
     theta: Theta = nuisance.identity,
     polished: ?PolishedSingleton = null,
+
+    fn needsResidual(seed: ?SingletonSeed) bool {
+        const fit = (seed orelse return false).state;
+        return fit.amplitude[0] > 0 and improves(fit.sse, fit.initial_sse, fit.initial_sse) and
+            fit.sse > 1e-8 * fit.initial_sse;
+    }
 };
 
 const Achieved = struct {
@@ -502,6 +508,7 @@ const Work = struct {
     angles: ?*AngleBatch,
     seed_target: gpu.Buf,
     residual_seeds: []?SingletonSeed,
+    first_residual: ?FirstResidual = null,
     cache: [4]Member = @splat(.{}),
 
     fn check(self: *Work) !void {
@@ -686,7 +693,8 @@ const Work = struct {
 
     fn residual(self: *Work, s: Support) !void {
         try self.check();
-        self.queueFixed(s);
+        self.stage(s);
+        self.model.prepareFixedTheta(s.theta);
         const g = &self.engine.g;
         const f = self.model.fit;
         g.copy(self.model.trial.bank, 0, f.bank, 0, @as(u64, s.k) * f.px * 4);
@@ -865,7 +873,7 @@ const Work = struct {
                 }
                 if (n < 2) continue;
                 for (0..n) |i| g.copy(self.model.fit.original, 0, self.seed_target, i * bytes, bytes);
-                try fitSingletonSeeds(self.engine, self.lv, self.frame, phase, poses[0..n], self.seed_target, self.model.optimize_enabled, seeds[0..n]);
+                try fitSingletonSeeds(self.engine, self.lv, self.frame, phase, poses[0..n], self.seed_target, self.model.optimize_enabled, seeds[0..n], null);
                 for (rows[0..n], seeds[0..n]) |row, seed| self.residual_seeds[row] = seed;
             }
         }
@@ -879,10 +887,19 @@ const Work = struct {
             const baseline = out.support;
             const order = baseline.k + 1;
             const ranks = if (order == 1) 1 else keep_n;
+            var first_prefit: ?SingletonSeed = null;
             if (order != 1) {
-                try self.residual(baseline);
-                const nrec = self.engine.phases.items.len * ranks;
-                try self.engine.indexPreparedCandidates(&.{self.cell}, self.search, self.band, ranks, self.pool[0..nrec]);
+                if (self.first_residual) |cached| {
+                    // This cache is only installed for rank-one, unpolished,
+                    // single-phase K2 with the same prefit used for this primary.
+                    self.pool[0] = cached.record;
+                    first_prefit = cached.seed;
+                    self.first_residual = null;
+                } else {
+                    try self.residual(baseline);
+                    const nrec = self.engine.phases.items.len * ranks;
+                    try self.engine.indexPreparedCandidates(&.{self.cell}, self.search, self.band, ranks, self.pool[0..nrec]);
+                }
                 try self.check();
                 try self.prepareResidualSeeds(ranks);
             }
@@ -915,6 +932,8 @@ const Work = struct {
                 const primary_fit = if (order == 1 and primary_fits.len != 0) &primary_fits[pi] else null;
                 const precomputed = if (order == 1)
                     if (primary_seeds.len != 0) primary_seeds[pi * stride + self.row] else null
+                else if (first_prefit != null)
+                    first_prefit
                 else if (self.residual_seeds.len != 0)
                     self.residual_seeds[pi * ranks + rank]
                 else
@@ -996,7 +1015,7 @@ const Work = struct {
 
 /// Shared fixed-identity and blur/gain prefit. All lanes in a dispatch
 /// project the same master, each with its own pose and measured target.
-fn fitSingletonSeeds(e: *core.Engine, lv: core.Level, frame: spherical.Frame, phase: usize, poses: []const detector.Pose, target: gpu.Buf, optimize: bool, seeds: []?SingletonSeed) !void {
+fn fitSingletonSeeds(e: *core.Engine, lv: core.Level, frame: spherical.Frame, phase: usize, poses: []const detector.Pose, target: gpu.Buf, optimize: bool, seeds: []?SingletonSeed, residuals: ?gpu.Buf) !void {
     if (e.cancel.get()) return error.Cancelled;
     const g = &e.g;
     const px = frame.pat_h * frame.pat_w;
@@ -1004,18 +1023,25 @@ fn fitSingletonSeeds(e: *core.Engine, lv: core.Level, frame: spherical.Frame, ph
     var fixed_states: [64]overlap.State = undefined;
     var optimized_states: [64]overlap.State = undefined;
     var theta: [64]Theta = undefined;
-    {
-        var fit = overlap.Fit.init(g, count, px, frame.pat_w, frame.mask, target);
-        defer fit.deinit();
-        var model = nuisance.Model.init(g, &e.prep, &fit);
-        defer model.deinit();
-        model.contrast = true;
-        model.optimize_enabled = optimize;
-        e.det.setPoses(poses);
-        e.det.project(e.phases.items[phase].det[@intFromEnum(lv)], frame, count);
-        g.copy(e.det.sims, 0, model.raw, 0, @as(u64, count) * px * 4);
-        model.singletonSeeds(fixed_states[0..count], optimized_states[0..count], theta[0..count]);
-    } // Retire the fit buffers with this submission; host read destinations stay live.
+    var fit = overlap.Fit.init(g, count, px, frame.pat_w, frame.mask, target);
+    var model = nuisance.Model.init(g, &e.prep, &fit);
+    defer if (residuals != null) {
+        model.deinit();
+        fit.deinit();
+        // Submit the completed residual before the next large workspace is
+        // allocated. No host readback is needed here.
+        g.submit();
+    };
+    model.contrast = true;
+    model.optimize_enabled = optimize;
+    e.det.setPoses(poses);
+    e.det.project(e.phases.items[phase].det[@intFromEnum(lv)], frame, count);
+    g.copy(e.det.sims, 0, model.raw, 0, @as(u64, count) * px * 4);
+    model.singletonSeeds(fixed_states[0..count], optimized_states[0..count], theta[0..count]);
+    if (residuals == null) {
+        model.deinit();
+        fit.deinit();
+    }
     try g.wait();
     if (e.cancel.get()) return error.Cancelled;
     for (seeds, 0..) |*out, i| {
@@ -1023,6 +1049,21 @@ fn fitSingletonSeeds(e: *core.Engine, lv: core.Level, frame: spherical.Frame, ph
         if (optimize) Work.retainTheta(&seed, optimized_states[i], theta[i]);
         // Let the scalar path retain its exact unavailable-state diagnostics.
         out.* = if (assessed(seed.state)) .{ .state = seed.state, .theta = seed.theta } else null;
+    }
+    if (residuals) |destination| {
+        for (seeds) |seed| {
+            if (SingletonSeed.needsResidual(seed)) break;
+        } else return;
+        for (seeds, 0..) |seed, i| {
+            fixed_states[i] = if (seed) |valid| valid.state else .{};
+            theta[i] = if (seed) |valid| valid.theta else nuisance.identity;
+        }
+        // The same original image, fixed theta, and saved amplitudes as
+        // Work.residual, with one independent target per lane.
+        model.preparePolishColumns(model.raw, theta[0..count]);
+        g.copy(model.trial.bank, 0, fit.bank, 0, @as(u64, count) * px * 4);
+        g.writeSlice(fit.state, 0, overlap.State, fixed_states[0..count]);
+        fit.residual(1, destination, true);
     }
 }
 
@@ -1099,7 +1140,18 @@ fn scorePrimaryAngles(e: *core.Engine, batch: *AngleBatch, lv: core.Level, frame
     if (e.cancel.get()) return error.Cancelled;
 }
 
-fn preparePrimarySeeds(e: *core.Engine, cells: []const u64, primary: []const core.Record, missing: []const u32, lv: core.Level, frame: spherical.Frame, frozen: gpu.Buf, target: gpu.Buf, optimize: bool, options: Options, seeds: []?SingletonSeed) !void {
+const FirstResidual = struct {
+    record: core.Record,
+    seed: ?SingletonSeed = null,
+};
+
+const Prefetch = struct {
+    records: []?FirstResidual,
+    search: core.Search,
+    band: ?*core.Band,
+};
+
+fn preparePrimarySeeds(e: *core.Engine, cells: []const u64, primary: []const core.Record, missing: []const u32, lv: core.Level, frame: spherical.Frame, frozen: gpu.Buf, target: gpu.Buf, optimize: bool, options: Options, seeds: []?SingletonSeed, prefetch: ?Prefetch) !void {
     if (seeds.len == 0) return;
     const g = &e.g;
     const bytes = @as(u64, frame.pat_h) * frame.pat_w * 4;
@@ -1122,7 +1174,13 @@ fn preparePrimarySeeds(e: *core.Engine, cells: []const u64, primary: []const cor
             }
             if (n < 2) continue;
             for (rows[0..n], 0..) |row, i| g.copy(frozen, row * bytes, target, i * bytes, bytes);
-            try fitSingletonSeeds(e, lv, frame, phase, poses[0..n], target, optimize, fit_seeds[0..n]);
+            // The prefit has already copied the measured rows into fit.original,
+            // so its input staging buffer can hold the generated residuals.
+            const residuals = if (prefetch != null) target else null;
+            try fitSingletonSeeds(e, lv, frame, phase, poses[0..n], target, optimize, fit_seeds[0..n], residuals);
+            if (prefetch) |cache| {
+                try prefetchResiduals(e, cells, lv, frame, phase, frozen, target, optimize, options, cache, poses[0..n], rows[0..n], fit_seeds[0..n]);
+            }
             const polish_capacity = AngleBatch.laneCapacity(e, bytes) / poll_angles;
             if (options.flags & 1 != 0 and polish_capacity >= 2) {
                 var batch_start: usize = 0;
@@ -1134,6 +1192,44 @@ fn preparePrimarySeeds(e: *core.Engine, cells: []const u64, primary: []const cor
             }
             for (rows[0..n], fit_seeds[0..n]) |row, seed| seeds[phase * cells.len + row] = seed;
         }
+    }
+}
+
+fn prefetchResiduals(e: *core.Engine, cells: []const u64, lv: core.Level, frame: spherical.Frame, phase: usize, frozen: gpu.Buf, target: gpu.Buf, optimize: bool, options: Options, cache: Prefetch, poses: []detector.Pose, rows: []const usize, primary_seeds: []const ?SingletonSeed) !void {
+    const g = &e.g;
+    const bytes = @as(u64, frame.pat_h) * frame.pat_w * 4;
+    var ids: [64]u64 = undefined;
+    var lanes: [64]usize = undefined;
+    var live: usize = 0;
+    for (rows, primary_seeds, 0..) |row, seed, i| {
+        if (!SingletonSeed.needsResidual(seed)) continue;
+        g.copy(target, i * bytes, e.pats[@intFromEnum(lv)], live * bytes, bytes);
+        ids[live] = cells[row];
+        lanes[live] = i;
+        live += 1;
+    }
+    if (live == 0) return;
+
+    var proposals: [64]core.Record = undefined;
+    try e.indexPreparedCandidates(ids[0..live], cache.search, cache.band, 1, proposals[0..live]);
+    var accepted: usize = 0;
+    var proposal_rows: [64]usize = undefined;
+    for (lanes[0..live], proposals[0..live]) |i, proposal| {
+        const row = rows[i];
+        cache.records[row] = .{ .record = proposal };
+        const member = Member.indexed(proposal, phase, 1);
+        if (!member.valid() or proposal.ncc < options.min_residual_ncc) continue;
+        poses[accepted] = .{ .q = proposal.q, .t = poses[i].t, .pat = 0 };
+        proposal_rows[accepted] = row;
+        accepted += 1;
+    }
+    if (accepted < 2) return;
+
+    var proposal_seeds: [64]?SingletonSeed = undefined;
+    for (proposal_rows[0..accepted], 0..) |row, i| g.copy(frozen, row * bytes, target, i * bytes, bytes);
+    try fitSingletonSeeds(e, lv, frame, phase, poses[0..accepted], target, optimize, proposal_seeds[0..accepted], null);
+    for (proposal_rows[0..accepted], proposal_seeds[0..accepted]) |row, seed| {
+        cache.records[row].?.seed = seed;
     }
 }
 
@@ -1161,9 +1257,23 @@ pub fn run(e: *core.Engine, cells: []const u64, k: u32, primary: []const core.Re
     const primary_seeds = try e.gpa.alloc(?SingletonSeed, if (capacity >= 2 and n > 1) primary.len else 0);
     defer e.gpa.free(primary_seeds);
     @memset(primary_seeds, null);
-    try preparePrimarySeeds(e, cells, primary, missing, lv, frame, frozen, seed_target, optimize, req.options, primary_seeds);
-    var target = g.storage(bytes);
-    defer g.release(&target);
+    const band = if (k > 1 and prm.method == .spherical) try e.band(prm.bandwidth, lv) else null;
+    // In this case the sole candidate always supplies the first achieved
+    // primary; no phase comparison, orientation polish or pooled branch can
+    // change the prefit used to generate its first residual.
+    const prefetch_enabled = primary_seeds.len > 0 and k == 2 and keep_n == 1 and
+        e.phases.items.len == 1 and req.options.flags & 3 == 2;
+    const prefetched = try e.gpa.alloc(?FirstResidual, if (prefetch_enabled) n else 0);
+    defer e.gpa.free(prefetched);
+    @memset(prefetched, null);
+    const prefetch: ?Prefetch = if (prefetch_enabled) .{ .records = prefetched, .search = prm, .band = band } else null;
+    try preparePrimarySeeds(e, cells, primary, missing, lv, frame, frozen, seed_target, optimize, req.options, primary_seeds, prefetch);
+    var fit = overlap.Fit.init(g, 1, px, hw[1], frame.mask, frozen);
+    defer fit.deinit();
+    var model = nuisance.Model.init(g, &e.prep, &fit);
+    defer model.deinit();
+    model.contrast = true;
+    model.optimize_enabled = optimize;
     var trial_states = g.storage(6 * @sizeOf(overlap.State));
     defer g.release(&trial_states);
     const pool = try e.gpa.alloc(core.Record, e.phases.items.len * keep_n);
@@ -1172,7 +1282,6 @@ pub fn run(e: *core.Engine, cells: []const u64, k: u32, primary: []const core.Re
     defer e.gpa.free(residual_seeds);
     const primary_fits = try e.gpa.alloc(?Support, if (compare_pooled) e.phases.items.len else 0);
     defer e.gpa.free(primary_fits);
-    const band = if (prm.method == .spherical) try e.band(prm.bandwidth, lv) else null;
     var angle_batch: AngleBatch = undefined;
     const angles = if (req.options.flags & 1 != 0 and AngleBatch.laneCapacity(e, bytes) >= poll_angles) &angle_batch else null;
     if (angles) |batch| batch.init(e, frame, poll_angles);
@@ -1185,15 +1294,13 @@ pub fn run(e: *core.Engine, cells: []const u64, k: u32, primary: []const core.Re
             outputs.progress[i] = .{ .stop_reason = missing[i], .previous_sse = nan, .incremental_improvement = nan, ._pad = unselected };
             continue;
         }
-        g.copy(frozen, i * bytes, target, 0, bytes);
+        if (i != 0) {
+            g.copy(frozen, i * bytes, fit.original, 0, bytes);
+            fit.resetTarget(fit.original);
+            model.resetProfileTarget();
+        }
         if (angles) |batch| batch.setTargets(frozen, &.{i});
-        var fit = overlap.Fit.init(g, 1, px, hw[1], frame.mask, target);
-        defer fit.deinit();
-        var model = nuisance.Model.init(g, &e.prep, &fit);
-        defer model.deinit();
-        model.contrast = true;
-        model.optimize_enabled = optimize;
-        var work: Work = .{ .engine = e, .model = &model, .options = req.options, .lv = lv, .frame = frame, .t = try e.positionOf(&e.geo, cell, lv), .row = @intCast(i), .cell = cell, .band = band, .search = prm, .pool = pool, .trial_states = trial_states, .angles = angles, .seed_target = seed_target, .residual_seeds = residual_seeds };
+        var work: Work = .{ .engine = e, .model = &model, .options = req.options, .lv = lv, .frame = frame, .t = try e.positionOf(&e.geo, cell, lv), .row = @intCast(i), .cell = cell, .band = band, .search = prm, .pool = pool, .trial_states = trial_states, .angles = angles, .seed_target = seed_target, .residual_seeds = residual_seeds, .first_residual = if (prefetch_enabled) prefetched[i] else null };
         var states: [1]overlap.State = undefined;
         var progress: [1]overlap.Progress = undefined;
         fit.read(&states);

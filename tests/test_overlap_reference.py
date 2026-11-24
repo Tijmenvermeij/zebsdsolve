@@ -12,7 +12,6 @@ import test_overlap as fixtures
 from zebsdsolve import Error
 
 ROOT=Path(__file__).resolve().parents[1]
-OLD=Path('/Users/tvermeij/EMsoftData/overlap_keepn_production_20261117/native/libzebsdsolve_268330f84d0c.dylib')
 
 
 def compare_histories(new,old):
@@ -47,22 +46,30 @@ def compare_histories(new,old):
 
 class IndependentReferenceHistories(unittest.TestCase):
     def test_selected_payload_equals_independent_greedy_or_rank_one(self):
-        if not OLD.exists():self.skipTest('frozen independent original V5 library required')
-        requested=os.environ.get('ZEBSDSOLVE_REFERENCE_ARTIFACTS')
+        baseline = os.environ.get('ZEBSDSOLVE_REFERENCE_BASELINE')
+        if not baseline:
+            self.skipTest('set ZEBSDSOLVE_REFERENCE_BASELINE to frozen compatible reference arrays')
+        reference = Path(baseline)
+        requested = os.environ.get('ZEBSDSOLVE_REFERENCE_ARTIFACTS')
         with tempfile.TemporaryDirectory() as temporary:
-            output=Path(requested or temporary);output.mkdir(parents=True,exist_ok=True)
-            summary={}
+            output = Path(requested or temporary)
+            output.mkdir(parents=True, exist_ok=True)
+            summary = {}
             for method in ('dictionary','spherical'):
-                for mode in ('old','new'):
-                    env=os.environ.copy()
-                    if mode=='old':env['ZEBSDSOLVE_LIB']=str(OLD)
-                    run=subprocess.run([sys.executable,str(ROOT/'tests/overlap_reference_capture.py'),str(output/f'{mode}_{method}.npz'),method],env=env,capture_output=True,text=True,timeout=180)
-                    (output/f'{mode}_{method}.log').write_text(run.stdout+run.stderr)
-                    self.assertEqual(run.returncode,0,run.stdout+run.stderr)
-                counts,fields=compare_histories(np.load(output/f'new_{method}.npz'),np.load(output/f'old_{method}.npz'))
-                for mode in ('old','new'):
-                    info=json.loads((output/f'{mode}_{method}.json').read_text())
-                    for profile in info['profiles'].values():self.assertEqual(profile['prep_load_dispatches'],1)
+                old = reference / f'old_{method}.npz'
+                new = output / f'new_{method}.npz'
+                self.assertTrue(old.is_file(), f'No frozen reference arrays at {old}')
+                run = subprocess.run(
+                    [sys.executable, str(ROOT/'tests/overlap_reference_capture.py'), str(new), method],
+                    capture_output=True, text=True, timeout=180,
+                )
+                (output/f'new_{method}.log').write_text(run.stdout+run.stderr)
+                self.assertEqual(run.returncode, 0, run.stdout+run.stderr)
+                with np.load(new, allow_pickle=False) as current, np.load(old, allow_pickle=False) as frozen:
+                    counts, fields = compare_histories(current, frozen)
+                info = json.loads(new.with_suffix('.json').read_text())
+                for profile in info['profiles'].values():
+                    self.assertEqual(profile['prep_load_dispatches'], 1)
                 summary[method]={'selected_source_counts':counts,'whole_payload_array_checks':fields}
             self.assertGreater(sum(case['selected_source_counts'][1] for case in summary.values()),0)
             self.assertGreater(sum(case['selected_source_counts'][0] for case in summary.values()),0)

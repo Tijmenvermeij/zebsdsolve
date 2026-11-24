@@ -45,11 +45,22 @@ pub const Model = struct {
     pub fn init(g: *gpu.Gpu, prep: *Prep, fit: *overlap.Fit) Model {
         const bytes = @as(u64, 4) * fit.n * fit.px * 4;
         var m: Model = .{ .g = g, .prep = prep, .fit = fit, .trial = overlap.Fit.init(g, fit.n, fit.px, fit.width, fit.mask, fit.original), .raw = g.storage(bytes), .committed = g.storage(bytes), .centered = g.storage(bytes), .mid = g.storage(bytes), .blurred = g.storage(bytes), .cells = g.storage(@as(u64, fit.n) * 196 * 4), .best = g.storage(@as(u64, fit.n) * @sizeOf(overlap.State)), .best_bank = g.storage(bytes), .theta = g.storage(@as(u64, fit.n) * 7 * 4), .norms = g.storage(@as(u64, fit.n) * 4 * 4) };
-        g.clear(m.cells);
-        g.clear(m.raw);
         g.clear(m.committed);
-        m.run("initialize", .{}, &.{ m.cells.at(5), fit.state.at(8) }, false);
+        m.initializeState();
         return m;
+    }
+    fn initializeState(self: *Model) void {
+        self.g.clear(self.cells);
+        self.g.clear(self.raw);
+        self.run("initialize", .{}, &.{ self.cells.at(5), self.fit.state.at(8) }, false);
+    }
+    /// Reuse the fixed-support workspace after the outer fit receives a new target.
+    /// The profiled controller never uses the discovery path's committed bank.
+    pub fn resetProfileTarget(self: *Model) void {
+        self.k = 0;
+        self.single_column = 0;
+        self.trial.resetTarget(self.fit.original);
+        self.initializeState();
     }
     pub fn deinit(self: *Model) void {
         self.trial.deinit();

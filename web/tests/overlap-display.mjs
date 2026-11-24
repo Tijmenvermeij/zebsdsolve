@@ -7,10 +7,11 @@ class Canvas {
   getContext(){const canvas=this;return {createImageData:(w,h)=>({data:new Uint8ClampedArray(w*h*4)}),putImageData(image){canvas.data=image.data.slice();},drawImage(source){for(let i=0;i<source.data.length;i+=4)if(source.data[i+3])canvas.data.set(source.data.subarray(i,i+4),i);},clearRect(){canvas.data.fill(0);}};}
 }
 class Element extends Canvas {
-  constructor(id){super();this.id=id;this.value='';this.checked=false;this.children=[];this.options=[];this.listeners={};this.title='';this.textContent='';this.hidden=false;this.dataset={};}
+  constructor(id){super();this.id=id;this.value='';this.checked=false;this.children=[];this.options=[];this.listeners={};this.title='';this.textContent='';this.hidden=false;this.dataset={};this.classList=new Set();}
   get valueAsNumber(){return this.value===''?NaN:Number(this.value);}
   get selectedOptions(){return this.options.filter(o=>o.value===this.value);}
   addEventListener(name,fn){this.listeners[name]=fn;}
+  setAttribute(){}
   replaceChildren(...children){this.children=children;if(this.options.length)this.options=children;}
   append(...children){this.children.push(...children);if(this.id.includes('filter-metric'))this.options.push(...children);}
   querySelector(selector){return selector==='option[data-weight]'?this.options.find(o=>o.dataset?.weight!==undefined):this.options.find(o=>o.value===/value="([^"]+)"/.exec(selector)?.[1]);}
@@ -25,7 +26,7 @@ for(const [,id,body] of html.matchAll(/<select[^>]*id="([^"]+)"[^>]*>([\s\S]*?)<
 for(const [,id,attrs] of html.matchAll(/<input[^>]*id="([^"]+)"([^>]*)>/g)){const e=elements.get(id);e.value=/value="([^"]*)"/.exec(attrs)?.[1]??'';e.checked=/\bchecked\b/.test(attrs);}
 globalThis.document={getElementById:id=>elements.get(id),createElement:tag=>new Element(tag)};
 const $=id=>elements.get(id),qs=new Float32Array([.7,0,0,0,.6,0,0,0,.5,0,0,0]);
-const requests=[], requestOptions=[];
+const requests=[], requestOptions=[], tileReadouts=[], inspections=[];
 const seeds=Uint8Array.of(1,1,1);
 const st={scan:{rows:1,cols:3},sourceFiles:[],phaseFiles:[{on:true}],settings:{batch:64,roi_x:0,roi_y:0,roi_w:2,roi_h:1},overview:new Float32Array([.1,.2,.3]),results:{phase:new Int32Array([0,0,0]),ncc:new Float32Array([.8,.2,.9]),quaternions:qs},cell:-1,showRun:0};
 st.ze={
@@ -34,9 +35,12 @@ st.ze={
   orientationColors(q,p){return Uint8ClampedArray.from(Array.from(p).flatMap((phase,i)=>[Math.round(q[4*i]*100),40,80,phase>=0?255:0]));},
   async overlapCells(cells, options){
     requests.push(Array.from(cells)); requestOptions.push(structuredClone(options));
+    tileReadouts.push($('overlap-readout').textContent);
     const support = (Type, multiple, singleton) => Type.from(Array.from(cells).flatMap(cell=>cell===0?multiple:singleton));
     return {
       max_components:2,cells,stage_gate:{minimum:options.minStageImprovement},
+      fit_model:'contrast_gain_v1',gain_domain:'contrast',
+      blur_gain_theta:support(Float32Array,[.5,0,1,1,1,0,0],[.75,0,1,1,1,0,0]),
       stop_reason:support(Uint32Array,[13],[1]),
       phase:support(Int32Array,[0,0],[0,-1]),
       quaternions:support(Float32Array,[.2,0,0,0,.9,0,0,0],[.9,0,0,0,0,0,0,0]),
@@ -49,6 +53,7 @@ st.ze={
       objective_valid:support(Uint32Array,[1],[1]),
     };
   },
+  async overlapInspect(...args){inspections.push(args);},
 };
 let ui;const redraw=()=>{ui.drawMap($('map'),0);ui.drawMap($('overlap-map-canvas'),1);};
 ui=createOverlap({st,busy:async(_,fn)=>{st.busy=true;try{await fn();}finally{st.busy=false;}},runPrimary:async()=>true,selectTab(){},inspectPrimary:async()=>false,redraw,status(message,error){if(error)throw Error(message);},log(){}});
@@ -86,22 +91,47 @@ assert.equal($('map').data[8],50);
 st.ze.geometry={pc:[.4,.5,.6]};
 seeds[2]=0;
 st.settings.roi_w=0;st.settings.roi_h=0;
+st.settings.batch=1;
 $('overlap-residual-cutoff').value='0';$('overlap-residual-cutoff').listeners.input();
 assert.notEqual($('map').data[8],50,'stale outside-ROI primary is hidden');
 assert.equal(ui.hover(2),'Primary unavailable');
 await $('btn-overlap-run').listeners.click();
-assert.deepEqual(requests,[[0],[0,1]],'next run excludes the same stale cell even when the new ROI includes it');
+assert.deepEqual(requests,[[0],[0],[1]],'next run excludes the same stale cell even when the new ROI includes it');
+assert.match(tileReadouts.at(-1),/^Running · 1 \/ 2 cells[\s\S]*1 shown in right map$/);
+assert.match($('overlap-readout').textContent,/^Complete · 2 \/ 2 cells[\s\S]*1 shown in right map$/);
 assert.equal(ui.hover(1,1),'No multi-component fit');
 assert.notEqual($('overlap-map-canvas').data[4],80,'replacement singleton stays off the residual map');
 ui.inspectMap(1,1);assert.equal($('overlap-component').value,'primary');
-$('overlap-map-component-2').value='1';redraw();
+$('overlap-map-component-2').value='1';$('overlap-map-component-2').listeners.change();
+assert.match($('overlap-readout').textContent,/2 shown in right map$/);
 assert.equal($('overlap-map-canvas').data[4],90,'numbered map includes a singleton fit');
 assert.match(ui.hover(1,1),/Fit component 1/);
 $('overlap-residual-cutoff').value='1';$('overlap-residual-cutoff').listeners.input();
 assert.equal($('overlap-map-canvas').data[4],90,'residual NCC cutoff only filters the residual-source map');
 $('overlap-residual-cutoff').value='0';$('overlap-residual-cutoff').listeners.input();
+$('overlap-filter-metric').value='proposal_ncc';$('overlap-filter-metric').listeners.change();
+$('overlap-filter-value').value='.6';$('overlap-filter-value').listeners.input();
+assert.match($('overlap-readout').textContent,/1 shown in right map$/);
+$('overlap-filter-metric').value='';$('overlap-filter-metric').listeners.change();
 ui.inspectMap(1,1);assert.equal($('overlap-component').value,'1','explicit fit slot remains inspectable');
 console.log('Overlap controller: native primary eligibility, residual provenance, singleton masking, independent cutoffs and frozen results pass');
+
+st.cell=1;
+await ui.showCell(1);
+assert.equal(inspections.length,1);
+const [replayCell,replay,replayRow,replayComponent]=inspections[0];
+assert.deepEqual([replayCell,replayRow,replayComponent],[1,0,0]);
+assert.deepEqual(replay.cells,Uint32Array.of(1));
+assert.equal(replay.max_components,2);
+assert.equal(replay.fit_model,'contrast_gain_v1');
+assert.equal(replay.gain_domain,'contrast');
+assert.equal(replay.blur_gain,true);
+assert.deepEqual(replay.phase,Int32Array.of(0,-1));
+assert.deepEqual(replay.quaternions,Float32Array.of(.9,0,0,0,0,0,0,0));
+assert.deepEqual(replay.amplitudes,Float32Array.of(1,0));
+assert.deepEqual(replay.proposal_ncc,Float32Array.of(.8,NaN));
+assert.deepEqual(replay.blur_gain_theta,Float32Array.of(.75,0,1,1,1,0,0));
+console.log('Overlap inspector replays only the selected cell and its frozen fit parameters');
 
 // A skipped or failed native primary render must never copy a previous cell's canvases.
 st.cell=0;$('overlap-component').value='primary';$('pat-exp').width=9;$('pat-exp').height=9;

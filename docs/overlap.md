@@ -574,6 +574,16 @@ Calibrated component acceptance and conditional orientation refinement remain
 separate work; no universal NCC cutoff is imposed.
 
 
+## Local regression checks
+
+Run the native Overlap tests with
+`PYTHONPATH=python:tests python -m unittest discover -s tests -p 'test_overlap*.py'`
+after building the native library. The optional historical trajectory comparison
+reads frozen `old_dictionary.npz` and `old_spherical.npz` from
+`ZEBSDSOLVE_REFERENCE_BASELINE`. Use references captured with matching geometry,
+settings and primary seeds. `ZEBSDSOLVE_REFERENCE_ARTIFACTS` can retain the current
+capture for diagnosis.
+
 ## Residual candidate pools (V5)
 
 `Solver.overlap_cells(..., keep_n=N)` and JavaScript `overlapCells(..., {keepN:N})` accept integer N from 1 through 8. N applies **per phase, per residual order**. The default is 1. The ordinary first search or stored primary remains unchanged; a one-component request follows V4 regardless of N. N=1 follows the corrected V4 path exactly. Existing V2/V3 exports retain their legacy behavior.

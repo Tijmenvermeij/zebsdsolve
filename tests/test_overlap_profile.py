@@ -91,6 +91,42 @@ class ProfileProduction(unittest.TestCase):
             for key in ('cell', 'branch', 'order', 'attempt', 'phase', 'rank', 'flags', 'result_order'):
                 self.assertEqual(a[key], b[key])
 
+    def test_single_component_does_not_prepare_residual_bandwidth(self):
+        self.s.index()
+        set_band = self.s._lib.ze_overlap_set_next_bandwidth
+        set_band.argtypes = (ctypes.c_void_p, ctypes.c_uint32)
+        set_band.restype = ctypes.c_int32
+        for screen in (None, .1):
+            options = dict(max_components=1, primary='stored', keep_n=3,
+                           blur_gain=True, min_residual_ncc=screen)
+            ordinary = self.s.overlap_cells([1], **options)
+            self.s.events()
+            self.assertEqual(set_band(self.s._e, 256), 256)
+            custom = self.s.overlap_cells([1], **options)
+            self.assertFalse(any('bandwidth 256,' in event.get('text', '') for event in self.s.events()))
+            for field in ('sse', 'phase', 'quaternions', 'amplitudes', 'blur_gain_theta'):
+                np.testing.assert_array_equal(custom[field], ordinary[field])
+
+    def test_first_residual_batch_matches_independent_calls(self):
+        from pathlib import Path
+        self.s.clear_phases()
+        self.s.add_phase(Path(__file__).resolve().parents[1]/'testdata/nickel/Ni_master_20kV.npz')
+        cells = [1, 0, 4, 1]
+        for method in ('spherical', 'dictionary'):
+            self.s.configure(method=method)
+            self.s.index()
+            options = dict(primary='stored', max_components=2, keep_n=1, blur_gain=True,
+                           min_residual_ncc=.1, min_stage_improvement=[.001, None, None])
+            batch = self.s.overlap_cells(cells, **options)
+            self.assertTrue(np.any(batch['retained_order'] == 2))
+            self.assertTrue(np.any(batch['retained_order'] == 1))
+            for row, cell in enumerate(cells):
+                independent = self.s.overlap_cells([cell], **options)
+                for field in ('phase', 'quaternions', 'amplitudes', 'proposal_ncc', 'winner_rank',
+                              'blur_gain_theta', 'sse', 'stop_reason', 'retained_order'):
+                    with self.subTest(method=method, row=row, field=field):
+                        np.testing.assert_array_equal(batch[field][row], independent[field][0])
+
     def test_batched_primary_seeds_match_independent_stored_cells(self):
         self.s.index()
         cells = [4, 2, 1, 0]
