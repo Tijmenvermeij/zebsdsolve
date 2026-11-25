@@ -6,6 +6,12 @@ notes.
 
 ## Unreleased
 
+- Batch indexing can be watched live from the Index tab, with IPF-Z, NCC and NMI
+  maps, progress, and a skip control for the active scan.
+- Planned pattern-centre fit points are red in the Geometry tab.
+- The browser build includes upstream's two-batch indexing pipeline. The fork's
+  calibrated Oxford H5OINA and EMSphInx HDF5 exports remain available in Batch.
+
 ## 0.2.6 — 2026-11-25
 
 0.2.5 once more: 0.2.5 reached PyPI, but GitHub failed its release (an upload answered HTTP 500)
