@@ -1503,7 +1503,7 @@ export class Zebsdsolve {
       if(gainDomain!=="contrast")throw new RangeError("overlap profiling requires contrast gain");
       if(!this.x.ze_overlap_cells_v6||!this.x.ze_overlap_profile_version||!this.x.ze_overlap_profile_trace_capacity)throw new Error("overlap profiling requires WASM V6 support; load a current module");
       profileVersion = this.x.ze_overlap_profile_version();
-      if (![1, 2].includes(profileVersion)) throw new Error("unsupported overlap profile version");
+      if (![1, 2, 3].includes(profileVersion)) throw new Error("unsupported overlap profile version");
       if (polish && fitBlurGain && profileVersion < 2) throw new Error("Polishing with blur/gain requires an updated WASM module");
       selectionVersion = this.x.ze_overlap_profile_selection_version?.() ?? 1;
       if (![1, 2].includes(selectionVersion)) throw new Error("unsupported overlap selection version");
@@ -1599,16 +1599,26 @@ export class Zebsdsolve {
       }
       if(profile){
         Object.assign(metadata,{active_count_definition:"strictly_positive_compacted_support_size",fitted_count_definition:"amplitude_above_1e-6_display_only",
-          profile_optimizer:{version:profileVersion,enabled:polish,method:"bounded_crystal_frame_axis_poll_variable_projection",geometry:"fixed",trust_centre:"immutable_native_source_pose",radius_deg:polishRadiusDeg,
-            singleton_starts_x_radius_factors:[0,.5,-.5],joint_starts:1,angular_step_radius_factors:[.5,.25,.125],max_sweeps_per_scale:2,
-            nuisance_schedule:fitBlurGain?(refitBlurGainAfterPolish?"full_at_entry_and_after_final_pose_change":"full_at_entry"):"disabled",
+          profile_optimizer:{version:profileVersion,enabled:polish,geometry:"fixed",trust_centre:"immutable_native_source_pose",radius_deg:polishRadiusDeg,
+            ...(profileVersion >= 3 ? {
+              method:"conditional_detector_gauss_newton",scope:"retained_support_after_discovery",
+              minimum_retained_components:maxComponents===1?1:2,
+              target:"original_prepared_minus_other_frozen_contributions",
+              angular_iterations:settings.refine_iters,max_angular_step_deg:settings.refine_step,
+              nuisance_schedule:fitBlurGain?(refitBlurGainAfterPolish?"discovery_then_isolated_endpoint":"discovery_only"):"disabled",
+              publication_weights:"final_joint_nnls",event_metrics:"discovery_before_orientation_refinement"
+            } : {
+              method:"bounded_crystal_frame_axis_poll_variable_projection",
+              singleton_starts_x_radius_factors:[0,.5,-.5],joint_starts:1,angular_step_radius_factors:[.5,.25,.125],max_sweeps_per_scale:2,
+              nuisance_schedule:fitBlurGain?(refitBlurGainAfterPolish?"full_at_entry_and_after_final_pose_change":"full_at_entry"):"disabled",
+            }),
             max_replacements_per_attempted_order:2,
             best_single_scope:"strongest_achieved_across_eligible_supports_and_both_complete_histories"}});
         if(fitBlurGain){const optimizer=metadata.blur_gain_optimizer;
           optimizer.max_evaluations_per_inner_joint_search=optimizer.max_evaluations;delete optimizer.max_evaluations;
           optimizer.max_evaluations_per_inner_singleton_search=optimizer.singleton_max_evaluations;delete optimizer.singleton_max_evaluations;
           Object.assign(optimizer,{evaluation_bound_scope:"one_inner_search_not_total_profile",best_single:"strongest_achieved_singleton_across_candidates_and_complete_histories",
-            best_single_refinement:"same_objective_bounded_pose_and_nuisance_profiles_when_enabled",joint_singleton_seeds:{k1:"separate_coarse_and_polished_theta_tables",k_gt_1:"same_achieved_member_theta_in_both_seed_tables"}});
+            best_single_refinement:profileVersion >= 3 ? "discovery_pose_and_nuisance_fit" : "same_objective_bounded_pose_and_nuisance_profiles_when_enabled",joint_singleton_seeds:{k1:"separate_coarse_and_polished_theta_tables",k_gt_1:"same_achieved_member_theta_in_both_seed_tables"}});
         }
       }
       return Object.assign(out,metadata,{primary,seed_source_roi,geometry:this.geometry,settings,phases:this.phases,oxford_detector_attitude_version:this.detectorAttitudeVersion,
