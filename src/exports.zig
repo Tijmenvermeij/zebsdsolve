@@ -787,7 +787,7 @@ export fn ze_result_checkpoint(e: *Engine, buf: ?[*]u8, cap: usize) i64 {
 
 /// Already measured phase-0 chance only: never calibrates or touches the GPU.
 export fn ze_result_chance(e: *Engine, out: *[2]f32) u32 {
-    if (e.chance_med.len == 0 or e.chance_spread.len == 0) return 0;
+    if (e.chance_key == 0 or e.chance_med.len == 0 or e.chance_spread.len == 0) return 0;
     out.* = .{ e.chance_med[0], e.chance_spread[0] };
     return 1;
 }

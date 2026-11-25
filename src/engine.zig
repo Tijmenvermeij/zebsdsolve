@@ -809,6 +809,7 @@ pub const Engine = struct {
         self.geo.plane = (Geometry{}).plane;
         self.plane_points.clearRetainingCapacity();
         self.scan_serial += 1;
+        self.chance_key = 0;
         self.scan_turn = 1;
         self.convention = .{};
         self.gpa.free(self.export_held);
@@ -1754,6 +1755,7 @@ pub const Engine = struct {
         self.events.log("phase {d}: {s} ({s}, {d} px, point group {s})", .{ self.phases.items.len - 1, m.name, m.source, m.side, if (m.point_group >= 1 and m.point_group <= 32) sym.point_group_names[m.point_group - 1] else "?" });
         self.res.clear();
         self.phase_generation += 1;
+        self.chance_key = 0;
         // the symmetry it obeys, as measured, and where its axes are when not the tables' own
         const st = m.setting;
         const z = rot.qapply(st.frame, .{ 0, 0, 1 });
@@ -1777,6 +1779,7 @@ pub const Engine = struct {
         self.clearFit();
         self.res.clear();
         self.phase_generation += 1;
+        self.chance_key = 0;
     }
 
     pub fn phaseInfo(self: *Engine, index: u32) !PhaseInfo {
