@@ -276,6 +276,29 @@ for (const when of ["begin", "step"]) {
     queue.stop(); yield { name: job.outputStem + ".h5", data: "results" }; yield { name: job.outputStem + ".ang", data: "results" }; for (const suffix of ["_IPF-Z.png", "_NCC.png"]) yield { name: job.outputStem + suffix, data: "pixels" };
   } }); queue = f.queue; const job = queue.add(spec()); queue.add(spec()); await queue.run(); assertLeaf(job); assert.equal(queue.jobs[1].status, "queued");
 }
+// Skip during an indexing step, then export only the next scan.
+{
+  let once = true;
+  const { queue, calls, counts } = fixture({ engineOptions: { step(q) {
+    if (once) {
+      once = false;
+      assert.ok(q.canSkip);
+      q.skip();
+    }
+  } } });
+  const first = queue.add(spec()), next = queue.add(spec());
+  const observed = [];
+  queue.onScan = (_engine, job) => observed.push(job.id);
+  await queue.run();
+  assert.deepEqual(observed, [first.id, next.id]);
+  assert.equal(first.status, "skipped");
+  assert.ok(!first.resultCheckpoint);
+  assert.equal(next.status, "complete");
+  assert.equal(counts.capture, 4);
+  assert.equal(calls.filter(call => call === "cancel").length, 1);
+  assert.equal(queue.error, null);
+}
+
 for (const initialState of ["failed", "cancelled"]) {
   let firstBegin = true, firstExport = true; const exports = [], rootA = new Directory(), rootB = new Directory();
   const { queue, counts } = fixture({ engineOptions: { begin: (queue, engine) => {

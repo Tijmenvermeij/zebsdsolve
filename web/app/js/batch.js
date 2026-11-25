@@ -71,6 +71,7 @@ function snapshot(spec) {
   return {
     sourceFiles, masterFiles, warnings: Object.freeze(warnings), directory: spec.directory || null,
     settings: freeze(clone(spec.settings)), geometry: freeze(clone(spec.geometry)),
+    frame: spec.frame == null ? null : freeze(clone(spec.frame)),
     openGeometry: spec.openGeometry == null ? null : freeze(clone(spec.openGeometry)),
     openHints: freeze(openHints), scanInfo: freeze(clone(spec.scanInfo)),
     phases: freeze(clone(spec.phases || [])), version: clone(spec.version ?? null),
@@ -78,16 +79,18 @@ function snapshot(spec) {
   };
 }
 const STOPPED = Symbol("stopped");
+const SKIPPED = Symbol("skipped");
 
 export class BatchQueue {
-  constructor({ createEngine, artifacts, onChange = () => {}, downloadsAdapter = new BatchDownloads(), onDownloadReady = () => {} }) {
-    this.createEngine = createEngine; this.artifacts = artifacts; this.onChange = onChange;
+  constructor({ createEngine, artifacts, onChange = () => {}, onScan = () => {}, onProgress = () => {}, downloadsAdapter = new BatchDownloads(), onDownloadReady = () => {} }) {
+    this.createEngine = createEngine; this.artifacts = artifacts;
+    this.onScan = onScan; this.onProgress = onProgress; this.onChange = onChange;
     this._downloads = downloadsAdapter; this.onDownloadReady = onDownloadReady; this.downloadsEnabled = false;
     this.jobs = []; this.running = false; this.directory = null; this.error = null;
     this._nextId = 1; this._stop = false;
-    this._engine = null; this._retainedJob = null; this._active = null;
+    this._engine = null; this._retainedJob = null; this._active = null; this._skip = false;
   }
-  _change() { this.onChange(); }
+  _change(kind) { this.onChange(kind); }
   add(spec) {
     const automatic = defaultOutputStem(spec.sourceFiles[0], spec.settings?.bandwidth);
     const stem = spec.outputStem ? outputStem(spec.outputStem) : automatic;
@@ -121,7 +124,7 @@ export class BatchQueue {
   retry(id) {
     if (this.running) throw new Error("Stop the batch before retrying.");
     const job = this._job(id);
-    if (["failed", "cancelled"].includes(job.status)) { job.resultCheckpoint = null; job.resultChance = null; job.status = "queued"; job.error = null; job.progress = null; }
+    if (["failed", "cancelled", "skipped"].includes(job.status)) { job.resultCheckpoint = null; job.resultChance = null; job.status = "queued"; job.error = null; job.progress = null; }
     else if (job.status !== "export-pending") throw new Error("This job does not need a retry.");
     this._change(); return job;
   }
@@ -147,6 +150,16 @@ export class BatchQueue {
   stop() {
     this._stop = true;
     if (this._active?.status === "indexing") this._engine?.cancel?.();
+    this._change();
+  }
+  get canSkip() {
+    return this.running && !this._stop && !this._skip && this._active?.status === "indexing" &&
+      this.jobs.some(job => job.status === "queued");
+  }
+  skip() {
+    if (!this.canSkip) return;
+    this._skip = true;
+    this._engine?.cancel?.();
     this._change();
   }
   async clear() {
@@ -240,7 +253,7 @@ export class BatchQueue {
   _journalData(job, completing = false) {
     return { zebsdsolve: job.version, scan: job.sourceFiles[0].name,
       geometry_convention: geometryConvention(job.scanInfo),
-      geometry: job.geometry, settings: job.settings, source_files: job.sources, master_files: job.masters,
+      geometry: job.geometry, settings: job.settings, frame: job.frame, source_files: job.sources, master_files: job.masters,
       phases: job.phases, opening_hints: job.openHints, acquisition_geometry: job.openGeometry, scan_info: job.scanInfo,
       warnings: job.warnings, map_source: "native engine map: IPF-Z and detector NCC; same frame and colors as the GUI",
       batch: { schemaVersion: 1, id: job.id, outputStem: job.outputStem, directory: job.folderName, transport: this.modeFor(job),
@@ -304,7 +317,10 @@ export class BatchQueue {
     }
     if (errors.length) throw new Error(errors.join(" "));
   }
-  _checkStop() { if (this._stop) throw STOPPED; }
+  _checkStop() {
+    if (this._stop) throw STOPPED;
+    if (this._skip) throw SKIPPED;
+  }
   _checkDevice() { if (this._engine.deviceLost) throw new Error(`GPU device lost: ${message(this._engine.deviceLost)}`); }
   async _index(job) {
     const engine = this._engine;
@@ -315,22 +331,34 @@ export class BatchQueue {
     for (const key of SCAN_FIELDS) if (job.scanInfo[key] !== actual?.[key]) throw new Error(`Scan ${key} changed: expected ${job.scanInfo[key]}, got ${actual?.[key]}.`);
     engine.configure(clone(job.settings));
     engine.setGeometry(clone(job.geometry));
+    if (job.frame) engine.frame = clone(job.frame);
     await engine.clearPhases();
     for (const file of job.masterFiles) { this._checkStop(); await engine.addPhase(file); }
     this._checkStop(); this._checkDevice();
+    await this.onScan(engine, job);
+    this._checkStop();
     await engine.indexBegin();
     this._checkStop(); this._checkDevice();
-    const started = performance.now(); let visits = 0;
+    const started = performance.now();
+    let visits = 0, sweepStarted = started, lastChange = started;
     for (;;) {
       this._checkStop(); this._checkDevice();
       const before = engine.indexStatus;
       const status = await engine.indexStep();
       this._checkStop(); this._checkDevice();
-      visits += Math.min(Math.max(0, before.total - before.done), job.settings.batch || before.total);
-      const pps = visits / Math.max((performance.now() - started) / 1000, 0.001);
+      const now = performance.now();
+      const nextSweep = status.sweep !== before.sweep;
+      visits += Math.max(0, nextSweep ? before.total - before.done : status.done - before.done);
+      if (nextSweep) sweepStarted = now;
+      const pps = visits / Math.max((now - started) / 1000, 0.001);
       job.progress = { done: status.done, total: status.total, sweep: status.sweep, sweeps: status.sweeps, pps,
-        etaSeconds: status.left === 0 ? 0 : Math.max(0, status.total - status.done) / pps };
-      this._change();
+        etaSeconds: status.left > 0 && status.done > 0 ? (now - sweepStarted) * status.left / (1000 * status.done) : 0 };
+      if (status.left === 0 || nextSweep || now - lastChange >= 250) {
+        lastChange = now;
+        this._change("progress");
+      }
+      await this.onProgress(engine, job, status);
+      this._checkStop();
       if (status.left === 0) break;
     }
   }
@@ -403,6 +431,7 @@ export class BatchQueue {
           await this._preflight(queued); queuedPreflighted = true;
         }
         this._active = job;
+        this._skip = false;
         let exporting = job.status === "export-pending";
         try {
           await this._reserveFolder(job); await this._saveJournal(job);
@@ -418,6 +447,20 @@ export class BatchQueue {
           this._retainedJob = null;
           if (this._engine.deviceLost) this._stop = true;
         } catch (error) {
+          // A cancel can surface as an engine error first. A device loss is still a failure.
+          if (!exporting && !this._engine?.deviceLost) {
+            if (this._stop) error = STOPPED;
+            else if (this._skip) error = SKIPPED;
+          }
+          if (error === SKIPPED) {
+            job.status = "skipped"; job.error = null;
+            try { await this._saveJournal(job); }
+            catch (journalError) {
+              job.error = message(journalError); this.error = job.error;
+              this._change(); break;
+            }
+            this._change(); continue;
+          }
           job.error = error === STOPPED ? "Stopped by user." : message(error);
           job.status = exporting ? "export-pending" : error === STOPPED ? "cancelled" : "failed";
           if (exporting && this.modeFor(job) === "downloads") job.outputs.find(entry => entry.name === job.journalName).complete = false;
@@ -430,6 +473,7 @@ export class BatchQueue {
     } catch (error) { this.error = message(error); }
     finally {
       this._active = null;
+      this._skip = false;
       if (!this._retainedJob) { try { await this._release(); } catch (error) { this.error ||= message(error); } }
       this.running = false; this._change();
     }

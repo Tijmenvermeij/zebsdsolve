@@ -6,6 +6,7 @@ import { drawGray, drawSigned, drawHeat, fit, svg, download, quantiles } from ".
 import { createVotes } from "./votes.js";
 import { exportH5, exportOxford } from "./hdf5-export.js";
 import { BatchQueue, defaultOutputStem } from "./batch.js";
+import { createBatchLiveMap } from "./batch-live.js";
 import { batchArtifacts } from "./batch-artifacts.js";
 import { isOxfordH5, oxfordExportWarnings, geometryConvention, acceptsGeometryConvention } from "./oxford-export-policy.js";
 import { createPlaneView } from "./planeview.js";
@@ -21,7 +22,6 @@ const $ = (id) => document.getElementById(id);
 const app = $("app");
 const PHASE_COLORS = ["#3b82f6", "#f59e0b", "#10b981", "#ef4444", "#8b5cf6", "#14b8a6", "#ec4899", "#84cc16"];
 const RESULT_KINDS = ["ipf", "ncc", "nmi", "phase", "sweep"];
-const TABS = ["simulate", "data", "patterns", "geometry", "index", "batch"];
 // settings outside the pattern's own groups that change what the pattern view shows of a
 // pattern indexed on the spot
 const LIVE_KEYS = new Set(["fit_bandwidth", "refine", "refine_iters", "refine_step", "nmi_bins", "phase_by", "scan_x_sign", "scan_y_sign"]);
@@ -194,7 +194,7 @@ async function busy(label, fn, { cpuExport = false } = {}) {
   st.stop = false;
   app.dataset.busy = "1";
   renderBatch();
-  $("btn-stop").hidden = cpuExport;
+  $("btn-stop").hidden = cpuExport || st.batchRunning;
   status(label);
   const t0 = performance.now();
   let succeeded = false;
@@ -214,7 +214,7 @@ async function busy(label, fn, { cpuExport = false } = {}) {
     renderBatch();
     $("btn-stop").hidden = true;
     progress(null);
-    st.live.clear();
+    if (!st.batchRunning) st.live.clear();
     if (st.gpuLost) { updateEnabled(); status(""); }
     if (succeeded && !st.gpuLost && !cpuExport) showCell();
   }
@@ -243,7 +243,7 @@ function showImportedGeometryNotice() {
 }
 
 function selectTab(name) {
-  if (st.batchRunning && name !== "batch") return;
+  if (st.batchRunning && name !== "batch" && name !== "index") return;
   app.dataset.tab = name;
   $("batch-workspace").hidden = name !== "batch";
   for (const b of $("tabs").children) {
@@ -253,6 +253,8 @@ function selectTab(name) {
   }
   for (const p of $("panels").children) p.hidden = p.dataset.tab !== name;
   $("panels").scrollTop = 0;
+  showBatchView();
+  if (st.batchRunning) return;
   if (name === "geometry") showImportedGeometryNotice();
   // the Geometry step is a console for the fits: the dock takes most of the stage there, and
   // shows a fit (the pattern-centre search, unless it is already on the plane)
@@ -1454,8 +1456,10 @@ function drawMapOverlay() {
     const spacing = Math.sqrt((rows * cols) / Math.max(cells.length, 1));
     const dense = cells.length > 150;
     const rad = dense ? Math.min(1.8 * u, 0.25 * spacing) : 3.5 * u;
+    const fill = st.fit ? "#7fbf6e" : dense ? "var(--bad)" : "none";
+    const stroke = dense ? "none" : st.fit ? "#0a0a0b" : "var(--bad)";
     for (const c of cells) {
-      over.append(svg("circle", { cx: (c % cols) + 0.5, cy: Math.floor(c / cols) + 0.5, r: rad, fill: st.fit ? "#7fbf6e" : "none", "fill-opacity": dense ? 0.75 : 1, stroke: dense ? "none" : st.fit ? "#0a0a0b" : "#9d9da4", "stroke-width": u }));
+      over.append(svg("circle", { cx: (c % cols) + 0.5, cy: Math.floor(c / cols) + 0.5, r: rad, fill, "fill-opacity": dense ? 0.75 : 1, stroke, "stroke-width": u }));
     }
   }
   if (st.cell >= 0) {
@@ -2584,10 +2588,12 @@ function updateWiring() {
   $("tabs").addEventListener("click", (e) => { const b = e.target.closest("button"); if (b) selectTab(b.dataset.tab); });
   $("tabs").addEventListener("keydown", (e) => {
     if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
-    const at = TABS.indexOf($("tabs").querySelector('[aria-selected="true"]').dataset.tab);
-    const next = TABS[(at + (e.key === "ArrowRight" ? 1 : TABS.length - 1)) % TABS.length];
-    selectTab(next);
-    $(`tab-${next}`).focus();
+    const tabs = [...$("tabs").querySelectorAll("button:not(:disabled)")];
+    const at = tabs.findIndex((tab) => tab.getAttribute("aria-selected") === "true");
+    const next = tabs[(at + (e.key === "ArrowRight" ? 1 : tabs.length - 1)) % tabs.length];
+    e.preventDefault();
+    selectTab(next.dataset.tab);
+    next.focus();
   });
   selectTab("data");
   wireSplits();
@@ -2781,7 +2787,7 @@ function updateWiring() {
   // Simulate step they step the master's energy bin, elsewhere the selected pattern on the map
   document.addEventListener("keydown", (e) => {
     const d = { ArrowLeft: [0, -1], ArrowRight: [0, 1], ArrowUp: [-1, 0], ArrowDown: [1, 0] }[e.key];
-    if (!d || e.altKey || e.ctrlKey || e.metaKey) return;
+    if (!d || st.batchRunning || e.defaultPrevented || e.altKey || e.ctrlKey || e.metaKey) return;
     const t = e.target;
     if (t.closest && t.closest("input, select, textarea, [contenteditable], #tabs, .pcv-search")) return;
     if (app.dataset.tab === "simulate") {
@@ -2876,11 +2882,52 @@ function updateWiring() {
 }
 
 // ── batch queue ──
+const batchLiveMap = createBatchLiveMap($("batch-live-map"), $("batch-live-map-kind"),
+  (error) => log(`Live batch map: ${error.message || error}`, true));
+
+function showBatchView() {
+  const live = st.batchRunning && app.dataset.tab === "index";
+  app.dataset.batchLive = live ? "1" : "0";
+  $("index-interactive").hidden = live;
+  $("batch-live-controls").hidden = !live;
+  $("batch-live-workspace").hidden = !live;
+}
+
+function showBatchProgress(job) {
+  const p = job?.progress;
+  const indexing = job?.status === "indexing";
+  const eta = p?.etaSeconds > 0 ? remainingTime(p.etaSeconds) : "";
+  const fraction = p && Math.min(1, Math.max(0, p.done / Math.max(p.total, 1)));
+  const bar = $("batch-progress"), liveBar = $("batch-live-progress");
+  bar.hidden = !batch.running;
+  for (const el of [bar, liveBar]) {
+    if (p && indexing) el.value = fraction;
+    else el.removeAttribute("value");
+  }
+  liveBar.hidden = !!job && !indexing;
+  const name = job?.sourceFiles[0].name;
+  const state = st.stop ? "Stopping…" : job?.status === "exporting" ? "Saving outputs…" : p && indexing ? "Live indexing" : indexing ? "Opening scan…" : "Preparing batch…";
+  $("batch-live-scan").textContent = name || "Batch indexing";
+  if ($("batch-live-state").textContent !== state) $("batch-live-state").textContent = state;
+  showKv($("batch-live-readout"), p && indexing ? [
+    ...(p.sweeps > 1 ? [["Sweep", `${p.sweep + 1} / ${p.sweeps}`]] : []),
+    ["Indexed", `${p.done.toLocaleString()} / ${p.total.toLocaleString()}`],
+    ["Rate", `${Math.round(p.pps).toLocaleString()} patterns/s`],
+    ...(eta ? [["Left", `~${eta}`]] : []),
+  ] : []);
+  batchLiveMap.showJob(job);
+  if (!job) return "";
+  if (!p || !indexing) return `${name}\n${state}`;
+  return `${name}\nsweep ${p.sweep + 1}/${p.sweeps} · ${p.done.toLocaleString()} / ${p.total.toLocaleString()}\n${p.pps.toFixed(0)} patterns/s${eta ? ` · ~${eta} left` : ""}`;
+}
+
 const batch = new BatchQueue({
   createEngine: () => Zebsdsolve.create({ wasm: new URL("../zebsdsolve/zebsdsolve.wasm", import.meta.url), warm: false }),
   artifacts: batchArtifacts,
+  onScan: (_engine, job) => batchLiveMap.opened(job),
+  onProgress: (engine, job, status) => batchLiveMap.draw(engine, job, status, app.dataset.batchLive === "1" && !document.hidden),
   onDownloadReady: job => startBatchDownload(job),
-  onChange: () => renderBatch(),
+  onChange: (kind) => kind === "progress" ? renderBatchProgress() : renderBatch(),
 });
 
 function startBatchDownload(job) {
@@ -2888,6 +2935,18 @@ function startBatchDownload(job) {
   const link = document.createElement("a"); link.href = job.archive.url; link.download = job.archive.name;
   document.body.append(link);
   try { link.click(); } finally { link.remove(); }
+}
+
+function renderBatchProgress() {
+  const active = batch.jobs.find(job => job.status === "indexing" || job.status === "exporting");
+  const text = showBatchProgress(active ?? null);
+  if (text || batch.error) {
+    $("batch-readout").textContent = text || batch.error;
+    return;
+  }
+  const completed = batch.jobs.filter(job => job.status === "complete").length;
+  const outcome = batch.jobs.some(job => batch.modeFor(job) === "downloads") ? "processed" : "complete";
+  $("batch-readout").textContent = batch.jobs.length ? `${completed} of ${batch.jobs.length} jobs ${outcome}` : "";
 }
 
 function renderBatch() {
@@ -2898,7 +2957,9 @@ function renderBatch() {
   }
   const waiting = batch.jobs.some((job) => ["queued", "export-pending"].includes(job.status));
   $("btn-batch-run").disabled = st.busy || st.batchRunning || st.scanPicking || !waiting;
-  $("btn-batch-stop").disabled = !batch.running;
+  $("btn-batch-view-live").hidden = !st.batchRunning;
+  for (const id of ["btn-batch-stop", "btn-batch-live-stop"]) $(id).disabled = !batch.running || st.stop;
+  $("btn-batch-skip").disabled = !batch.canSkip;
   $("btn-batch-clear").disabled = st.busy || st.batchRunning || st.scanPicking || !batch.jobs.length;
   $("batch-downloads").checked = batch.downloadsEnabled;
   $("batch-downloads").disabled = st.busy || st.batchRunning || st.scanPicking || batch.jobs.some(job => job.folderName && job.status !== "complete");
@@ -2912,18 +2973,8 @@ function renderBatch() {
   const completed = batch.jobs.filter((job) => job.status === "complete").length;
   const outcome = batch.jobs.some(job => batch.modeFor(job) === "downloads") ? "processed" : "complete";
   $("batch-count").textContent = batch.jobs.length ? `${completed} / ${batch.jobs.length} ${outcome}` : "";
-  const active = batch.jobs.find((job) => ["indexing", "exporting"].includes(job.status));
-  const bar = $("batch-progress"); bar.hidden = !batch.running;
-  if (active?.progress && active.status === "indexing") {
-    const p = active.progress;
-    bar.value = Math.min(1, Math.max(0, p.done / Math.max(p.total, 1)));
-    const eta = remainingTime(p.etaSeconds);
-    $("batch-readout").textContent = `${active.sourceFiles[0].name}\nsweep ${p.sweep + 1}/${p.sweeps} · ${p.done.toLocaleString()} / ${p.total.toLocaleString()}\n${p.pps.toFixed(0)} patterns/s${eta ? ` · ~${eta} left` : ""}`;
-  } else if (active) {
-    bar.removeAttribute("value");
-    $("batch-readout").textContent = `${active.sourceFiles[0].name}\n${active.status === "exporting" ? "Saving outputs…" : "Preparing indexing…"}`;
-  } else $("batch-readout").textContent = batch.error || (batch.jobs.length ? `${completed} of ${batch.jobs.length} jobs ${outcome}` : "");
-  const labels = { queued: "Queued", indexing: "Indexing", exporting: "Saving", complete: "Complete", cancelled: "Stopped", failed: "Failed", "export-pending": "Export failed" };
+  renderBatchProgress();
+  const labels = { queued: "Queued", indexing: "Indexing", exporting: "Saving", complete: "Complete", cancelled: "Stopped", skipped: "Skipped", failed: "Failed", "export-pending": "Export failed" };
   const table = $("batch-jobs");
   const previousRows = new Map([...table.children].map(row => [row.dataset.job, row]));
   const rows = batch.jobs.map((job) => {
@@ -2954,7 +3005,7 @@ function renderBatch() {
     }
     button("Output…", () => configureBatchOutput(job), job.status !== "queued" || !!job.folderName);
     button("Load", () => loadBatchJob(job), job.status === "export-pending");
-    if (["failed", "cancelled", "export-pending"].includes(job.status)) button(job.status === "export-pending" ? "Retry export" : "Retry", async () => {
+    if (["failed", "cancelled", "skipped", "export-pending"].includes(job.status)) button(job.status === "export-pending" ? "Retry export" : "Retry", async () => {
       try { batch.retry(job.id); if (job.status === "export-pending") await runBatch(); } catch (e) { status(e.message, true); }
     });
     if (job.status !== "export-pending") button("Remove", () => { try { batch.remove(job.id); if (st.batchEditing === job.id) { st.batchEditing = null; renderBatch(); } } catch (e) { status(e.message, true); } });
@@ -2971,7 +3022,7 @@ async function addBatchJob() {
     await st.ze._queue;
     if (files !== st.sourceFiles || st.busy || st.batchRunning || st.scanPicking) return;
     const spec = { sourceFiles: files, masterFiles: st.phaseFiles.filter((p) => p.on).map((p) => p.file), settings: st.ze.settings, geometry: st.ze.geometry,
-      openHints: st.sourceOpenHints, openGeometry: st.geoOpened, scanInfo: st.scan, phases: st.ze.phases, version: st.ze.version };
+      openHints: st.sourceOpenHints, openGeometry: st.geoOpened, scanInfo: st.scan, phases: st.ze.phases, frame: st.ze.frame, version: st.ze.version };
     const editing = batch.jobs.find(job => job.id === st.batchEditing);
     spec.directory = editing ? batch.directoryFor(editing) : await sourceFolders.find(files[0]).catch(() => null);
     if (files !== st.sourceFiles || st.busy || st.batchRunning || st.scanPicking) return;
@@ -2999,6 +3050,7 @@ async function loadBatchJob(job) {
       st.settings = st.ze.settings; fields.show(st.settings); showGeometry();
       showResolution(); showStage(); showSweeps(); showAngle(); showRoi();
       if (!await rebuildPhases()) return;
+      if (job.frame) st.ze.frame = job.frame;
       st.batchEditing = job.status === "queued" && !job.folderName ? job.id : null;
       selectTab("index");
     } finally { phasesChanged(); updateEnabled(); }
@@ -3123,15 +3175,19 @@ async function runBatch() {
   selectTab("batch");
   // Take ownership before any permission or engine await.
   st.batchRunning = true; app.dataset.batchRunning = "1";
-  for (const b of $("tabs").children) if (b.dataset.tab !== "batch") b.disabled = true;
+  st.stop = false;
+  for (const b of $("tabs").children) b.disabled = b.dataset.tab !== "batch" && b.dataset.tab !== "index";
   let launchError = null, launched = false;
   renderBatch();
   try {
     if (!await prepareBatchFolders()) { status("Batch not started"); return; }
     launched = true;
+    selectTab("index");
+    $("tab-index").focus();
     await busy("batch indexing…", async () => {
       try {
-        invalidateOverview(); ++st.showRun; ++st.masterRun;
+        ++st.showRun;
+        ++st.masterRun;
         await st.ze._queue;
         if (!st.stop) await batch.run();
       } catch (e) { launchError = e; throw e; }
@@ -3140,6 +3196,7 @@ async function runBatch() {
   finally {
     st.batchRunning = false; app.dataset.batchRunning = "0";
     for (const b of $("tabs").children) b.disabled = false;
+    showBatchView();
     renderBatch();
     if (launchError) status(String(launchError.message || launchError), true);
     else if (!launched) status("Batch not started");
@@ -3160,7 +3217,16 @@ function wireBatch() {
   $("btn-batch-setup").addEventListener("click", setupBatchFolders);
   $("btn-batch-folder").addEventListener("click", chooseBatchFolder);
   $("btn-batch-run").addEventListener("click", runBatch);
-  $("btn-batch-stop").addEventListener("click", () => batch.stop());
+  $("btn-batch-view-live").addEventListener("click", () => {
+    selectTab("index");
+    $("tab-index").focus();
+  });
+  $("btn-batch-skip").addEventListener("click", () => batch.skip());
+  for (const id of ["btn-batch-stop", "btn-batch-live-stop"]) $(id).addEventListener("click", () => {
+    st.stop = true;
+    batch.stop();
+    status("stopping…");
+  });
   $("btn-batch-new").addEventListener("click", () => { if (st.busy || st.batchRunning || st.scanPicking) return; st.batchEditing = null; renderBatch(); });
   $("btn-batch-clear").addEventListener("click", async () => {
     if (st.busy || st.batchRunning || st.scanPicking) return;

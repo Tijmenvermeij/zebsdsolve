@@ -179,42 +179,52 @@
         </section>
 
         <section class="panel" data-tab="index" role="tabpanel" aria-labelledby="tab-index" hidden>
-          <div class="row">
-            <button type="button" class="primary act" id="btn-index"><svg><use href="#i-play"/></svg>Index</button>
-            <button type="button" class="act" id="btn-batch-add">Add to batch</button>
-            <button type="button" class="act" id="btn-tune" title="Before a large scan: index a sample of the region a few times over, and keep the batch and workgroup sizes that run fastest on this machine. About ten short trials.">Tune speed</button>
-          </div>
-          <dl class="kv" id="index-readout"></dl>
-          <progress id="index-progress" max="1" value="0" aria-label="Indexing progress" hidden></progress>
-          <div class="fields" data-group="index"></div>
-          <div class="fields" data-group="refine"></div>
-          <h4>Acceptance</h4>
-          <div class="fields" data-group="accept"></div>
-          <dl class="kv" id="sweep-readout"></dl>
-          <details class="sub" id="index-advanced">
-            <summary>Advanced</summary>
-            <div class="fields" data-group="sweeps"></div>
-            <div class="fields" data-group="indexmore"></div>
-          </details>
-          <h4>Export</h4>
-          <div class="row">
-            <select id="frame-pick" title="The reference frame convention orientations are written in: the engine's own (kikuchipy's: x on the surface toward the detector, z out of it, the masters' crystal axes), or the one the scan file's stored orientations were found in after indexing. The misorientation left between those and these results is shown, never applied. File › View conventions draws them.">
-              <option value="engine">frame: engine (kikuchipy)</option>
-              <option value="file" disabled>frame: file's</option>
-            </select>
-          </div>
-          <dl class="kv" id="frame-readout"></dl>
-          <div class="row">
-            <button type="button" class="needs-results" id="btn-ang" title="EDAX .ang: Bunge angles in the frame above, each orientation's representative in its phase's fundamental zone; the region of interest's cells"><svg><use href="#i-down"/></svg>.ang</button>
-            <button type="button" class="needs-results" id="btn-ctf" title="Oxford .ctf: Bunge angles as for the .ang, with each phase's lattice"><svg><use href="#i-down"/></svg>.ctf</button>
-            <div class="menu" id="export-more">
-              <button type="button" class="needs-results" id="btn-export-more" aria-haspopup="menu" aria-expanded="false" aria-controls="export-more-list" title="Other formats">other<svg class="caret"><use href="#i-caret"/></svg></button>
-              <div class="menu-list up" id="export-more-list" role="menu" hidden>
-                <button type="button" class="needs-results" role="menuitem" id="btn-h5"><svg><use href="#i-down"/></svg>.h5</button>
-                <button type="button" role="menuitem" id="btn-h5oina" title="Export indexed results and Oxford calibration"><svg><use href="#i-down"/></svg>.h5oina</button>
-              </div>
+          <div id="batch-live-controls" hidden>
+            <div class="row">
+              <button type="button" id="btn-batch-skip" disabled>Skip current scan</button>
+              <button type="button" class="stop" id="btn-batch-live-stop" disabled><svg><use href="#i-stop"/></svg>Stop</button>
             </div>
-            <button type="button" id="btn-json" title="The geometry and every setting, as JSON. Dropped on the window (or opened with a scan), it brings them back."><svg><use href="#i-down"/></svg>project .json</button>
+            <progress id="batch-live-progress" max="1" aria-label="Current scan indexing progress"></progress>
+            <dl class="kv" id="batch-live-readout"></dl>
+          </div>
+          <div id="index-interactive">
+            <div class="row">
+              <button type="button" class="primary act" id="btn-index"><svg><use href="#i-play"/></svg>Index</button>
+              <button type="button" class="act" id="btn-batch-add">Add to batch</button>
+              <button type="button" class="act" id="btn-tune" title="Before a large scan: index a sample of the region a few times over, and keep the batch and workgroup sizes that run fastest on this machine. About ten short trials.">Tune speed</button>
+            </div>
+            <dl class="kv" id="index-readout"></dl>
+            <progress id="index-progress" max="1" value="0" aria-label="Indexing progress" hidden></progress>
+            <div class="fields" data-group="index"></div>
+            <div class="fields" data-group="refine"></div>
+            <h4>Acceptance</h4>
+            <div class="fields" data-group="accept"></div>
+            <dl class="kv" id="sweep-readout"></dl>
+            <details class="sub" id="index-advanced">
+              <summary>Advanced</summary>
+              <div class="fields" data-group="sweeps"></div>
+              <div class="fields" data-group="indexmore"></div>
+            </details>
+            <h4>Export</h4>
+            <div class="row">
+              <select id="frame-pick" title="The reference frame convention orientations are written in: the engine's own (kikuchipy's: x on the surface toward the detector, z out of it, the masters' crystal axes), or the one the scan file's stored orientations were found in after indexing. The misorientation left between those and these results is shown, never applied. File › View conventions draws them.">
+                <option value="engine">frame: engine (kikuchipy)</option>
+                <option value="file" disabled>frame: file's</option>
+              </select>
+            </div>
+            <dl class="kv" id="frame-readout"></dl>
+            <div class="row">
+              <button type="button" class="needs-results" id="btn-ang" title="EDAX .ang: Bunge angles in the frame above, each orientation's representative in its phase's fundamental zone; the region of interest's cells"><svg><use href="#i-down"/></svg>.ang</button>
+              <button type="button" class="needs-results" id="btn-ctf" title="Oxford .ctf: Bunge angles as for the .ang, with each phase's lattice"><svg><use href="#i-down"/></svg>.ctf</button>
+              <div class="menu" id="export-more">
+                <button type="button" class="needs-results" id="btn-export-more" aria-haspopup="menu" aria-expanded="false" aria-controls="export-more-list" title="Other formats">other<svg class="caret"><use href="#i-caret"/></svg></button>
+                <div class="menu-list up" id="export-more-list" role="menu" hidden>
+                  <button type="button" class="needs-results" role="menuitem" id="btn-h5"><svg><use href="#i-down"/></svg>.h5</button>
+                  <button type="button" role="menuitem" id="btn-h5oina" title="Export indexed results and Oxford calibration"><svg><use href="#i-down"/></svg>.h5oina</button>
+                </div>
+              </div>
+              <button type="button" id="btn-json" title="The geometry and every setting, as JSON. Dropped on the window (or opened with a scan), it brings them back."><svg><use href="#i-down"/></svg>project .json</button>
+            </div>
           </div>
         </section>
         <section class="panel" data-tab="batch" role="tabpanel" aria-labelledby="tab-batch" hidden>
@@ -222,7 +232,7 @@
           <label class="check batch-download-option" title="One ZIP per scan, using your browser's download location. The browser may ask to allow multiple downloads."><input type="checkbox" id="batch-downloads"> Save to Downloads</label>
           <button type="button" class="act" id="btn-batch-setup">Set up output folders…</button>
           <button type="button" class="act" id="btn-batch-folder">Set all output folders…</button>
-          <div class="row"><button type="button" class="primary act" id="btn-batch-run">Run batch</button><button type="button" id="btn-batch-stop" disabled>Stop</button></div>
+          <div class="row"><button type="button" class="primary act" id="btn-batch-run">Run batch</button><button type="button" id="btn-batch-view-live" hidden>View live</button><button type="button" class="stop" id="btn-batch-stop" disabled>Stop</button></div>
           <progress id="batch-progress" max="1" value="0" aria-label="Batch indexing progress" hidden></progress>
           <p class="readout" id="batch-readout"></p>
           <p class="readout" id="batch-editing"></p>
@@ -304,6 +314,21 @@
           <tbody id="batch-jobs"></tbody>
         </table></div>
       </section>
+      <section class="batch-live-workspace" id="batch-live-workspace" aria-label="Live batch indexing map" hidden>
+        <div class="pane-bar">
+          <h2 id="batch-live-scan"></h2>
+          <span class="meta" id="batch-live-state" role="status"></span>
+          <span class="grow"></span>
+          <div class="seg" id="batch-live-map-kind" role="group" aria-label="Batch map colours">
+            <button type="button" data-kind="ipf_z" aria-pressed="true" disabled>IPF Z</button>
+            <button type="button" data-kind="ncc" aria-pressed="false" disabled>NCC</button>
+            <button type="button" data-kind="nmi" aria-pressed="false" disabled>NMI</button>
+          </div>
+        </div>
+        <div class="well">
+          <canvas id="batch-live-map" width="1" height="1" role="img" aria-label="Batch indexing results" hidden></canvas>
+        </div>
+      </section>
       <section class="pane map-pane" id="map-pane">
         <div class="pane-bar">
           <div class="seg" id="map-kind" role="tablist">
@@ -336,7 +361,7 @@
           <span class="grow"></span>
           <span class="meta" id="map-hover"></span>
           <button type="button" class="ghost mini" id="btn-zoom" disabled title="Scroll to zoom in on the map, drag to move it, double-click (or this) to show all of it">whole map</button>
-          <label class="check" title="The lattice of patterns the fits use (green once a fit has given them orientations)"><input type="checkbox" id="show-fit" checked> fit patterns</label>
+          <label class="check" title="Fit patterns (red before fitting, green after fitting)"><input type="checkbox" id="show-fit" checked> fit patterns</label>
           <button type="button" class="tool" id="btn-key" aria-pressed="true" title="Show or hide the key to the map's colours, on its right">key</button>
         </div>
         <div class="well" id="map-well" tabindex="0" title="Click or drag to select a pattern; the arrow keys step it (with shift: by ten). Scroll zooms about the pointer, a drag moves a zoomed map.">
