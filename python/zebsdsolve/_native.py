@@ -18,7 +18,7 @@ class ScanInfo(ctypes.Structure):
     _fields_ = [
         ("rows", U32), ("cols", U32), ("pat_h", U32), ("pat_w", U32),
         ("pixel", U32), ("has_background", U32), ("has_pc", U32), ("format", U32),
-        ("voltage_kv", F64), ("bytes", F64), ("has_px", U32), ("geometry_frame", U32),
+        ("voltage_kv", F64), ("bytes", F64), ("has_px", U32), ("pattern_kinds", U32), ("geometry_frame", U32),
     ]
 
 
@@ -208,6 +208,11 @@ _SIGS = {
     "ze_ipf_key": ([P, U32, U32, U32, u8p, SZ, f32p], I32),
     "ze_export": ([P, U32, P, SZ], I64),
     "ze_bunge": ([f32p, f64p], None),
+    "ze_export_h5oina": ([P, P, SZ], I64),
+    "ze_identify_frame": ([P, f64p, i32p, ctypes.c_uint64, ctypes.c_char_p, SZ], I64),
+    "ze_frame": ([P, ctypes.c_char_p, SZ], SZ),
+    "ze_stored_orientations": ([P, f64p, i32p, ctypes.c_uint64], I32),
+    "ze_set_frame": ([P, ctypes.c_char_p, SZ], I32),
     "ze_reduce": ([P, U32, f32p, f64p], None),
     "ze_disorientation": ([P, U32, f32p, f32p], F64),
     "ze_compile_wgsl": ([P, ctypes.c_char_p, SZ, ctypes.c_char_p, SZ, ctypes.c_char_p, SZ], I32),

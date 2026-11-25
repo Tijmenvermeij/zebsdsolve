@@ -12,9 +12,10 @@
 //! scores) works at the level settings.full_resolution gives it; everything a level needs (the
 //! filtered patterns, the static background, each phase's filtered master) is kept per level.
 //!
-//! Indexing keeps the file and the device busy at once: between submitting a batch and waiting
-//! for it, the host reads the next batch's patterns (into a cache by map cell) and reduces them
-//! if a level is reduced. With settings.nlpar every pattern is first averaged with its
+//! Indexing keeps the file and the device busy at once: two batches are in flight, each recorded
+//! and submitted while the device works on the one before (`indexBatches`), and meanwhile the
+//! host reads the batch after's patterns (into a cache by map cell) and reduces them if a level
+//! is reduced. With settings.nlpar every pattern is first averaged with its
 //! neighbours in the map, on the device, in `uploadCells`: a batch is then read with a margin
 //! of cells around it, batches are square blocks of the map, and the cache holds what
 //! neighbouring blocks share.
@@ -40,6 +41,7 @@ pub const overlap = @import("overlap.zig");
 pub const overlap_peaks = @import("overlap_peaks.zig");
 pub const overlap_nuisance = @import("overlap_nuisance.zig");
 pub const overlap_profile = @import("overlap_profile.zig");
+const convention_mod = @import("convention.zig");
 
 const Gpu = gpu_mod.Gpu;
 const Buf = gpu_mod.Buf;
@@ -47,7 +49,7 @@ const Allocator = std.mem.Allocator;
 pub const Settings = settings_mod.Settings;
 pub const Geometry = geometry_mod.Geometry;
 
-pub const version = "0.2.2";
+pub const version = "0.2.6";
 
 /// A pattern resolution: reduced by settings.binning, or as stored.
 pub const Level = enum(u1) { reduced = 0, full = 1 };
@@ -70,6 +72,10 @@ pub const ScanInfo = extern struct {
     bytes: f64 = 0,
     /// 1 when the file gave a pixel size
     has_px: u32 = 0,
+    /// the kinds of patterns the file stores side by side (scan.zig's KIND_*: 1 processed,
+    /// 2 unprocessed, 3 both; 0: one kind it does not name), and (4) when those read are the
+    /// unprocessed
+    pattern_kinds: u32 = 0,
     /// Source-derived geometry convention: 0 generic, 1 legacy Oxford (reserved),
     /// 2 Oxford detector CS3-to-microscope v2, 3 Oxford fallback.
     geometry_frame: u32 = 0,
@@ -283,8 +289,8 @@ const Memory = struct {
 
 /// Tuning how the work is cut up (settings.batch, refine_pixels, wg_refine, wg_fft) to this
 /// machine and this scan. A sample of the region is indexed as indexing would index it, the
-/// front end times that (the engine has no clock of its own), and a few moves are tried in
-/// turn, each climbing from the values held: doubled while that is faster, else halved while
+/// front end times that (the engine has no clock of its own), and a few moves are tried one
+/// after another, each climbing from the values held: doubled while that is faster, else halved while
 /// that is. About ten trials, not a search of every value. Nothing of the map's results is
 /// touched, and neither the orientations indexing finds nor which matches are accepted
 /// depend on these settings.
@@ -319,7 +325,7 @@ pub const Tune = struct {
 
     /// Patterns a trial indexes, by what the search costs, so that a trial stays a fraction of
     /// a second: the spherical correlation's cost follows the cube of its orientation grid
-    /// (64 points a turn up to bandwidth 32, 128 up to 64, 256 up to 128, 512 beyond).
+    /// (64 points per 360° up to bandwidth 32, 128 up to 64, 256 up to 128, 512 beyond).
     pub fn sampleOf(method: settings_mod.Method, bandwidth: u32, dict_grid: u32) usize {
         return switch (method) {
             .spherical => if (bandwidth <= 32) 8192 else if (bandwidth <= 64) 4096 else if (bandwidth <= 128) 1024 else 128,
@@ -375,7 +381,7 @@ const PatternCache = struct {
 
     /// bytes of one pattern
     pb: usize = 0,
-    /// the cell each slot holds; slots fill in order and then turn over from `next`
+    /// the cell each slot holds; slots fill in order and then wrap around from `next`
     cells: std.ArrayList(u64) = .empty,
     data: std.ArrayList(u8) = .empty,
     /// The slot each map cell is in (NO_SLOT: none), by cell: a table, not a hash map. A hash
@@ -453,6 +459,7 @@ pub const ExportContext = struct {
     geometry: Geometry,
     calibration: @import("oxford.zig").Calibration,
     phase_generation: u64,
+    scan_signs: [2]i32,
 };
 
 pub fn sameExportContext(a: ExportContext, b: ExportContext) bool {
@@ -464,11 +471,7 @@ pub fn sameExportContext(a: ExportContext, b: ExportContext) bool {
     }
     x.ipf_colors = .classic;
     y.ipf_colors = .classic;
-    x.ipf_lightness = 0;
-    y.ipf_lightness = 0;
-    x.ipf_gray = 0;
-    y.ipf_gray = 0;
-    return std.meta.eql(x, y) and std.meta.eql(a.geometry, b.geometry) and @import("oxford.zig").Calibration.eql(a.calibration, b.calibration) and a.phase_generation == b.phase_generation;
+    return std.meta.eql(x, y) and std.meta.eql(a.geometry, b.geometry) and @import("oxford.zig").Calibration.eql(a.calibration, b.calibration) and a.phase_generation == b.phase_generation and std.meta.eql(a.scan_signs, b.scan_signs);
 }
 
 /// Seed conditioning excludes only region selection. Raw poses/NCC/NMI do not
@@ -577,6 +580,11 @@ pub const Record = extern struct {
     z: f32,
 };
 
+comptime {
+    // (the layout detector.wgsl's collect writes)
+    std.debug.assert(@sizeOf(Record) == detector.RECORD * @sizeOf(f32));
+}
+
 /// What a search runs with: its method, and the bandwidth of the spherical correlation or the
 /// dictionary's grid.
 pub const Search = struct {
@@ -604,6 +612,11 @@ pub const Engine = struct {
     /// that a fit is a function of the scan, the settings and what was given, not of the fits
     /// run before it.
     geo_given: Geometry = .{},
+    /// The frame the exports write orientations in (convention.zig): the engine's own until
+    /// one is identified from the maker's own orientations or set; a new scan resets it.
+    convention: convention_mod.Frame = .{},
+    /// an export made by a call that asked its size, for the call that takes it (exports.zig)
+    export_held: []u8 = &.{},
     /// the source points the last plane fit measured, a fit pattern each (planefit.plane)
     plane_points: std.ArrayList(@import("planefit.zig").PlanePoint) = .empty,
     /// the crystal a master pattern is simulated for, and the last simulation (simulate.zig)
@@ -683,6 +696,12 @@ pub const Engine = struct {
     chance_med: []f32 = &.{},
     chance_spread: []f32 = &.{},
     chance_key: u64 = 0,
+    /// counts the scans opened, made or given (closeScan), so that what is measured on one is
+    /// not taken for the next's
+    scan_serial: u64 = 0,
+    /// −1 where the scan open went the other way from what the settings' scan signs say
+    /// (Info.scan_turn, or the file's own pattern centres): `scanSigns`
+    scan_turn: i32 = 1,
     res: Results = .{},
     /// indexing in progress: the cells of the sweep in progress and how many are done
     index_cells: []u64 = &.{},
@@ -815,6 +834,12 @@ pub const Engine = struct {
         self.geo.plane_kind = 0;
         self.geo.plane = (Geometry{}).plane;
         self.plane_points.clearRetainingCapacity();
+        self.scan_serial += 1;
+        self.chance_key = 0;
+        self.scan_turn = 1;
+        self.convention = .{};
+        self.gpa.free(self.export_held);
+        self.export_held = &.{};
         self.tuneFree();
         self.cache.deinit(self.gpa);
         self.ahead = &.{};
@@ -834,6 +859,40 @@ pub const Engine = struct {
         self.avg_n = 0;
         self.bg_key = .{ null, null };
         self.told_no_background = false;
+    }
+
+    /// The frame the maker's orientations in `ref` are in (with none, the scan file's own),
+    /// found against this engine's results (convention.identify). The exports take it when it
+    /// was told clearly: its median under 5°, and the best other convention's at least twice
+    /// that and 5° more. The misorientation left is reported, never applied.
+    pub fn identifyFrame(self: *Engine, ref: ?convention_mod.Reference) !struct { found: convention_mod.Found, installed: bool } {
+        if (self.phases.items.len == 0) return error.NoPhases;
+        var stored: ?scan_mod.Stored = null;
+        defer if (stored) |*st| st.deinit(self.gpa);
+        const r = ref orelse blk: {
+            const s = switch (self.source) {
+                .file => |s| s,
+                else => return error.NoStoredOrientations,
+            };
+            stored = (try s.storedOrientations(self.gpa)) orelse return error.NoStoredOrientations;
+            break :blk convention_mod.Reference{ .euler = stored.?.euler, .phase = stored.?.phase };
+        };
+        var views: [convention_mod.max_phases]convention_mod.PhaseView = undefined;
+        const n_ph = @min(self.phases.items.len, convention_mod.max_phases);
+        for (self.phases.items[0..n_ph], 0..) |*p, i| views[i] = .{ .rotations = p.master.rotations(), .lattice = p.master.lattice };
+        const cols: usize = if (self.info()) |i| i.cols else |_| 0;
+        const found = try convention_mod.identify(self.gpa, self.res.quat, self.res.phase, cols, r, views[0..n_ph]);
+        const holds = found.median_deg < 5 and found.runner_up_deg >= 2 * found.median_deg + 5;
+        if (holds) self.convention = found.frame;
+        var line: [256]u8 = undefined;
+        var w = std.Io.Writer.fixed(&line);
+        found.frame.describe(&w) catch {};
+        const deg = std.math.radiansToDegrees;
+        const m = found.misorientation;
+        const th = rot.norm(m);
+        const u = if (th > 0) rot.scale(m, 1 / th) else rot.Vec3{ 0, 0, 0 };
+        self.events.log("frame of the stored orientations: {s}; {d} cells, median {d:.2}°, {d:.0} % within 2°, {d:.1}° under the next convention{s}; misorientation left {d:.2}° about ({d:.3}, {d:.3}, {d:.3}) (x, y, z: toward the detector, the tilt axis, out of the surface), changing {d:.2}° from the first row to the last and {d:.2}° from the first column to the last", .{ w.buffered(), found.cells, found.median_deg, 100 * found.within, found.runner_up_deg, if (holds) "; the exports take it" else "; not told clearly, the exports keep theirs", deg(th), u[0], u[1], u[2], deg(rot.norm(found.misorientation_rows)), deg(rot.norm(found.misorientation_cols)) });
+        return .{ .found = found, .installed = holds };
     }
 
     fn clearFit(self: *Engine) void {
@@ -889,6 +948,7 @@ pub const Engine = struct {
             .pat_h = read_settings.pattern_height,
             .pat_w = read_settings.pattern_width,
             .oxford_patterns = oxford_patterns,
+            .unprocessed = read_settings.stored_patterns == .unprocessed,
         });
         errdefer s.close();
         // Count and quaternion byte sizes must fit wasm32 before any resize arithmetic.
@@ -907,6 +967,75 @@ pub const Engine = struct {
         self.geo_given = self.geo;
         self.events.log("opened {s}: {d} × {d} patterns of {d} × {d}", .{ s.formatName(), s.info.rows, s.info.cols, s.info.pat_h, s.info.pat_w });
         if (s.oxford_patterns) |source| self.events.log("Oxford pattern source: {s}", .{source.datasetName()});
+        const kinds = s.info.pattern_kinds;
+        if (kinds == scan_mod.KIND_PROCESSED | scan_mod.KIND_UNPROCESSED) {
+            self.events.log("the file stores processed and unprocessed patterns: reading the {s} (stored_patterns)", .{if (s.info.unprocessed) "unprocessed" else "processed"});
+        } else if (kinds != 0 and s.info.unprocessed != (self.set.stored_patterns == .unprocessed)) {
+            self.events.log("stored_patterns asks for {s} patterns; the file stores only {s} ones, read instead", .{ @tagName(self.set.stored_patterns), if (s.info.unprocessed) "unprocessed" else "processed" });
+        }
+        if (!std.math.isNan(s.info.detector_rot[0])) self.events.log("the detector's orientation as the file stores it: {d:.2}° from the nominal one", .{std.math.radiansToDegrees(rot.norm(s.info.detector_rot))});
+        if (self.calibration.status() != .supported) self.takeTurn(s.info);
+        // (as #13 found: a tilt about another axis than the scan's x is not what the geometry is)
+        if (@abs(s.info.tilt_axis_deg) > 1e-4) self.events.log("the file tilts the sample about an axis {d:.2}° from the scan's x, which is not read: the geometry tilts it about x", .{s.info.tilt_axis_deg});
+    }
+
+    /// Which way the beam went: as the scan signs say, or the other way along both. The file's
+    /// own pattern centres decide where they move measurably from cell to cell (a maker's
+    /// calibration moves them with the beam), else what the file says of its scan's turn.
+    fn takeTurn(self: *Engine, si: scan_mod.Info) void {
+        self.scan_turn = 1;
+        const said = si.scan_turn;
+        if (si.turn_note.len != 0) self.events.log("the scan's turn as the file stores it: {s}", .{si.turn_note});
+        const stored = [2]rot.Vec3{ si.pc_per_col, si.pc_per_row };
+        var ok = si.rows >= 2 and si.cols >= 2;
+        for (stored) |v| for (v) |x| {
+            ok = ok and std.math.isFinite(x);
+        };
+        if (ok) ok = rot.norm(stored[0]) > 1e-7 and rot.norm(stored[1]) > 1e-7;
+        if (ok) {
+            // the engine's own change from the middle cell to the next column and the next row,
+            // the beam as the signs say
+            // Infer the acquisition's turn before applying the caller's requested scan signs.
+            const defaults: Settings = .{};
+            const signs = [2]i32{ defaults.scan_x_sign, defaults.scan_y_sign };
+            const R = self.calibration.rotation(&self.geo);
+            const sz = self.sizeOf(.full) catch {
+                self.scan_turn = said;
+                return;
+            };
+            const mid = @as(u64, (si.rows - 1) / 2) * si.cols + (si.cols - 1) / 2;
+            const at = [3]u64{ mid, mid + 1, mid + si.cols };
+            var pc: [3]rot.Vec3 = undefined;
+            for (at, &pc) |c, *p| p.* = Geometry.pcOf(R, self.placeWithSigns(&self.geo, c, .full, signs) catch {
+                self.scan_turn = said;
+                return;
+            }, sz[0], sz[1]);
+            var agree: [2]f64 = undefined;
+            for (0..2) |k| {
+                const ours = rot.sub(pc[k + 1], pc[0]);
+                agree[k] = rot.dot(ours, stored[k]) / @max(rot.norm(ours) * rot.norm(stored[k]), 1e-300);
+            }
+            if (agree[0] > 0.5 and agree[1] > 0.5) {
+                self.scan_turn = 1;
+            } else if (agree[0] < -0.5 and agree[1] < -0.5) {
+                self.scan_turn = -1;
+            } else ok = false;
+            if (ok) {
+                self.events.log("the file's own pattern centres move {s} the scan signs say{s}", .{ if (self.scan_turn == 1) "as the beam does where" else "as the beam does going the other way from where", if (self.scan_turn != said) " (taken over what it says of its scan's turn)" else "" });
+                return;
+            }
+        }
+        self.scan_turn = said;
+    }
+
+    /// The scan's signs (settings.scan_x_sign, scan_y_sign) as the scan open went.
+    pub fn scanSigns(self: *const Engine) [2]i32 {
+        if (self.calibration.status() == .supported) return self.calibration.scanSigns(self.set.scan_x_sign, self.set.scan_y_sign);
+        return .{ self.set.scan_x_sign * self.scan_turn, self.set.scan_y_sign * self.scan_turn };
+    }
+
+    pub fn exportContext(self: *const Engine) ExportContext {
+        return .{ .settings = self.set, .geometry = self.geo, .calibration = self.calibration, .phase_generation = self.phase_generation, .scan_signs = self.scanSigns() };
     }
 
     /// Take patterns from memory: rows · cols patterns of h × w pixels, row-major, copied.
@@ -945,19 +1074,20 @@ pub const Engine = struct {
             g.pc = si.pc;
             g.rot = .{ 0, 0, 0 };
         }
+        if (!std.math.isNan(si.detector_rot[0])) g.rot = si.detector_rot;
         if (!std.math.isNan(si.sample_tilt_deg)) g.sample_tilt_deg = si.sample_tilt_deg;
         if (!std.math.isNan(si.detector_tilt_deg)) g.detector_tilt_deg = si.detector_tilt_deg;
         g.px_um = if (std.math.isFinite(si.px_um) and si.px_um > 0) si.px_um else 1000.0 * detector_width_mm / @as(f64, @floatFromInt(@max(si.pat_w, 1)));
         if (!std.math.isNan(si.step_x_um)) g.step_x_um = si.step_x_um;
         if (!std.math.isNan(si.step_y_um)) g.step_y_um = si.step_y_um;
-        if (si.calibration.metadata != null) {
+        if (si.calibration.status() == .supported) {
             // Oxford has a full calibrated baseline; `rot` is only its fitted
             // residual. Never inherit unknown pixel size from a previous scan.
             g.rot = .{ 0, 0, 0 };
             g.detector_tilt_deg = 0;
             g.px_um = if (std.math.isFinite(si.px_um)) si.px_um else 0;
-            if (si.calibration.status() != .supported)
-                self.events.log("Oxford automatic frame unavailable: {s}", .{@tagName(si.calibration.status())});
+        } else if (si.calibration.metadata != null) {
+            self.events.log("Oxford automatic frame unavailable: {s}", .{@tagName(si.calibration.status())});
         }
     }
 
@@ -991,6 +1121,7 @@ pub const Engine = struct {
             .file => |s| {
                 out.has_background = @intFromBool(s.background.len != 0);
                 out.format = @intFromEnum(s.format);
+                out.pattern_kinds = s.info.pattern_kinds | @as(u32, if (s.info.unprocessed) 4 else 0);
                 out.bytes = @floatFromInt(s.files[0].size);
             },
             .memory => |m| {
@@ -1166,8 +1297,10 @@ pub const Engine = struct {
             self.fetch(self.source.file, list, null, true) catch {};
             return;
         }
-        // (patterns in memory need no reading, only reducing)
-        if (self.source != .file and !reduced) return;
+        // (patterns in memory need no reading, but gathering the batch's out of the map is a copy
+        // as long as a read, so it is made here too, while the device works; averaged ones are
+        // gathered window by window)
+        if (self.source != .file and !reduced and self.set.nlpar) return;
         self.ahead_host.resize(gpa, std.mem.alignForward(usize, list.len * pb, 4)) catch return;
         @memset(self.ahead_host.items[list.len * pb ..], 0);
         const bytes = self.ahead_host.items[0 .. list.len * pb];
@@ -1283,7 +1416,7 @@ pub const Engine = struct {
         g.ensure(&self.nl.a, @as(u64, n_win) * px * 4);
         if (self.binOf(lv) == 1) {
             g.ensure(&self.raw[k], bytes.len);
-            g.write(self.raw[k], 0, bytes);
+            g.upload(self.raw[k], 0, bytes);
             self.prep.load(self.raw[k], n_win, hw[0], hw[1], @intFromEnum(i.pixel), self.nl.a);
         } else {
             try self.reduceLevel(lv, self.nl_cells.items, bytes);
@@ -1473,14 +1606,15 @@ pub const Engine = struct {
         const n: u32 = @intCast(cells.len);
         const o = opts orelse prep_mod.Options{ .normalize = false };
         g.ensure(&self.pats[k], @as(u64, n) * px * 4);
+        // (uploads, not writes: made while the device may still work on the batch before)
         if (self.binOf(lv) == 1) {
             g.ensure(&self.raw[k], bytes.len);
-            g.write(self.raw[k], 0, bytes);
+            g.upload(self.raw[k], 0, bytes);
             self.prep.run(self.raw[k], n, hw[0], hw[1], @intFromEnum(i.pixel), o, self.pats[k]);
         } else {
             try self.reduceLevel(lv, cells, bytes);
             g.ensure(&self.raw[k], self.red_host.items.len * 4);
-            g.writeSlice(self.raw[k], 0, f32, self.red_host.items);
+            g.upload(self.raw[k], 0, std.mem.sliceAsBytes(self.red_host.items));
             self.prep.run(self.raw[k], n, hw[0], hw[1], 2, o, self.pats[k]);
         }
     }
@@ -1607,17 +1741,20 @@ pub const Engine = struct {
         const i = self.info() catch return .{ 0, 0, 0 };
         const row: f64 = @floatFromInt(cell / i.cols);
         const col: f64 = @floatFromInt(cell % i.cols);
-        const signs = self.calibration.scanSigns(self.set.scan_x_sign, self.set.scan_y_sign);
+        const signs = self.scanSigns();
         return geo.scanOffset(row, col, 0.5 * @as(f64, @floatFromInt(i.rows - 1)), 0.5 * @as(f64, @floatFromInt(i.cols - 1)), signs[0], signs[1], self.binOf(lv));
     }
 
     /// The detector's position for a cell under `geo`, in a level's pixels.
     pub fn placeOf(self: *const Engine, geo: *const Geometry, cell: u64, lv: Level) !rot.Vec3 {
+        return self.placeWithSigns(geo, cell, lv, self.scanSigns());
+    }
+
+    fn placeWithSigns(self: *const Engine, geo: *const Geometry, cell: u64, lv: Level, signs: [2]i32) !rot.Vec3 {
         const i = try self.info();
         const sz = try self.sizeOf(lv);
         const row: f64 = @floatFromInt(cell / i.cols);
         const col: f64 = @floatFromInt(cell % i.cols);
-        const signs = self.calibration.scanSigns(self.set.scan_x_sign, self.set.scan_y_sign);
         return geo.positionForRotation(self.calibration.rotation(geo), row, col, 0.5 * @as(f64, @floatFromInt(i.rows - 1)), 0.5 * @as(f64, @floatFromInt(i.cols - 1)), signs[0], signs[1], self.binOf(lv), sz[0], sz[1]);
     }
 
@@ -1644,6 +1781,7 @@ pub const Engine = struct {
         self.events.log("phase {d}: {s} ({s}, {d} px, point group {s})", .{ self.phases.items.len - 1, m.name, m.source, m.side, if (m.point_group >= 1 and m.point_group <= 32) sym.point_group_names[m.point_group - 1] else "?" });
         self.res.clear();
         self.phase_generation += 1;
+        self.chance_key = 0;
         // the symmetry it obeys, as measured, and where its axes are when not the tables' own
         const st = m.setting;
         const z = rot.qapply(st.frame, .{ 0, 0, 1 });
@@ -1667,6 +1805,7 @@ pub const Engine = struct {
         self.clearFit();
         self.res.clear();
         self.phase_generation += 1;
+        self.chance_key = 0;
     }
 
     pub fn phaseInfo(self: *Engine, index: u32) !PhaseInfo {
@@ -2010,12 +2149,24 @@ pub const Engine = struct {
     /// score it (NCC, NMI) at the scores', and measure there what NMI chance gives. `out` gets
     /// one record per phase per cell ([phase][cell]). One readback.
     pub fn indexCells(self: *Engine, cells: []const u64, prm: Search, out: []Record) !void {
+        const ticket = try self.recordCells(cells, prm, out);
+        // the device starts on this batch; the host reads the next one meanwhile
+        if (self.ahead.len != 0) {
+            self.g.submit();
+            self.readAhead(self.ahead);
+        }
+        try self.finishCells(ticket, cells.len, out);
+    }
+
+    /// indexCells up to its readback: the batch recorded, not yet submitted. Its records land in
+    /// `out`, which stays the caller's until `finishCells` has the ticket returned here.
+    fn recordCells(self: *Engine, cells: []const u64, prm: Search, out: []Record) !u64 {
         const s = &self.set;
         const n_ph = self.phases.items.len;
         const n: u32 = @intCast(cells.len);
         if (n_ph == 0) return error.NoPhases;
         if (out.len != n_ph * cells.len) return error.BadLength;
-        if (n == 0) return;
+        if (n == 0) return self.g.readTicket();
         const ls = self.levelOf(.search);
         const lr = self.levelOf(.refine);
         const lc = self.levelOf(.score);
@@ -2039,18 +2190,18 @@ pub const Engine = struct {
         try self.uploadCellsAs(cells, &.{ ls, lr, lc }, .{ .account = account });
         if (account) self.nl_report = .queued;
 
-        try self.indexPrepared(cells, prm, bd, out);
-        self.reportNlpar();
-        // each match's NMI on the scan's own scale
-        for (0..n_ph) |pi| {
-            for (out[pi * n ..][0..n]) |*r| r.z = (r.nmi - self.chance_med[pi]) / self.chance_spread[pi];
-        }
+        return self.recordPrepared(cells, prm, bd, out);
+    }
+
+    fn indexPrepared(self: *Engine, cells: []const u64, prm: Search, bd: ?*Band, out: []Record) !void {
+        const ticket = try self.recordPrepared(cells, prm, bd, out);
+        try self.g.waitFor(ticket);
     }
 
     /// Search/refine/score a batch already in pats at the three stage levels.
     /// Never uploads, preprocesses, calibrates chance, or assigns chance-z.
     /// Masters/band/PCA must already have been prepared by indexCells.
-    fn indexPrepared(self: *Engine, cells: []const u64, prm: Search, bd: ?*Band, out: []Record) !void {
+    fn recordPrepared(self: *Engine, cells: []const u64, prm: Search, bd: ?*Band, out: []Record) !u64 {
         const g = &self.g;
         const gpa = self.gpa;
         const s = &self.set;
@@ -2141,12 +2292,17 @@ pub const Engine = struct {
             }
         }
         g.read(self.records, 0, std.mem.sliceAsBytes(out));
-        // the device starts on this batch; the host reads the next one meanwhile
-        if (self.ahead.len != 0) {
-            g.submit();
-            self.readAhead(self.ahead);
+        return g.readTicket();
+    }
+
+    /// The batch recordCells gave `ticket` for, landed in `out` (its n cells): each match's NMI
+    /// on the scan's own scale.
+    fn finishCells(self: *Engine, ticket: u64, n: usize, out: []Record) !void {
+        try self.g.waitFor(ticket);
+        self.reportNlpar();
+        for (0..self.phases.items.len) |pi| {
+            for (out[pi * n ..][0..n]) |*r| r.z = (r.nmi - self.chance_med[pi]) / self.chance_spread[pi];
         }
-        try g.wait();
     }
 
     /// Overlap-private residual pool. Output is immutable [phase][rank][cell].
@@ -2345,7 +2501,7 @@ pub const Engine = struct {
 
     pub fn storedPrimaryContextCurrent(self: *const Engine) bool {
         const context = self.res.seed_context orelse return false;
-        return sameSeedContext(context, .{ .settings = self.set, .geometry = self.geo, .calibration = self.calibration, .phase_generation = self.phase_generation });
+        return sameSeedContext(context, self.exportContext());
     }
 
     pub fn storedPrimaryStatus(self: *const Engine, cell: usize, context_current: bool) StoredPrimaryStatus {
@@ -2856,19 +3012,69 @@ pub const Engine = struct {
         };
     }
 
-    /// Measure, once for the scan as it is prepared now, what mutual information chance gives:
-    /// a sample of the region's patterns (about 256 on a lattice) against each phase at random
-    /// orientations, at the level the scores are taken. Its median and spread (1.4826 × the
-    /// median deviation) per phase are the scale every match's NMI is then read on; they are
-    /// measured again only when what the scores depend on changes (the patterns' preparation,
-    /// the geometry, the phases, the region).
+    /// A batch in flight (indexBatches): its cells, the records it lands in, its read's ticket.
+    const Flight = struct { cells: []const u64, recs: []Record, ticket: u64 };
+
+    /// Index `cells` a batch at a time, two batches in flight: each batch is recorded and
+    /// submitted while the device still works on the one before, which is waited on only then,
+    /// so the device does not stand idle between batches; the host reads the batch after (from
+    /// `cells`, and then `after`) meanwhile. `land(ctx, cells, records)` takes each batch's
+    /// records once they land, in order. Stops between batches when cancelled. Nothing is left
+    /// in flight when it returns, an error included (what is in flight lands first).
+    fn indexBatches(self: *Engine, cells: []const u64, after: []const u64, prm: Search, ctx: anytype, comptime land: fn (@TypeOf(ctx), []const u64, []Record) anyerror!void) !void {
+        const gpa = self.gpa;
+        const batch: usize = @max(self.set.batch, 1);
+        const per = self.phases.items.len * @min(batch, cells.len);
+        var recs: [2][]Record = .{ &.{}, &.{} };
+        defer for (recs) |r| gpa.free(r);
+        recs[0] = try gpa.alloc(Record, per);
+        recs[1] = try gpa.alloc(Record, per);
+        errdefer self.g.wait() catch {};
+        var cur: ?Flight = null;
+        var at: usize = 0;
+        var slot: usize = 0;
+        while (true) {
+            const more = at < cells.len and !self.cancel.get();
+            // (a batch whose averaging is still to be reported lands before the next is recorded:
+            // the report reads what its averaging left)
+            if (cur) |c| if (!more or self.nl_report == .queued) {
+                cur = null;
+                try self.finishCells(c.ticket, c.cells.len, c.recs);
+                try land(ctx, c.cells, c.recs);
+            };
+            if (!more) break;
+            const n = @min(batch, cells.len - at);
+            const mine = cells[at..][0..n];
+            const out = recs[slot][0 .. self.phases.items.len * n];
+            const ticket = try self.recordCells(mine, prm, out);
+            self.g.submit();
+            at += n;
+            slot = 1 - slot;
+            const next = if (at < cells.len) cells[at..][0..@min(batch, cells.len - at)] else after;
+            if (next.len != 0 and !self.cancel.get()) self.readAhead(next);
+            if (cur) |c| {
+                try self.finishCells(c.ticket, c.cells.len, c.recs);
+                try land(ctx, c.cells, c.recs);
+            }
+            cur = .{ .cells = mine, .recs = out, .ticket = ticket };
+        }
+    }
+
+    fn landNowhere(_: void, _: []const u64, _: []Record) anyerror!void {}
+
     /// The key to a phase's inverse pole figure colours, as the settings have them.
     pub fn ipfKeyOf(self: *const Engine, phase: usize) sym.Key {
         // a direction's colour follows the Laue class; an orientation's, the point group's own rotations
         const m = &self.phases.items[phase].master;
-        return sym.Key.init(if (self.set.ipf_colors == .perfect_rotation) m.rotation else m.laue, self.set.ipf_colors, self.set.ipf_lightness, self.set.ipf_gray);
+        return sym.Key.init(if (self.set.ipf_colors == .perfect_rotation) m.rotation else m.laue, self.set.ipf_colors);
     }
 
+    /// Measure, once for the scan as it is prepared now, what mutual information chance gives:
+    /// a sample of the region's patterns (about 256 on a lattice) against each phase at random
+    /// orientations, at the level the scores are taken. Its median and spread (1.4826 × the
+    /// median deviation) per phase are the scale every match's NMI is then read on; they are
+    /// measured again only when what the scores depend on changes (the scan, the patterns'
+    /// preparation, the geometry, the phases, the region).
     pub fn calibrate(self: *Engine) !void {
         const gpa = self.gpa;
         const g = &self.g;
@@ -2899,14 +3105,13 @@ pub const Engine = struct {
         k.plane_iters = 0;
         k.refine = false;
         k.ipf_colors = .classic;
-        k.ipf_lightness = 0;
-        k.ipf_gray = 0;
         const json = try k.toJson(gpa);
         defer gpa.free(json);
         var h = std.hash.Wyhash.init(n_ph);
         h.update(json);
         h.update(std.mem.asBytes(&self.geo));
         self.calibration.hash(&h);
+        h.update(std.mem.asBytes(&self.scan_serial));
         for (self.phases.items) |*p| h.update(std.mem.asBytes(&p.serial));
         const key = h.final() | 1;
         if (key == self.chance_key and self.chance_med.len == n_ph) return;
@@ -2978,7 +3183,7 @@ pub const Engine = struct {
         return best;
     }
 
-    // ── indexing a region, a batch per step, in sweeps ──
+    // ── indexing a region, a few batches per step, in sweeps ──
 
     /// The cells of the region of interest (the whole map when it is empty), row-major.
     pub fn regionCells(self: *Engine) ![]u64 {
@@ -3017,7 +3222,7 @@ pub const Engine = struct {
             outside = true;
             break;
         };
-        const context: ExportContext = .{ .settings = self.set, .geometry = self.geo, .calibration = self.calibration, .phase_generation = self.phase_generation };
+        const context: ExportContext = self.exportContext();
         if (!outside) {
             self.res.context_consistent = true;
         } else if (self.res.context) |old| {
@@ -3090,31 +3295,17 @@ pub const Engine = struct {
         };
     }
 
-    /// Index the next batch of the sweep in progress; when the sweep ends, the cells without an
-    /// accepted match become the next one's. Returns the cells left to visit (0: done). A match
-    /// is accepted when it stands far enough above chance (settings.accept_z) and its
-    /// refinement had settled (settings.accept_step_deg). Every cell keeps the best match any
-    /// sweep gave it, accepted or not.
-    pub fn indexStep(self: *Engine) !usize {
-        const batch_context: ExportContext = .{ .settings = self.set, .geometry = self.geo, .calibration = self.calibration, .phase_generation = self.phase_generation };
-        if (self.res.context) |context| {
-            if (!sameExportContext(context, .{ .settings = self.set, .geometry = self.geo, .calibration = self.calibration, .phase_generation = self.phase_generation })) self.res.context_consistent = false;
-        }
+    /// A batch of the sweep landed (indexBatches): each cell keeps the better match, the
+    /// accepted ones their sweep.
+    fn landIndexed(self: *Engine, cells: []const u64, recs: []Record) anyerror!void {
         const s = &self.set;
-        const left = self.index_cells.len - self.index_done;
-        if (left == 0 or self.cancel.get()) return 0;
-        const n = @min(left, s.batch);
-        const cells = self.index_cells[self.index_done..][0..n];
         const n_ph = self.phases.items.len;
-        const recs = try self.gpa.alloc(Record, n_ph * n);
-        defer self.gpa.free(recs);
-        const sw = s.sweep(self.index_sweep);
-        self.ahead = self.index_cells[self.index_done + n ..][0..@min(left - n, s.batch)];
-        defer self.ahead = &.{};
-        try self.indexCells(cells, .{ .method = sw.method, .bandwidth = sw.bandwidth, .dict_grid = sw.dict_grid }, recs);
-        const after_context: ExportContext = .{ .settings = self.set, .geometry = self.geo, .calibration = self.calibration, .phase_generation = self.phase_generation };
-        if (!sameExportContext(batch_context, after_context)) self.res.context_consistent = false;
-        const coherent_seed = if (self.res.seed_context) |seed| sameSeedContext(seed, batch_context) and sameSeedContext(batch_context, after_context) else false;
+        const n = cells.len;
+        const landed_context = self.exportContext();
+        if (self.res.context) |context| {
+            if (!sameExportContext(context, landed_context)) self.res.context_consistent = false;
+        }
+        const coherent_seed = if (self.res.seed_context) |seed| sameSeedContext(seed, landed_context) else false;
         const settle: f32 = @floatCast(std.math.degreesToRadians(s.accept_step_deg));
         for (cells, 0..) |c, b| {
             const cell: usize = @intCast(c);
@@ -3153,6 +3344,29 @@ pub const Engine = struct {
         }
         self.index_done += n;
         self.events.emit(.{ .kind = "progress", .stage = "index", .done = self.index_done, .total = self.index_cells.len, .sweep = self.index_sweep, .sweeps = s.sweeps });
+    }
+
+    /// Index the next few batches of the sweep in progress; when the sweep ends, the cells
+    /// without an accepted match become the next one's. Returns the cells left to visit (0:
+    /// done). A match is accepted when it stands far enough above chance (settings.accept_z) and
+    /// its refinement had settled (settings.accept_step_deg). Every cell keeps the best match
+    /// any sweep gave it, accepted or not.
+    pub fn indexStep(self: *Engine) !usize {
+        const s = &self.set;
+        const left = self.index_cells.len - self.index_done;
+        if (left == 0 or self.cancel.get()) return 0;
+        if (self.res.context) |context| {
+            if (!sameExportContext(context, self.exportContext())) self.res.context_consistent = false;
+        }
+        // A few batches a call, about 4096 patterns, two at a time in flight (indexBatches); a
+        // call ends with nothing in flight, so whatever comes between calls finds the device
+        // idle.
+        const batch: usize = @max(s.batch, 1);
+        const n = @min(left, batch * std.math.clamp(4096 / batch, 2, 16));
+        const cells = self.index_cells[self.index_done..][0..n];
+        const after = self.index_cells[self.index_done + n ..][0..@min(left - n, batch)];
+        const sw = s.sweep(self.index_sweep);
+        try self.indexBatches(cells, after, .{ .method = sw.method, .bandwidth = sw.bandwidth, .dict_grid = sw.dict_grid }, self, landIndexed);
         if (self.index_done == self.index_cells.len and self.index_sweep + 1 < s.sweeps) {
             // the next sweep takes what this one left
             var keep: usize = 0;
@@ -3250,7 +3464,7 @@ pub const Engine = struct {
     }
 
     /// Run the trial in hand: index its sample with its settings as indexing would a sweep of
-    /// it (batches, reading ahead), keeping nothing. The front end times this call. A trial's
+    /// it (batches, two in flight, reading ahead), keeping nothing. The front end times this call. A trial's
     /// first call indexes one batch only, to settle what a new value needs built.
     pub fn tuneTrial(self: *Engine) !void {
         const t = &self.tune;
@@ -3263,19 +3477,10 @@ pub const Engine = struct {
         const cells = try gpa.dupe(u64, if (t.run == 0) sample[0..@min(batch, sample.len)] else sample);
         defer gpa.free(cells);
         if (self.set.nlpar and t.run != 0) try self.orderInBlocks(cells);
-        const n_ph = self.phases.items.len;
-        const recs = try gpa.alloc(Record, n_ph * @min(batch, cells.len));
-        defer gpa.free(recs);
         const sw = self.set.sweep(if (t.last) self.set.sweeps - 1 else 0);
-        defer self.ahead = &.{};
-        var at: usize = 0;
-        while (at < cells.len) {
-            if (self.cancel.get()) return error.Cancelled;
-            const n = @min(batch, cells.len - at);
-            self.ahead = cells[at + n ..][0..@min(batch, cells.len - at - n)];
-            try self.indexCells(cells[at..][0..n], .{ .method = sw.method, .bandwidth = sw.bandwidth, .dict_grid = sw.dict_grid }, recs[0 .. n_ph * n]);
-            at += n;
-        }
+        if (self.cancel.get()) return error.Cancelled;
+        try self.indexBatches(cells, &.{}, .{ .method = sw.method, .bandwidth = sw.bandwidth, .dict_grid = sw.dict_grid }, {}, landNowhere);
+        if (self.cancel.get()) return error.Cancelled;
     }
 
     /// The next candidate worth a trial, into `cand`: the values held with the move in hand
@@ -3298,14 +3503,14 @@ pub const Engine = struct {
                 t.cand = c;
                 return true;
             }
-            self.tuneTurn();
+            self.tuneReverse();
         }
         return false;
     }
 
     /// The candidate in this direction was not kept: try the other way if this was the move's
     /// first step up, else leave the move.
-    fn tuneTurn(self: *Engine) void {
+    fn tuneReverse(self: *Engine) void {
         const t = &self.tune;
         if (t.up and !t.kept) {
             t.up = false;
@@ -3344,7 +3549,7 @@ pub const Engine = struct {
             t.best = t.cand;
             t.kept = true;
         } else {
-            self.tuneTurn();
+            self.tuneReverse();
         }
         t.now[which] = t.best_time;
         t.run = 0;
@@ -3513,6 +3718,7 @@ pub const Engine = struct {
         @memset(data, 0);
         // an empty scan of the shape first: a cell's place in it is part of its geometry
         const calibration = self.calibration;
+        const scan_turn = self.scan_turn;
         var geometry = self.geo;
         try self.setPatterns(std.mem.sliceAsBytes(data), .f32, s.toy_rows, s.toy_cols, s.toy_height, s.toy_width);
         // A generic scan without a known pixel size takes the default for this new
@@ -3521,6 +3727,7 @@ pub const Engine = struct {
         if (calibration.metadata == null and !(geometry.px_um > 0)) geometry.px_um = self.geo.px_um;
         geometry.adoptPlaneReference(s.toy_rows, s.toy_cols);
         self.calibration = calibration;
+        self.scan_turn = scan_turn;
         self.geo = geometry;
 
         // the microstructure
@@ -3629,6 +3836,7 @@ pub const Engine = struct {
         }
         try self.setPatterns(std.mem.sliceAsBytes(data), .f32, s.toy_rows, s.toy_cols, s.toy_height, s.toy_width);
         self.calibration = calibration;
+        self.scan_turn = scan_turn;
         self.geo = geometry;
         self.events.log("toy scan: {d} × {d} patterns of {d} × {d}, {d} grains of {d} phase(s), {d} blank cells, contrast {d:.2}, {d:.4} electrons a pixel, seed {d}", .{ s.toy_rows, s.toy_cols, s.toy_height, s.toy_width, grains.len, n_ph, n - crystals, s.toy_contrast, s.toy_counts, s.toy_seed });
     }

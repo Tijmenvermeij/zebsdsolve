@@ -266,6 +266,9 @@ try {
       require(JSON.stringify(frame)===JSON.stringify(reference),'Oxford frame provenance changed');
       const tilt=header.get('Tilt Angle').value[0];require(Math.abs(tilt-expectedOxford.calibration.effective_tilt_radians)<1e-6,'Oxford tilt changed');
       const ids=out.get('zebsdsolve/PhaseIDMap').value;require(data.get('Phase').value[cell]===ids[expectedOxford.results.phase[cell]],'Oxford phase mapping wrong');
+      const flags=data.get('Error').value;
+      require(flags[cell]===1 && flags[0]===0,'Batch Oxford success status differs from indexed pixels');
+      require(Math.abs(header.get('Hit Rate').value[0]-100*flags.reduce((sum,v)=>sum+v,0)/flags.length)<1e-8,'Batch Oxford hit rate is stale');
     }finally{out.close();h.FS.unlink('/p6-result.h5oina');}
     require(JSON.parse(await(await(await(await testOutput.getDirectoryHandle('Ni_test_02')).getFileHandle('Ni_test_02.json')).getFile()).text()).batch.status==='complete','Earlier job journal overwritten');
     return {status:'complete',outputBytes:file.size,patternsOmitted:true,frameMatchesIndividual:true};

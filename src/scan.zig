@@ -10,12 +10,14 @@
 //! unset here and is the caller's to supply: `Hints` for the shape, the engine's geometry for
 //! the rest.
 //!
-//! Patterns are numbered row-major over the map (row · cols + col), top row first.
-//! Signed 16-bit Oxford unprocessed pixels are returned losslessly as f32.
+//! Patterns are numbered row-major over the map (row · cols + col) and returned as stored:
+//! `bytes_per_px` bytes per pixel, top row first; signed 16-bit pixels (an Oxford
+//! acquisition's unprocessed patterns) widened to f32, exactly.
 const std = @import("std");
 const file_mod = @import("io/file.zig");
 const File = file_mod.File;
 const hdf5 = @import("io/hdf5.zig");
+const rot = @import("rot.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -73,7 +75,16 @@ pub const Hints = struct {
     /// which scan of a multi-scan HDF5 file (empty: the first)
     scan_name: []const u8 = "",
     oxford_patterns: OxfordPatternChoice = .auto,
+    /// where a file stores the detector's own patterns beside processed ones (an Oxford
+    /// acquisition's Unprocessed and Processed Patterns), read the detector's own
+    unprocessed: bool = false,
 };
+
+/// The kinds of patterns a file stores side by side (Info.pattern_kinds): processed, as the
+/// acquisition prepared them, and unprocessed, the detector's own. 0: the file names one kind,
+/// or none.
+pub const KIND_PROCESSED: u32 = 1;
+pub const KIND_UNPROCESSED: u32 = 2;
 
 /// Metadata as the file gives it; NaN where it gives none.
 pub const Info = struct {
@@ -96,6 +107,88 @@ pub const Info = struct {
     pc: [3]f64 = @splat(std.math.nan(f64)),
     /// Scalar adapter provenance or why optional ANG PC metadata was not applied.
     pc_note: []const u8 = "",
+    /// the detector's rotation from its nominal attitude where the file stores its orientation,
+    /// as geometry.rot has it (rotation vector, radians, about the detector's row and column
+    /// directions and its normal)
+    detector_rot: [3]f64 = @splat(std.math.nan(f64)),
+    /// the kinds of patterns the file stores side by side (KIND_*), and whether the ones read
+    /// are the unprocessed
+    pattern_kinds: u32 = 0,
+    unprocessed: bool = false,
+    /// −1 where the file's scan was turned half round from the one the settings' scan signs
+    /// describe, so that the beam went the other way along both directions; what says so
+    /// (`turn_note`)
+    scan_turn: i32 = 1,
+    turn_note: []const u8 = "",
+    /// the sample's tilt axis away from the scan's x, where the file says so (Oxford's Tilt
+    /// Axis), which the geometry does not take (it tilts the sample about x); NaN: not said
+    tilt_axis_deg: f64 = std.math.nan(f64),
+    /// how the pattern centres the file stores per cell change from one column to the next
+    /// and from one row to the next (in this engine's convention, as `pc`), where it stores
+    /// them; NaN where it does not
+    pc_per_col: [3]f64 = @splat(std.math.nan(f64)),
+    pc_per_row: [3]f64 = @splat(std.math.nan(f64)),
+};
+
+/// Oxford's nominal detector orientation, (0, 90°, 0): Bunge angles of the detector's axes (x
+/// along the pattern's columns, y up it, z its normal toward the sample, the axes its pattern
+/// centre is measured in) in the sample's.
+const oxford_nominal: rot.Vec3 = .{ 0, std.math.pi / 2.0, 0 };
+
+/// The rotation (active, row-major) Bunge angles (φ1, Φ, φ2) describe: Rz(φ1) Rx(Φ) Rz(φ2).
+fn bungeMatrix(e: rot.Vec3) rot.Mat3 {
+    const c1 = @cos(e[0]);
+    const s1 = @sin(e[0]);
+    const c = @cos(e[1]);
+    const s = @sin(e[1]);
+    const c2 = @cos(e[2]);
+    const s2 = @sin(e[2]);
+    return .{
+        c1 * c2 - s1 * c * s2, -c1 * s2 - s1 * c * c2, s1 * s,
+        s1 * c2 + c1 * c * s2, -s1 * s2 + c1 * c * c2, -c1 * s,
+        s * s2,                s * c2,                 c,
+    };
+}
+
+/// Oxford's `Detector Orientation Euler` as geometry.rot: the detector's rotation away from the
+/// nominal (0, 90°, 0), in its own axes. Oxford's detector axes are those its pattern centre is
+/// measured in (x along the columns, y up the pattern); the engine's are the row direction, the
+/// column direction and the normal, so (x, y, z) Oxford is (column, −row, normal) here. Null
+/// when the angles lie more than 15° from the nominal: then they do not say what this reading
+/// takes them to. (Checked on an AZtec acquisition: its orientations and the engine's then
+/// agree to 0.12°; with the detector at the nominal attitude, 3.4°.)
+pub fn oxfordDetectorRot(e: rot.Vec3) ?rot.Vec3 {
+    for (e) |v| if (!std.math.isFinite(v)) return null;
+    const b = rot.matMul(rot.transpose(bungeMatrix(oxford_nominal)), bungeMatrix(e));
+    const v = rot.so3Log(rot.fromMat(b));
+    if (rot.norm(v) > std.math.degreesToRadians(15.0)) return null;
+    return .{ -v[1], v[0], v[2] };
+}
+
+/// The inverse of `oxfordDetectorRot`: geometry.rot as Oxford's Bunge angles (φ1 and φ2 in
+/// [0, 2π)).
+pub fn oxfordDetectorEuler(r: rot.Vec3) rot.Vec3 {
+    const v: rot.Vec3 = .{ r[1], -r[0], r[2] };
+    const m = rot.matMul(bungeMatrix(oxford_nominal), rot.toMat(rot.so3Exp(v)));
+    const tau = 2 * std.math.pi;
+    const phi = std.math.acos(std.math.clamp(m[8], -1, 1));
+    var p1 = std.math.atan2(m[2], -m[5]);
+    var p2 = std.math.atan2(m[6], m[7]);
+    if (p1 < 0) p1 += tau;
+    if (p2 < 0) p2 += tau;
+    return .{ p1, phi, p2 };
+}
+
+/// Orientations a file stores, as `Scan.storedOrientations` gives them (owned).
+pub const Stored = struct {
+    euler: []f64,
+    phase: []i32,
+
+    pub fn deinit(self: *Stored, gpa: Allocator) void {
+        gpa.free(self.euler);
+        gpa.free(self.phase);
+        self.* = undefined;
+    }
 };
 
 pub const Scan = struct {
@@ -119,6 +212,13 @@ pub const Scan = struct {
     overview_kind: OverviewKind = .none,
     /// ANG IQ in verified UP pixel order; no pattern pixels are read to display it.
     overview_values: []f32 = &.{},
+    /// HDF5 formats: the scan's Data and Header groups
+    h5_data: ?u64 = null,
+    h5_header: ?u64 = null,
+    /// a companion's stored orientations (Bunge, radians, 3 per cell) and phase labels
+    /// (−1: not indexed), owned; HDF5 formats read theirs on demand (storedOrientations)
+    stored_euler: []f64 = &.{},
+    stored_phase: []i32 = &.{},
     why: []const u8 = "",
 
     pub fn count(self: *const Scan) u64 {
@@ -154,6 +254,80 @@ pub const Scan = struct {
         defer self.gpa.free(values);
         if ((try self.h5.?.numbers(address, values)) != n) return error.InvalidStoredOverview;
         for (values, out) |x, *v| v.* = if (std.math.isFinite(x) and @abs(x) <= std.math.floatMax(f32)) @floatCast(x) else std.math.nan(f32);
+    }
+
+    /// The orientations the file stores from its maker's own indexing, as it stores them: Bunge
+    /// angles (radians; a format that writes degrees is converted) and a phase label per cell
+    /// (any number; −1: not indexed). Which frames they are in is not read here
+    /// (convention.identify finds it from the data). Null where the file stores none.
+    pub fn storedOrientations(self: *Scan, gpa: Allocator) !?Stored {
+        const n: usize = @intCast(self.count());
+        if (self.stored_euler.len != 0) {
+            if (self.stored_euler.len != 3 * n or self.stored_phase.len != n) return null;
+            const euler = try gpa.dupe(f64, self.stored_euler);
+            errdefer gpa.free(euler);
+            return .{ .euler = euler, .phase = try gpa.dupe(i32, self.stored_phase) };
+        }
+        const data = self.h5_data orelse return null;
+        const h = &self.h5.?;
+        // where each format keeps them, in what unit, and whether its phase 0 means not indexed
+        const Where = struct { one: []const u8 = "", three: [3][2][]const u8 = .{ .{ "", "" }, .{ "", "" }, .{ "", "" } }, degrees: bool = false, zero_unindexed: bool };
+        const where: Where = switch (self.format) {
+            .h5_oxford => .{ .one = "Euler", .zero_unindexed = true },
+            .h5_bruker => .{ .three = .{ .{ "phi1", "" }, .{ "PHI", "" }, .{ "phi2", "" } }, .degrees = true, .zero_unindexed = true },
+            .h5_edax => .{ .three = .{ .{ "phi1", "Phi1" }, .{ "Phi", "PHI" }, .{ "phi2", "Phi2" } }, .zero_unindexed = false },
+            else => return null,
+        };
+        const euler = try gpa.alloc(f64, 3 * n);
+        errdefer gpa.free(euler);
+        if (where.one.len != 0) {
+            const a = (try h.child(data, where.one)) orelse {
+                gpa.free(euler);
+                return null;
+            };
+            if ((h.numbers(a, euler) catch 0) != 3 * n) {
+                gpa.free(euler);
+                return null;
+            }
+        } else {
+            const column = try gpa.alloc(f64, n);
+            defer gpa.free(column);
+            for (where.three, 0..) |names, k| {
+                var got = false;
+                for (names) |nm| {
+                    if (nm.len == 0 or got) continue;
+                    const a = (try h.child(data, nm)) orelse continue;
+                    if ((h.numbers(a, column) catch 0) != n) continue;
+                    for (column, 0..) |v, i| euler[3 * i + k] = v;
+                    got = true;
+                }
+                if (!got) {
+                    gpa.free(euler);
+                    return null;
+                }
+            }
+        }
+        if (where.degrees) for (euler) |*v| {
+            v.* = std.math.degreesToRadians(v.*);
+        };
+        const phase = try gpa.alloc(i32, n);
+        errdefer gpa.free(phase);
+        @memset(phase, 0);
+        if (try h.child(data, "Phase")) |a| {
+            const vals = try gpa.alloc(f64, n);
+            defer gpa.free(vals);
+            if ((h.numbers(a, vals) catch 0) == n) for (vals, phase) |v, *p| {
+                p.* = if (std.math.isFinite(v) and @abs(v) < 1 << 30) @intFromFloat(v) else -1;
+            };
+        }
+        for (phase, 0..) |*p, i| {
+            if (where.zero_unindexed and p.* == 0) p.* = -1;
+            // (angles past 2π: the not-indexed marker some makers write, 4π)
+            for (euler[3 * i ..][0..3]) |v| {
+                if (!std.math.isFinite(v) or @abs(v) > 2 * std.math.pi + 0.01) p.* = -1;
+            }
+        }
+        return .{ .euler = euler, .phase = phase };
     }
 
     fn discoverOverview(self: *Scan, data: u64) void {
@@ -231,6 +405,8 @@ pub const Scan = struct {
             gpa.free(self.offsets);
             gpa.free(self.background);
             gpa.free(self.overview_values);
+            gpa.free(self.stored_euler);
+            gpa.free(self.stored_phase);
         }
         const f = &self.files[0];
         var head: [8]u8 = @splat(0);
@@ -267,6 +443,8 @@ pub const Scan = struct {
         gpa.free(self.offsets);
         gpa.free(self.background);
         gpa.free(self.overview_values);
+        gpa.free(self.stored_euler);
+        gpa.free(self.stored_phase);
         for (self.files) |*f| f.close();
         gpa.free(self.files);
         gpa.destroy(self);
@@ -403,20 +581,21 @@ pub const Scan = struct {
 
     // ── HDF5 ──
 
-    fn selectOxfordPatterns(self: *Scan, data: u64, choice: OxfordPatternChoice) !?u64 {
+    fn selectOxfordPatterns(self: *Scan, data: u64, choice: OxfordPatternChoice, prefer_unprocessed: bool) !?u64 {
         const h = &self.h5.?;
-        const processed = if (choice != .unprocessed) try h.child(data, OxfordPatternSource.processed.datasetName()) else null;
-        const unprocessed = if (choice == .ask or (choice != .processed and processed == null))
-            try h.child(data, OxfordPatternSource.unprocessed.datasetName())
-        else
-            null;
+        const processed = try h.child(data, OxfordPatternSource.processed.datasetName());
+        const unprocessed = try h.child(data, OxfordPatternSource.unprocessed.datasetName());
+        self.info.pattern_kinds = (if (processed != null) KIND_PROCESSED else 0) | (if (unprocessed != null) KIND_UNPROCESSED else 0);
         if (choice == .ask and processed != null and unprocessed != null) return error.OxfordPatternChoiceRequired;
-        if (processed) |addr| {
-            self.oxford_patterns = .processed;
-            return addr;
-        }
-        if (unprocessed) |addr| {
-            self.oxford_patterns = .unprocessed;
+        const use_raw = switch (choice) {
+            .unprocessed => true,
+            .processed => false,
+            .auto, .ask => unprocessed != null and (processed == null or prefer_unprocessed),
+        };
+        const address = if (use_raw) unprocessed else processed;
+        if (address) |addr| {
+            self.oxford_patterns = if (use_raw) .unprocessed else .processed;
+            self.info.unprocessed = use_raw;
             return addr;
         }
         return switch (choice) {
@@ -451,6 +630,8 @@ pub const Scan = struct {
         const ebsd = (try h.child(scan, "EBSD")).?;
         const data = (try h.child(ebsd, "Data")).?;
         const header = (try h.child(ebsd, "Header")).?;
+        self.h5_data = data;
+        self.h5_header = header;
 
         const V = struct {
             format: Format,
@@ -464,34 +645,46 @@ pub const Scan = struct {
             tilt: []const u8,
             det_tilt: []const u8,
             background: []const u8,
+            /// the detector's own patterns, where the file may store them beside the processed
+            /// ones, and their background
+            unprocessed: []const u8 = "",
+            unprocessed_background: []const u8 = "",
         };
         const vendors = [_]V{
             .{ .format = .h5_kikuchipy, .patterns = &.{"patterns"}, .rows = "n_rows", .cols = "n_columns", .pat_h = "pattern_height", .pat_w = "pattern_width", .step_x = "step_x", .step_y = "step_y", .tilt = "sample_tilt", .det_tilt = "elevation_angle", .background = "static_background" },
             .{ .format = .h5_bruker, .patterns = &.{"RawPatterns"}, .rows = "NROWS", .cols = "NCOLS", .pat_h = "PatternHeight", .pat_w = "PatternWidth", .step_x = "XSTEP", .step_y = "YSTEP", .tilt = "SampleTilt", .det_tilt = "CameraTilt", .background = "StaticBackground" },
             .{ .format = .h5_edax, .patterns = &.{"Pattern"}, .rows = "nRows", .cols = "nColumns", .pat_h = "Pattern Height", .pat_w = "Pattern Width", .step_x = "Step X", .step_y = "Step Y", .tilt = "Sample Tilt", .det_tilt = "Camera Elevation Angle", .background = "" },
-            .{ .format = .h5_oxford, .patterns = &.{}, .rows = "Y Cells", .cols = "X Cells", .pat_h = "Pattern Height", .pat_w = "Pattern Width", .step_x = "X Step", .step_y = "Y Step", .tilt = "Tilt Angle", .det_tilt = "", .background = "" },
+            .{ .format = .h5_oxford, .patterns = &.{"Processed Patterns"}, .rows = "Y Cells", .cols = "X Cells", .pat_h = "Pattern Height", .pat_w = "Pattern Width", .step_x = "X Step", .step_y = "Y Step", .tilt = "Tilt Angle", .det_tilt = "", .background = "Processed Static Background", .unprocessed = "Unprocessed Patterns", .unprocessed_background = "Unprocessed Static Background" },
         };
         var vendor: ?V = null;
         var pat_addr: u64 = 0;
+        const info = &self.info;
         for (vendors) |v| {
             if ((try h.child(header, v.rows)) == null) continue;
             if (v.format == .h5_oxford) {
-                pat_addr = (try self.selectOxfordPatterns(data, hints.oxford_patterns)) orelse continue;
+                pat_addr = (try self.selectOxfordPatterns(data, hints.oxford_patterns, hints.unprocessed)) orelse continue;
                 vendor = v;
                 break;
             }
+            var processed: ?u64 = null;
             for (v.patterns) |pn| if (try h.child(data, pn)) |a| {
-                pat_addr = a;
-                vendor = v;
+                processed = a;
                 break;
             };
-            if (vendor != null) break;
+            const raw = if (v.unprocessed.len != 0) try h.child(data, v.unprocessed) else null;
+            if (processed == null and raw == null) continue;
+            vendor = v;
+            // (the kinds are named where a file may store both; the one asked for is read
+            // where both are, else the one there is)
+            if (v.unprocessed.len != 0) info.pattern_kinds = (if (processed != null) KIND_PROCESSED else 0) | (if (raw != null) KIND_UNPROCESSED else 0);
+            info.unprocessed = raw != null and (processed == null or hints.unprocessed);
+            pat_addr = if (info.unprocessed) raw.? else processed.?;
+            break;
         }
         const v = vendor orelse return error.NoPatternsInFile;
         self.format = v.format;
         self.ds = try h.dataset(pat_addr);
         if (self.ds.rank != 3 and self.ds.rank != 4) return error.NoPatternsInFile;
-        const info = &self.info;
         info.pat_h = @intCast(self.ds.dims[self.ds.rank - 2]);
         info.pat_w = @intCast(self.ds.dims[self.ds.rank - 1]);
         info.pixel = switch (self.ds.dtype.class) {
@@ -511,6 +704,24 @@ pub const Scan = struct {
                 if (name.len == 0) return std.math.nan(f64);
                 const a = (hh.child(group, name) catch null) orelse return std.math.nan(f64);
                 return hh.number(a) catch std.math.nan(f64);
+            }
+            /// how a per-pattern array changes from one column to the next and from one row to
+            /// the next, on average (the last column less the first, over the columns between,
+            /// and likewise down the rows)
+            fn drift(hh: *hdf5.Hdf5, g: Allocator, group: u64, name: []const u8, rows: u32, cols: u32) [2]f64 {
+                const none: [2]f64 = @splat(std.math.nan(f64));
+                if (rows < 2 or cols < 2) return none;
+                const a = (hh.child(group, name) catch null) orelse return none;
+                const n = @as(usize, rows) * cols;
+                if (n > 1 << 24) return none;
+                const vals = g.alloc(f64, n) catch return none;
+                defer g.free(vals);
+                if ((hh.numbers(a, vals) catch 0) != n) return none;
+                var dc: f64 = 0;
+                var dr: f64 = 0;
+                for (0..rows) |r| dc += vals[r * cols + cols - 1] - vals[r * cols];
+                for (0..cols) |c| dr += vals[(rows - 1) * cols + c] - vals[c];
+                return .{ dc / @as(f64, @floatFromInt(rows * (cols - 1))), dr / @as(f64, @floatFromInt(cols * (rows - 1))) };
             }
             /// mean of a per-pattern array
             fn mean(hh: *hdf5.Hdf5, g: Allocator, group: u64, name: []const u8) f64 {
@@ -567,6 +778,16 @@ pub const Scan = struct {
                 const full = num.get(h, header, "DetectorFullHeightMicrons");
                 const unclipped = num.get(h, header, "UnClippedPatternHeight");
                 if (full > 0 and unclipped > 0) info.px_um = full / unclipped;
+                // A clipped pattern's PCY is a fraction of the height before clipping, from the
+                // top: Esprit's own per-pattern pattern centres move with the beam as its tilts
+                // and step say only when PCY is read so and DD as a fraction of the stored
+                // height, and the patterns put their centre there (2 px from it; 9 px from PCY
+                // read on the stored height).
+                const stored: f64 = @floatFromInt(info.pat_h);
+                if (unclipped > stored and !std.math.isNan(info.pc[1])) {
+                    info.pc[1] *= unclipped / stored;
+                    info.pc_note = "Bruker's PCY read as a fraction of the pattern's height before clipping (UnClippedPatternHeight), DD of its stored height";
+                }
                 info.voltage_kv = num.get(h, header, "KV");
             },
             .h5_edax => {
@@ -602,7 +823,37 @@ pub const Scan = struct {
                     if ((h.numbers(a, &m.specimen_euler) catch 0) != 3) m.specimen_euler = @splat(std.math.nan(f64));
                 }
                 info.calibration = .{ .metadata = m };
+                // Only the fallback raster convention needs these additional full-map reads.
+                if (info.calibration.status() != .supported) {
+                    // (and how they move over the map: x as it is, y turned over, both scaled as above)
+                    const dx = num.drift(h, gpa, data, "Pattern Center X", info.rows, info.cols);
+                    const dy = num.drift(h, gpa, data, "Pattern Center Y", info.rows, info.cols);
+                    const dz = num.drift(h, gpa, data, "Detector Distance", info.rows, info.cols);
+                    info.pc_per_col = .{ dx[0], -dy[0] * ratio, dz[0] * ratio };
+                    info.pc_per_row = .{ dx[1], -dy[1] * ratio, dz[1] * ratio };
+                }
+                // The scan's turn (Scanning Rotation Angle): at a half turn the beam goes as the
+                // settings' signs say (checked on an AZtec acquisition: its stored pattern
+                // centres move as the engine's do); unturned, the other way along both (as #13,
+                // by Tijmenvermeij, found on Oxford's files); any other angle is not read.
+                const turn = num.get(h, header, "Scanning Rotation Angle");
+                if (std.math.isFinite(turn)) {
+                    const w = @mod(turn, 2 * std.math.pi);
+                    if (@abs(w - std.math.pi) <= 1e-4) {
+                        info.turn_note = "a half turn: the beam as the scan signs say";
+                    } else if (@min(w, 2 * std.math.pi - w) <= 1e-4) {
+                        info.scan_turn = -1;
+                        info.turn_note = "none: the beam the other way from what the scan signs say";
+                    } else info.turn_note = "neither none nor a half turn, which is not read: the beam as the scan signs say";
+                }
                 info.sample_tilt_deg = std.math.radiansToDegrees(info.sample_tilt_deg);
+                info.tilt_axis_deg = std.math.radiansToDegrees(num.get(h, header, "Tilt Axis"));
+                if (try h.child(header, "Detector Orientation Euler")) |a| {
+                    var eu: [3]f64 = undefined;
+                    if ((h.numbers(a, &eu) catch 0) == 3) if (oxfordDetectorRot(eu)) |r| {
+                        info.detector_rot = r;
+                    };
+                }
                 info.voltage_kv = num.get(h, header, "Beam Voltage");
             },
             else => unreachable,
@@ -727,6 +978,8 @@ pub const Scan = struct {
             }
             const ang = try @import("ang.zig").load(self.gpa, &self.files[k], n, if (version >= 3) .{ dx, dy } else null, w, hgt);
             errdefer self.gpa.free(ang.iq);
+            errdefer self.gpa.free(ang.euler);
+            errdefer self.gpa.free(ang.phase);
             if (version >= 3 and (nx != ang.cols or ny != ang.rows)) return error.ScanShapeMismatch;
             if (version >= 3 and (!sameStep(dx, ang.step_x_um) or !sameStep(dy, ang.step_y_um))) return error.UPANGStepMismatch;
             if ((hints.rows != 0 and hints.rows != ang.rows) or (hints.cols != 0 and hints.cols != ang.cols)) return error.ScanShapeMismatch;
@@ -738,6 +991,8 @@ pub const Scan = struct {
             info.pc_note = ang.pc_note;
             self.overview_values = ang.iq;
             self.overview_kind = .image_quality;
+            self.stored_euler = ang.euler;
+            self.stored_phase = ang.phase;
             return;
         }
         // Preserve standalone UP/manual-shape behavior. A valid rectangular v3+
@@ -1013,4 +1268,71 @@ test "UP ANG scalar maps clean up on success, parse errors and allocation failur
     try std.testing.expectError(error.DuplicateANGSidecar, Scan.open(gpa, &.{ up, ang, ang }, .{}));
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "scan.ang", .data = header ++ "0 0 0 0 0 1 0 0\n0 0 0 .05 0 3 0 0\n" });
     try std.testing.expectError(error.ANGCoordinatesNotRowMajor, Scan.open(gpa, paths, .{}));
+}
+
+test "a file's processed and unprocessed patterns, each with its own pixels and background" {
+    // (after #15, by Tijmenvermeij: an Oxford acquisition written by the engine's HDF5 writer,
+    // with both kinds, with one, with the other)
+    const W = @import("io/hdf5_write.zig");
+    const testing = std.testing;
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const i16_ = W.Type{ .class = .int, .size = 2 };
+    const stores = [_]u32{ KIND_PROCESSED | KIND_UNPROCESSED, KIND_PROCESSED, KIND_UNPROCESSED };
+    for (stores) |kinds| {
+        var f = try W.File.init(gpa);
+        defer f.deinit();
+        const data = try f.path("1/EBSD/Data");
+        const header = try f.path("1/EBSD/Header");
+        _ = try f.dataset(header, "Y Cells", .{ .dtype = W.Type.u8_, .bytes = &.{1} });
+        _ = try f.dataset(header, "X Cells", .{ .dtype = W.Type.u8_, .bytes = &.{2} });
+        _ = try f.dataset(header, "Processed Static Background", .{ .dtype = W.Type.u8_, .dims = &.{ 1, 2 }, .bytes = &.{ 3, 4 } });
+        _ = try f.dataset(header, "Unprocessed Static Background", .{ .dtype = i16_, .dims = &.{ 1, 2 }, .bytes = &.{ 0xff, 0xff, 0, 0x80 } });
+        if (kinds & KIND_PROCESSED != 0) _ = try f.dataset(data, "Processed Patterns", .{ .dtype = W.Type.u8_, .dims = &.{ 2, 1, 2 }, .bytes = &.{ 70, 71, 72, 73 } });
+        if (kinds & KIND_UNPROCESSED != 0) _ = try f.dataset(data, "Unprocessed Patterns", .{ .dtype = i16_, .dims = &.{ 2, 1, 2 }, .bytes = &.{ 0, 0x80, 0xff, 0x7f, 0xc9, 0xff, 7, 0 } });
+        try tmp.dir.writeFile(testing.io, .{ .sub_path = "scan.h5oina", .data = try f.bytes(arena.allocator()) });
+        const path = try tmp.dir.realPathFileAlloc(testing.io, "scan.h5oina", gpa);
+        defer gpa.free(path);
+        for ([_]bool{ false, true }) |ask| {
+            const scan = try Scan.open(gpa, &.{path}, .{ .unprocessed = ask });
+            defer scan.close();
+            try testing.expectEqual(kinds, scan.info.pattern_kinds);
+            // (the kind asked for where both are stored, else the one there is)
+            const raw = kinds == KIND_UNPROCESSED or (kinds != KIND_PROCESSED and ask);
+            try testing.expectEqual(raw, scan.info.unprocessed);
+            if (raw) {
+                try testing.expectEqual(Pixel.f32, scan.info.pixel);
+                try testing.expectEqualSlices(f32, &.{ -1, -32768 }, scan.background);
+                var all: [16]u8 = undefined;
+                try scan.read(0, 2, &all);
+                for ([_]f32{ -32768, 32767, -55, 7 }, 0..) |want, i|
+                    try testing.expectEqual(want, @as(f32, @bitCast(std.mem.readInt(u32, all[i * 4 ..][0..4], .little))));
+                var cell: [8]u8 = undefined;
+                try scan.readCells(&.{1}, &cell);
+                try testing.expectEqualSlices(u8, all[8..], &cell);
+            } else {
+                try testing.expectEqual(Pixel.u8, scan.info.pixel);
+                try testing.expectEqualSlices(f32, &.{ 3, 4 }, scan.background);
+                var all: [4]u8 = undefined;
+                try scan.read(0, 2, &all);
+                try testing.expectEqualSlices(u8, &.{ 70, 71, 72, 73 }, &all);
+            }
+        }
+    }
+}
+
+test "Oxford's detector orientation as the geometry's rotation, and back" {
+    // an AZtec acquisition's (radians): 3.40° from the nominal (0, 90°, 0)
+    const eu: rot.Vec3 = .{ 6.266744, 1.6277858, 6.2817445 };
+    const r = oxfordDetectorRot(eu).?;
+    const want = [_]f64{ 0.0163958, 0.05700002, -0.00097189 };
+    for (want, r) |a, b| try std.testing.expectApproxEqAbs(a, b, 1e-6);
+    const back = oxfordDetectorEuler(r);
+    for (eu, back) |a, b| try std.testing.expectApproxEqAbs(a, b, 1e-6);
+    // the nominal itself is no rotation, and angles far from it are not read
+    for (oxfordDetectorRot(.{ 0, std.math.pi / 2.0, 0 }).?) |v| try std.testing.expectApproxEqAbs(0, v, 1e-12);
+    try std.testing.expect(oxfordDetectorRot(.{ 0, std.math.degreesToRadians(20.0), 0 }) == null);
 }

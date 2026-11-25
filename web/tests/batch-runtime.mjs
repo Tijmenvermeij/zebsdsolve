@@ -49,7 +49,7 @@ function spec() {
     openHints: { map_rows: 2, map_cols: 3, pattern_height: 4, pattern_width: 5 }, scanInfo: { ...scan },
     geometry: { pc: [0.4, 0.5, 0.6], sampleTiltDeg: 70 }, openGeometry: { pc: [0.3, 0.5, 0.6], sampleTiltDeg: 70 }, phases: [{ name: "iron" }], version: "1" };
 }
-function fixture({ engineOptions = {}, artifacts: makeArtifacts } = {}) {
+function fixture({ engineOptions = {}, artifacts: makeArtifacts, overlap } = {}) {
   const directory = new Directory(), calls = [], engines = [], counts = { index: 0, capture: 0 };
   let queue;
   const createEngine = async () => {
@@ -74,15 +74,22 @@ function fixture({ engineOptions = {}, artifacts: makeArtifacts } = {}) {
       if (completed.has(name)) continue;
       counts.capture++; yield { name, data: `data ${name}` };
     }
+    const overlapName = job.outputStem + "_overlap.json";
+    if (job.overlap && !completed.has(overlapName)) {
+      assert.ok(job.overlapArtifact);
+      counts.capture++; yield { name: overlapName, data: job.overlapArtifact };
+    }
   });
-  queue = new BatchQueue({ createEngine, artifacts }); queue.setDirectory(directory);
+  queue = new BatchQueue({ createEngine, artifacts, overlap }); queue.setDirectory(directory);
   return { queue, directory, calls, engines, counts };
 }
 
 
 const journal = (job) => JSON.parse(job._folder.entries.get(job.journalName).data);
 function assertLeaf(job, vendor = ".ang") {
-  assert.deepEqual([...job._folder.entries.keys()].sort(), [job.outputStem + ".h5", job.outputStem + vendor, job.outputStem + "_IPF-Z.png", job.outputStem + "_NCC.png", job.outputStem + ".json"].sort());
+  const suffixes = [".h5", vendor, "_IPF-Z.png", "_NCC.png", ".json"];
+  if (job.overlap) suffixes.push("_overlap.json");
+  assert.deepEqual([...job._folder.entries.keys()].sort(), suffixes.map(suffix => job.outputStem + suffix).sort());
   assert.equal(journal(job).batch.status, "complete");
   assert.ok(journal(job).batch.outputs.every(entry => entry.complete));
 }
@@ -276,6 +283,66 @@ for (const when of ["begin", "step"]) {
     queue.stop(); yield { name: job.outputStem + ".h5", data: "results" }; yield { name: job.outputStem + ".ang", data: "results" }; for (const suffix of ["_IPF-Z.png", "_NCC.png"]) yield { name: job.outputStem + suffix, data: "pixels" };
   } }); queue = f.queue; const job = queue.add(spec()); queue.add(spec()); await queue.run(); assertLeaf(job); assert.equal(queue.jobs[1].status, "queued");
 }
+// Skip during an indexing step, then export only the next scan.
+{
+  let once = true;
+  const { queue, calls, counts } = fixture({ engineOptions: { step(q) {
+    if (once) {
+      once = false;
+      assert.ok(q.canSkip);
+      q.skip();
+    }
+  } } });
+  const first = queue.add(spec()), next = queue.add(spec());
+  const observed = [];
+  queue.onScan = (_engine, job) => observed.push(job.id);
+  await queue.run();
+  assert.deepEqual(observed, [first.id, next.id]);
+  assert.equal(first.status, "skipped");
+  assert.ok(!first.resultCheckpoint);
+  assert.equal(next.status, "complete");
+  assert.equal(counts.capture, 4);
+  assert.equal(calls.filter(call => call === "cancel").length, 1);
+  assert.equal(queue.error, null);
+}
+
+// An interrupted Overlap stage publishes no results. The next scan completes all six files.
+{
+  const { queue, calls, counts } = fixture({ async overlap(_engine, job, check, progress) {
+    for (let done = 0; done <= 2; done++) {
+      assert.ok(check());
+      await progress({ done, total: 2 });
+    }
+    return new Blob([JSON.stringify({ scan: job.sourceFiles[0].name })]);
+  } });
+  const first = queue.add({ ...spec(), overlap: { maxComponents: 2 } });
+  const nextInput = spec(); nextInput.sourceFiles[0] = file("next.ebsp");
+  const next = queue.add({ ...nextInput, overlap: { maxComponents: 2 } });
+  const observed = [];
+  queue.onProgress = (_engine, job, progress) => {
+    if (progress.stage !== "overlap") return;
+    observed.push([job.id, progress.done]);
+    if (job === first && progress.done === 1) {
+      assert.ok(queue.canSkip);
+      queue.skip();
+    }
+  };
+  await queue.run();
+  assert.deepEqual(observed, [[first.id, 0], [first.id, 1], [next.id, 0], [next.id, 1], [next.id, 2]]);
+  assert.equal(first.status, "skipped");
+  assert.equal(first.progress, null);
+  assert.equal(first.overlapArtifact, null);
+  assert.ok(!first.resultCheckpoint);
+  assert.deepEqual([...first._folder.entries.keys()], [first.journalName]);
+  assert.equal(journal(first).batch.status, "skipped");
+  assertLeaf(next);
+  assert.deepEqual(journal(next).overlap, { maxComponents: 2 });
+  assert.equal(await next._folder.entries.get(`${next.outputStem}_overlap.json`).data.text(), '{"scan":"next.ebsp"}');
+  assert.equal(counts.capture, 5);
+  assert.equal(calls.filter(call => call === "cancel").length, 1);
+  assert.equal(queue.error, null);
+}
+
 for (const initialState of ["failed", "cancelled"]) {
   let firstBegin = true, firstExport = true; const exports = [], rootA = new Directory(), rootB = new Directory();
   const { queue, counts } = fixture({ engineOptions: { begin: (queue, engine) => {
@@ -395,4 +462,4 @@ for (const saved of [undefined, 1, 3]) {
   const job = queue.add(input); await queue.run(); assert.equal(job.status, "complete"); assert.equal(counts.index, 1);
   assert.equal(journal(job).geometry_convention, "oxford-fallback-v1");
 }
-console.log("Batch runtime: per-job destinations, five-file journals, frozen replay, concurrency, cancellation and guarded retries passed.");
+console.log("Batch runtime: per-job destinations, five- and six-file outputs, frozen replay, concurrency, skip, cancellation and guarded retries passed.");

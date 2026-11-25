@@ -326,7 +326,7 @@ export function createOverlap({ st, busy, runPrimary, selectTab, redraw, status,
       const result = await engine.overlapCells(cells, fitOptions);
       if (!check()) return false;
       commit(candidate, result, cells, colors ? engine : null);
-      onTile(cells);
+      await onTile(cells);
       await new Promise(resolve => setTimeout(resolve, 0));
     }
     return true;
@@ -338,7 +338,7 @@ export function createOverlap({ st, busy, runPrimary, selectTab, redraw, status,
     const candidate = newRun(engine, requested, options, {
       scanName:job.sourceFiles[0].name, sources:job.sources, masters:job.masters, openHints:job.openHints,
     });
-    onTile({done:0,total:requested.length});
+    await onTile({done:0,total:requested.length});
     const finished = await computeTiles(engine, candidate, options, check,
       () => onTile({done:candidate.completedCount,total:requested.length}), false);
     if (!finished) return null;

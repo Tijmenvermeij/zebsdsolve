@@ -8,7 +8,7 @@ const n = 4;
 const s = {
   schema_version: 1, version: "export-test", scan: { rows: 2, cols: 2, pat_h: 8, pat_w: 10, format: "h5_oxford" },
   geometry: { pc: [.4, .5, .6], step_x_um: 1, step_y_um: 2, sample_tilt_deg: 70 }, settings: { phase_by: "nmi" },
-  phases: [{ name: "Fe", space_group: 229, laue: 11, lattice: [3, 3, 3, 90, 90, 90] }, { name: "Ni", space_group: 225, laue: 11, lattice: [3.5, 3.5, 3.5, 90, 90, 90] }],
+  phases: [{ name: "Fe", space_group: 229, laue: 11, lattice: [3, 3, 3, 90, 90, 90] }, { name: "Ni", space_group: 225, laue: 11, laue_symbol: "m-3m", lattice: [3.5, 3.5, 3.5, 90, 90, 90] }],
   results: { quaternions: [1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0], euler: [.1, .2, .3, 0, 0, 0, .2, .4, .6, 0, 0, 0], phase: [0, -1, 1, -1], ncc: [.8, 0, .9, 0], nmi: [.5, 0, .7, 0], z: [12, 0, 15, 0], sweep: [0, -1, 1, -1] },
   candidates: { phase_count: 2, quaternions: Array.from({ length: 8 }, () => [1, 0, 0, 0]).flat(), euler: new Array(24).fill(0), ncc: [.8, .6, .4, 0, .7, 0, .9, 0], nmi: [.5, .3, .2, 0, .4, 0, .7, 0], z: [12, 9, 8, 0, 10, 0, 15, 0], sweep: [0, 0, 0, -1, 0, -1, 1, -1] },
   pattern_centres: Array.from({ length: n }, () => [.4, .5, .6]).flat(),
@@ -66,6 +66,8 @@ const f = new h.File("/source.h5oina", "w");
 put(f, "Manufacturer", "Oxford Instruments"); const root = f.create_group("1"), eb = root.create_group("EBSD"), hd = eb.create_group("Header"), d = eb.create_group("Data");
 for (const [key, value] of [["X Cells", 2], ["Y Cells", 2], ["Pattern Width", 10], ["Pattern Height", 8]]) put(hd, key, new Uint32Array([value]));
 for (const [key, value] of [["X Step", 1], ["Y Step", 2]]) put(hd, key, new Float64Array([value])).create_attribute("Unit", "um");
+put(hd, "Hit Rate", new Float32Array([100]));
+put(d, "Error", new Uint8Array(n).fill(1));
 const pg = hd.create_group("Phases"), fe = pg.create_group("1");
 put(fe, "Space Group", new Uint32Array([229])); put(fe, "Laue Group", new Uint32Array([11])); put(fe, "Phase Name", ["Fe"]);
 put(fe, "Lattice Dimensions", new Float64Array([3, 3, 3]), [1, 3]).create_attribute("Unit", "angstrom");
@@ -140,7 +142,10 @@ read(ox, (f) => {
   assert.deepEqual(f.get_external_link("/VendorExternalLink"), { filename: "external.h5", obj_path: "/vendor/data" });
   assert.deepEqual(Array.from(f.get("VendorHardLink").value), [5, 6]);
   assert.equal(f.get("1/EBSD/Data/Pattern Center X").value[0], .4);
-  assert.ok(Number.isNaN(f.get("1/EBSD/Data/Pattern Center X").value[3]));
+  assert.equal(f.get("1/EBSD/Data/Pattern Center X").value[3], .2);
+  assert.deepEqual(Array.from(f.get("1/EBSD/Data/Error").value), [1, 0, 1, 0]);
+  assert.equal(f.get("1/EBSD/Header/Hit Rate").value[0], 50);
+  assert.equal(f.get("1/EBSD/Header/Phases/2/Laue Group").attrs.Symbol.value, "m-3m");
   assert.ok(Math.abs(f.get("1/EBSD/Data/Pattern Center Y").value[0] - .4) < 1e-12);
   assert.ok(Number.isNaN(f.get("1/EBSD/Data/Pattern Center Y").value[3]));
 });

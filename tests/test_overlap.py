@@ -507,11 +507,65 @@ class NativeDiscovery(unittest.TestCase):
         self.assertLess(restore(self.s._e,bad_buffer,size),0);self.s._error()
         np.testing.assert_array_equal(self.s.overlap_cells([0],max_components=1,primary='stored')['quaternions'][0,0],first[0,0])
         # New conditioning invalidates all old proofs; only committed cells regain
-        # proof if normal indexing is cancelled after its first actual batch.
-        self.s.configure(mask=True,roi_w=6,roi_h=1,sweeps=1)
-        self.s.index_begin();self.s.index_step();self.s.cancel();self.s.index_step()
-        partial=self.s.overlap_cells([0,1],max_components=1,primary='stored')
-        self.assertTrue(partial['objective_valid'][0]);self.assertEqual(partial['stop_reason'][1],6)
+        # proof if normal indexing is cancelled after its first group of batches.
+        patterns = np.tile(self.patterns[None], (1,4,1,1))
+        self.s.set_patterns(patterns)
+        self.s.configure(mask=True,roi_w=24,roi_h=1,sweeps=1)
+        self.s.index_begin()
+        self.assertGreater(self.s.index_step(), 0)
+        visited = int(np.count_nonzero(self.s.results()['phase'] >= 0))
+        self.assertGreater(visited, 1)
+        self.s.cancel()
+        self.s.index_step()
+        partial = self.s.overlap_cells([0,visited],max_components=1,primary='stored')
+        self.assertTrue(partial['objective_valid'][0])
+        self.assertEqual(partial['stop_reason'][1],6)
+
+    def test_checkpoint_requires_the_opened_pattern_kind(self):
+        from tempfile import TemporaryDirectory
+        import h5py
+
+        with TemporaryDirectory() as temp, Solver() as solver:
+            path = Path(temp) / "scan.h5oina"
+            with h5py.File(path, "w") as file:
+                group = file.create_group("1/EBSD")
+                header, data = group.create_group("Header"), group.create_group("Data")
+                header.create_dataset("Y Cells", data=[2])
+                header.create_dataset("X Cells", data=[3])
+                data.create_dataset("Processed Patterns", data=np.arange(480, dtype=np.uint8).reshape(6,8,10))
+                data.create_dataset("Unprocessed Patterns", data=np.arange(480, dtype=np.int16).reshape(6,8,10) - 240)
+            solver.configure(bandwidth=16, batch=2)
+            solver.add_phase(ROOT / "testdata/nickel/Ni_master_20kV.npz")
+            lib = solver._lib
+            open_configured = lib.ze_open_scan_configured
+            open_configured.argtypes = [C.c_void_p, C.c_char_p, C.c_size_t, C.c_char_p,
+                                        C.c_size_t, C.c_char_p, C.c_size_t]
+            open_configured.restype = C.c_int32
+            capture = lib.ze_result_checkpoint
+            capture.argtypes = [C.c_void_p, C.c_void_p, C.c_size_t]
+            capture.restype = C.c_int64
+            restore = lib.ze_restore_result_checkpoint
+            restore.argtypes = [C.c_void_p, C.c_void_p, C.c_size_t]
+            restore.restype = C.c_int32
+            filename = str(path).encode()
+
+            def reopen(kind):
+                hints = b'{"oxford_patterns":"' + kind + b'"}'
+                self.assertEqual(open_configured(solver._e, filename, len(filename), b"{}", 2, hints, len(hints)), 0)
+                self.assertEqual(solver.scan["unprocessed"], kind == b"unprocessed")
+
+            reopen(b"processed")
+            solver.index()
+            size = capture(solver._e, None, 0)
+            self.assertGreater(size, 112)
+            data = C.create_string_buffer(size)
+            self.assertEqual(capture(solver._e, data, size), size)
+            reopen(b"processed")
+            self.assertEqual(restore(solver._e, data, size), 0)
+            reopen(b"unprocessed")
+            self.assertLess(restore(solver._e, data, size), 0)
+            self.assertIn("CheckpointContextMismatch", solver._error())
+            self.assertTrue(np.all(solver.results()["phase"] == -1))
 
     def test_spherical_three_and_four_known_native_poses(self):
         self.s.clear_phases();self.s.add_phase(ROOT/'testdata/nickel/Ni_master_20kV.npz')

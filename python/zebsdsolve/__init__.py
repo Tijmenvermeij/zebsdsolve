@@ -28,7 +28,7 @@ import numpy as np
 
 from . import _native as _n
 
-__version__ = "0.2.2"
+__version__ = "0.2.6"
 
 _lib = None
 _wgpu = None
@@ -157,7 +157,7 @@ class Solver:
     @property
     def geometry(self):
         """The detector geometry: a dict with pc (3), sample_tilt_deg, detector_tilt_deg, rot (3,
-        rotation vector, radians, in the detector's own axes: swing about its row direction,
+        rotation vector, radians, in the detector's own axes: azimuthal about its row direction,
         tilt about its column direction, twist about its normal), px_um, step_x_um, step_y_um.
 
         px_um is the size of one stored pattern pixel on the detector: the scan file's, or one
@@ -225,7 +225,9 @@ class Solver:
         """Open a scan file, and any side files it needs after it. NORDIF's Pattern.dat needs its
         Setting.txt, which is picked up from beside it when not given; an EDAX .up1 / .up2 can take
         its scan's .ang (the map's shape, the steps, image quality and the pattern centre). The
-        region of interest goes back to the whole map."""
+        region of interest goes back to the whole map. A file that stores processed and
+        unprocessed patterns side by side (an Oxford acquisition can) is read as the setting
+        `stored_patterns` says; `scan["pattern_kinds"]` names the kinds it stores."""
         paths = [str(p) for p in paths]
         if len(paths) == 1 and paths[0].lower().endswith(".dat"):
             side = os.path.join(os.path.dirname(paths[0]), "Setting.txt")
@@ -234,6 +236,7 @@ class Solver:
         joined = "\n".join(paths).encode()
         self._check(self._lib.ze_open_scan(self._e, joined, len(joined)), "open")
         self._source_path = paths[0]
+        self._opened = [os.path.abspath(p) for p in paths]
         return self
 
     def synthesize(self, **settings):
@@ -244,7 +247,7 @@ class Solver:
 
         Keywords are settings. The microstructure, from `toy_seed`: `toy_rows` × `toy_cols`
         cells cut into `toy_grains` grains (1: a single crystal), each with a random orientation
-        and phase; `toy_spread_deg` turns every cell a little within its grain; `toy_blank` is
+        and phase; `toy_spread_deg` rotates every cell a little within its grain; `toy_blank` is
         the share of cells holding no crystal. The detector: patterns of `toy_height` ×
         `toy_width` pixels, `toy_contrast` of whose intensity is the simulation and the rest a
         background (flat, or a hump of `toy_background_sigma` × the width). The counting: a
@@ -261,6 +264,7 @@ class Solver:
         i32p = ctypes.POINTER(ctypes.c_int32)
         self._check(self._lib.ze_synthesize(self._e, _ptr(q, _n.f32p), ph.ctypes.data_as(i32p), gr.ctypes.data_as(i32p), n), "synthesize")
         self._source_path = None
+        self._opened = []
         return {"quaternions": q.reshape(rows, cols, 4), "phase": ph.reshape(rows, cols), "grain": gr.reshape(rows, cols), "geometry": self.geometry}
 
     def set_patterns(self, patterns):
@@ -281,6 +285,7 @@ class Solver:
         rows, cols, h, w = a.shape
         self._check(self._lib.ze_set_patterns(self._e, a.ctypes.data, a.nbytes, pixel, rows, cols, h, w), "set_patterns")
         self._source_path = None
+        self._opened = []
         return self
 
     @property
@@ -295,6 +300,8 @@ class Solver:
             "rows": s.rows, "cols": s.cols, "pattern_shape": (s.pat_h, s.pat_w), "dtype": ["uint8", "uint16", "float32"][s.pixel],
             "format": fmt, "has_background": bool(s.has_background), "has_pc": bool(s.has_pc), "has_px": bool(s.has_px), "geometry_frame": s.geometry_frame,
             "voltage_kv": s.voltage_kv or None, "bytes": int(s.bytes),
+            "pattern_kinds": tuple(k for b, k in ((1, "processed"), (2, "unprocessed")) if s.pattern_kinds & b),
+            "unprocessed": bool(s.pattern_kinds & 4),
         }
 
     def shape(self, full=False):
@@ -465,21 +472,21 @@ class Solver:
             nz, ny, nx = (int(v) for v in shape)
             axes = np.empty(nx + ny + nz, np.float64)
             scores = np.empty(n, np.float32)
-            best = np.empty(1024, np.uint32)
-            ncc = np.empty(1024, np.float32)
-            self._lib.ze_pc_level(self._e, i, shape, info, _ptr(axes, _n.f64p), axes.size, _ptr(scores, _n.f32p), n, _ptr(best, _n.u32p), _ptr(ncc, _n.f32p), best.size)
-            n_pat = self._lib.ze_fit_patterns(self._e, None, None, None, None, 0) or len(best)
+            per = np.empty(self._lib.ze_pc_level_scores(self._e, i, None, 0), np.float32)
+            n_pat = per.size // n
+            best = np.empty(n_pat, np.uint32)
+            ncc = np.empty(n_pat, np.float32)
+            self._lib.ze_pc_level(self._e, i, shape, info, _ptr(axes, _n.f64p), axes.size, _ptr(scores, _n.f32p), n, _ptr(best, _n.u32p), _ptr(ncc, _n.f32p), n_pat)
 
             def split(c):
                 return np.stack([c % nx, (c // nx) % ny, c // (nx * ny)], -1)
 
-            per = np.empty(self._lib.ze_pc_level_scores(self._e, i, None, 0), np.float32)
             self._lib.ze_pc_level_scores(self._e, i, _ptr(per, _n.f32p), per.size)
             out.append({"scores": scores.reshape(nz, ny, nx), "x": axes[:nx], "y": axes[nx:nx + ny], "z": axes[nx + ny:],
                         "pattern_scores": per.reshape(-1, nz, ny, nx),
                         **self._pc_ballots(i, (nz, ny, nx)),
                         "winner": tuple(int(v) for v in split(np.array(int(info[0])))), "walked": bool(info[1]),
-                        "pattern_best": split(best[:n_pat].astype(np.int64)), "pattern_ncc": ncc[:n_pat].copy()})
+                        "pattern_best": split(best.astype(np.int64)), "pattern_ncc": ncc})
         return out
 
     def _pc_ballots(self, i, shape):
@@ -515,13 +522,12 @@ class Solver:
 
         Returns a dict: plane (4 × 3), kind, frame, pc (the source at the map's middle), start_pc
         (the pattern centre the fit began from), rot
-        (the geometry's turn now), n_patterns, n_used, rmsd (of the used points about the
+        (the geometry's detector rotation now), n_patterns, n_used, rmsd (of the used points about the
         plane: PCx, PCy, PCz), ncc and start_ncc (the fit patterns' mean score, each at its
         own best, and before), iterations, and `said`: what the plane says of the geometry,
         each with its standard error (`*_se`, from leaving out one block of the map at a
-        time): rot (the sample's frame against the nominal one: swing, tilt, and the scan's
-        turn in its own plane; radians), sample_tilt_deg (the sample tilt that tilt makes,
-        omitted for calibrated Oxford acquisitions),
+        time): rot (the sample's frame against the nominal one: azimuthal, tilt, and the scan
+        rotation; radians), sample_tilt_deg (the sample tilt that tilt makes),
         step (the beam's travel for a row and for a column, as a factor on what the steps and
         the pixel size say), skew (the scan's directions off a right angle, radians)."""
         r = _n.PlaneResult()
@@ -533,7 +539,7 @@ class Solver:
         `set_geometry`; what earlier fits left is not used, so the same scan and settings give
         the same fit): the vote for the pattern centre (`fit_pc`), then the fit patterns' own
         source points from there, and of the ways they may move over the scan the simplest the
-        map supports: one centre (the vote's geometry stays), a tilt line (PCx the same
+        map supports: one centre (with the scan's steps), a tilt line (PCx the same
         everywhere, PCy and PCz along the rows) or the plane (`plane_kind`). Each is asked where
         a block of the map stands from the others; `models` gives each one's error so (`cv`,
         and `cv_se`, the standard error of its difference from the best), `model` the one taken.
@@ -1179,11 +1185,12 @@ class Solver:
         return float(out[0]), float(out[1])
 
     def index_begin(self):
-        """Start indexing the region of interest; `index_step` then does a batch at a time."""
+        """Start indexing the region of interest; `index_step` then does a few batches at a time."""
         self._check(self._lib.ze_index_begin(self._e), "index")
 
     def index_step(self):
-        """Index the next batch; returns the number of cells left to visit (0: done)."""
+        """Index the next few batches (about 4096 patterns, two batches at a time on the GPU);
+        returns the number of cells left to visit (0: done)."""
         return self._check(self._lib.ze_index_step(self._e), "index")
 
     @property
@@ -1207,9 +1214,9 @@ class Solver:
         return plan
 
     def index(self, progress=None):
-        """Index the region of interest (settings roi_*, the whole map by default), a batch at a
-        time, in settings.sweeps sweeps. `progress(status)` is called after each batch with
-        `index_status`; return False from it to stop."""
+        """Index the region of interest (settings roi_*, the whole map by default), a few batches
+        at a time, in settings.sweeps sweeps. `progress(status)` is called after each step
+        (index_step) with `index_status`; return False from it to stop."""
         self.index_begin()
         while True:
             left = self.index_step()
@@ -1249,8 +1256,7 @@ class Solver:
 
     def ipf_key(self, phase=0, size=256, lower=False):
         """The key to a phase's inverse pole figure colours, as the settings have them
-        (`ipf_colors`: "classic", "hue", "perfect" or "perfect_rotation"; `ipf_lightness` and
-        `ipf_gray` for the last two): (rgba, box). `rgba` is uint8 (size, size, 4): the crystal
+        (`ipf_colors`: "classic", "hue", "perfect" or "perfect_rotation"): (rgba, box). `rgba` is uint8 (size, size, 4): the crystal
         directions that stand for all the others, in stereographic projection with the crystal's
         x to the right ([001] at the origin), transparent outside them. That is the triangle
         between [001], [101] and [111] for the cubic classes, a wedge from the c axis for any
@@ -1263,6 +1269,71 @@ class Solver:
         box = np.empty(6, np.float32)
         self._check(self._lib.ze_ipf_key(self._e, int(phase), int(size), int(bool(lower)), _ptr(out, _n.u8p), out.size, _ptr(box, _n.f32p)), "ipf_key")
         return out.reshape(size, size, 4), tuple(float(v) for v in box[:4])
+
+    def stored_orientations(self):
+        """The orientations the scan file stores from its maker's indexing, as it stores them:
+        {"euler": (rows, cols, 3) Bunge angles in radians, "phase": (rows, cols) labels, −1 where
+        not indexed}, or None when it stores none. Which frame they are in is
+        `identify_frame`'s to find."""
+        s = self.scan
+        n = s["rows"] * s["cols"]
+        e = np.empty((n, 3), np.float64)
+        ph = np.empty(n, np.int32)
+        if not self._check(self._lib.ze_stored_orientations(self._e, _ptr(e, _n.f64p), _ptr(ph, _n.i32p), n), "stored_orientations"):
+            return None
+        return {"euler": e.reshape(s["rows"], s["cols"], 3), "phase": ph.reshape(s["rows"], s["cols"])}
+
+    def identify_frame(self, euler=None, phase=None):
+        """The reference frame convention a maker's orientations are in, found against the
+        results: from `euler` (Bunge angles, radians, (rows, cols, 3) or (n, 3), one per map
+        cell) and `phase` (a label per cell, any integers, negative where not indexed), or with
+        neither the scan file's own. Every convention of the sample's axes, the rotation's sense
+        and the crystal's axes on the lattice is tried, cell by cell under each phase's own
+        symmetry.
+
+        Returns a dict: `frame` (as `frame` has it), `cells` compared, `within` (the fraction
+        within 2°), `median_deg`, `runner_up_deg` (the best other convention's median: how
+        clearly this one was told), `matched` (the reference's label for each phase),
+        `installed` (the exports take the convention when it was told clearly: median under 5°,
+        and the best other's at least twice that and 5° more), and the misorientation left
+        between the reference and these results, which no convention removes and nothing
+        applies: `misorientation` (rotation vector, radians, about the engine's x toward the
+        detector, y the tilt axis, z out of the surface: the rotation of the sample axes that
+        takes these results closest to the reference, at the map's middle),
+        `misorientation_rows` and `misorientation_cols` (how much it changes from the first row
+        to the last and from the first column to the last) and `misorientation_cells` (the cells
+        it was measured on, those within a few degrees). A misorientation that changes over the
+        map says the two geometries place the pattern centre differently as the beam moves; one
+        that does not, that their detector orientations or pattern centres differ, or that
+        either indexed less well."""
+        cap = 8192
+        buf = ctypes.create_string_buffer(cap)
+        if euler is None:
+            n = self._check(self._lib.ze_identify_frame(self._e, None, None, 0, buf, cap), "identify_frame")
+        else:
+            e = np.ascontiguousarray(np.asarray(euler, np.float64).reshape(-1, 3))
+            ph = np.ascontiguousarray(np.asarray(phase, np.int32).reshape(-1))
+            if len(ph) != len(e):
+                raise Error("identify_frame: euler and phase differ in length")
+            n = self._check(self._lib.ze_identify_frame(self._e, _ptr(e, _n.f64p), _ptr(ph, _n.i32p), len(ph), buf, cap), "identify_frame")
+        return json.loads(buf.raw[:n].decode())
+
+    @property
+    def frame(self):
+        """The reference frame convention the exports write orientations in: `axes` (the
+        convention's sample X, Y, Z as the engine's axes, 1 x on the surface toward the
+        detector, 2 y the tilt axis, 3 z out of the surface, negative reversed), `active`,
+        `crystal` (x_a_z_cstar, the masters' own; x_astar_z_c; y_b_z_cstar; y_bstar_z_c) and
+        `text`, a line naming it. The engine's own (kikuchipy's) until identified
+        (`identify_frame`) or set; a new scan resets it."""
+        buf = ctypes.create_string_buffer(1024)
+        n = self._lib.ze_frame(self._e, buf, 1024)
+        return json.loads(buf.raw[:n].decode())
+
+    @frame.setter
+    def frame(self, value):
+        j = b"" if value is None else json.dumps({k: v for k, v in dict(value).items() if k != "text"}).encode()
+        self._check(self._lib.ze_set_frame(self._e, j, len(j)), "set_frame")
 
     def export_snapshot(self, engine_to_cs1=None):
         """Stored results and alternate-phase candidates; optional active engine→CS1 wxyz rotation."""
@@ -1297,6 +1368,10 @@ class Solver:
         engine_to_cs1 overrides require frame_provenance.
         HDF5 exports require the optional h5py dependency.
         """
+        target = os.path.abspath(path)
+        if os.path.exists(target) and any(os.path.exists(source) and os.path.samefile(target, source)
+                                         for source in getattr(self, "_opened", [])):
+            raise Error("export would replace an open source file")
         suffix = str(path).rsplit(".", 1)[-1].lower()
         if suffix in ("h5", "hdf5"):
             from .hdf5_export import write_emsphinx

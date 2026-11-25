@@ -74,7 +74,8 @@ const SoP = extern struct {
     rden_div: u32 = 1,
     nb: u32,
     log2nc: u32,
-    pad0: u32 = 0,
+    /// 1: spec holds U, not yet transformed along c (a_peak_m)
+    u_in_spec: u32 = 0,
     pad1: u32 = 0,
     pad2: u32 = 0,
 };
@@ -107,7 +108,7 @@ pub fn fftSize(L: u32) u32 {
 
 pub const Tables = struct {
     L: u32,
-    /// orientation grid points per turn; the sphere grid has n rings of 2n points
+    /// orientation grid points per 360°; the sphere grid has n rings of 2n points
     n: u32,
     n_pairs: u32,
     ring: Buf,
@@ -280,7 +281,10 @@ pub const Spherical = struct {
     /// invocations per workgroup of the FFT kernels (settings.wg_fft)
     wg: u32 = shaders.wg_default,
     items: Buf = .{},
+    /// per item and northern ring: its orders below L with its mirror's (sphere.wgsl rings)
     grid: Buf = .{},
+    /// per item and chunk of its grid: the window's sums (sphere.wgsl sphere_sums)
+    partials: Buf = .{},
     alm: Buf = .{},
     /// per item: window area, window mean, harmonic norm, a_00
     stats: Buf = .{},
@@ -310,7 +314,7 @@ pub const Spherical = struct {
 
     pub fn deinit(self: *Spherical) void {
         self.seed_selector.deinit();
-        inline for (.{ "items", "grid", "alm", "stats", "spec", "cand_v", "cand_i", "best", "peaks", "w_alm", "w_stats", "vol_f", "vol_f2", "seed_numerator", "seed_denominator", "seed_keys", "seed_pages", "seed_page", "seed_interpolated" }) |f| self.g.release(&@field(self, f));
+        inline for (.{ "items", "grid", "partials", "alm", "stats", "spec", "cand_v", "cand_i", "best", "peaks", "w_alm", "w_stats", "vol_f", "vol_f2", "seed_numerator", "seed_denominator", "seed_keys", "seed_pages", "seed_page", "seed_interpolated" }) |f| self.g.release(&@field(self, f));
     }
 
     fn pipe(self: *Spherical, comptime module: []const u8, comptime entry: []const u8) u32 {
@@ -357,8 +361,11 @@ pub const Spherical = struct {
         const n_theta = t.n;
         const n_phi = 2 * t.n;
         const per: u64 = @as(u64, n_theta) * n_phi;
+        // (sphere.wgsl SUMS_CHUNK)
+        const chunks: u32 = @intCast(per / @min(per, 2048));
         g.ensure(&self.items, @as(u64, n_items) * 16);
-        g.ensure(&self.grid, n_items * per * 8);
+        g.ensure(&self.grid, @as(u64, n_items) * (n_theta / 2) * t.L * 16);
+        g.ensure(&self.partials, @as(u64, n_items) * chunks * 8);
         g.ensure(alm, @as(u64, n_items) * t.n_pairs * 8);
         g.ensure(stats, @as(u64, n_items) * 16);
         g.writeSlice(self.items, 0, Item, items);
@@ -376,20 +383,19 @@ pub const Spherical = struct {
             .c2 = .{ fr.c2[0], fr.c2[1], fr.c2[2], 0 },
             .mask = .{ fr.mask[0], fr.mask[1], fr.mask[2], 0 },
         };
-        var f = Gpu.flat(@intCast((n_items * per + 255) / 256));
+        var f = Gpu.flat(n_items * chunks);
         p.grid_x = f[0];
-        g.dispatch(self.pipe("sphere", "backproject"), f[0], f[1], 1, &.{ g.uniform(0, std.mem.asBytes(&p)), self.items.at(1), pats.at(2), t.ring.at(3), self.grid.at(4) });
-        f = Gpu.flat(n_items);
-        p.grid_x = f[0];
-        g.dispatch(self.pipe("sphere", "window_center"), f[0], f[1], 1, &.{ g.uniform(0, std.mem.asBytes(&p)), t.ring.at(3), self.grid.at(4), stats.at(8) });
-        // (the Legendre sums read orders below L only)
-        self.fftLines(self.grid, n_phi, n_items * n_theta, t.L);
+        g.dispatch(self.pipe("sphere", "sphere_sums"), f[0], f[1], 1, &.{ g.uniform(3, std.mem.asBytes(&p)), self.items.at(4), pats.at(5), t.ring.at(6), self.partials.at(12) });
+        // each ring with its mirror, along φ (a line of the FFT each pair)
+        const k = self.lineParams(n_phi, n_items * (n_theta / 2));
+        const u = g.uniformPair(0, std.mem.asBytes(&k.u), 3, std.mem.asBytes(&p));
+        g.dispatch(self.fftPipe("sphere", "rings"), k.f[0], k.f[1], 1, &.{ u[0], t.tw.at(2), u[1], self.items.at(4), pats.at(5), t.ring.at(6), self.grid.at(7), self.partials.at(12) });
         f = Gpu.flat((n_items * t.n_pairs + 255) / 256);
         p.grid_x = f[0];
-        g.dispatch(self.pipe("sphere", "legendre"), f[0], f[1], 1, &.{ g.uniform(0, std.mem.asBytes(&p)), self.grid.at(4), t.wplm.at(5), t.pairs.at(6), alm.at(7) });
+        g.dispatch(self.pipe("sphere", "legendre"), f[0], f[1], 1, &.{ g.uniform(3, std.mem.asBytes(&p)), self.grid.at(7), t.wplm.at(8), t.pairs.at(9), alm.at(10) });
         f = Gpu.flat(n_items);
         p.grid_x = f[0];
-        g.dispatch(self.pipe("sphere", "sh_norm"), f[0], f[1], 1, &.{ g.uniform(0, std.mem.asBytes(&p)), t.pairs.at(6), alm.at(7), stats.at(8) });
+        g.dispatch(self.pipe("sphere", "sh_norm"), f[0], f[1], 1, &.{ g.uniform(3, std.mem.asBytes(&p)), t.pairs.at(9), alm.at(10), stats.at(11), self.partials.at(12) });
     }
 
     fn soParams(self: *const Spherical, ph: *const PhaseGpu, n_items: u32) SoP {
@@ -397,16 +403,28 @@ pub const Spherical = struct {
     }
 
     /// Record the spectrum of `n_items` coefficient sets against the weights `w`, transformed
-    /// along b and then c, leaving V[j; m', c] in `spec`.
-    fn spectrum(self: *Spherical, ph: *const PhaseGpu, w: Buf, alm: Buf, n_items: u32) void {
+    /// along b and then (`along_c`) c, leaving U[j; m', m] or V[j; m', c] in `spec`.
+    fn spectrum(self: *Spherical, ph: *const PhaseGpu, w: Buf, alm: Buf, n_items: u32, along_c: bool) void {
         const g = self.g;
         const t = self.t;
         g.ensure(&self.spec, n_items * ph.specBytes(t));
         const so = self.soParams(ph, n_items);
-        const k = self.lineParams(t.n, n_items * t.L * ph.nc);
+        // (pairs of lines, m' = 2h and 2h + 1, a workgroup's at one pair for up to four m of
+        // `per` items: so3.wgsl spectrum)
+        const lpw = TW_LEN / t.n;
+        const per = lpw / @min(4, lpw);
+        const k = self.lineParams(t.n, (n_items + per - 1) / per * per * ((t.L + 1) / 2) * ph.nc);
         const u = g.uniformPair(0, std.mem.asBytes(&k.u), 3, std.mem.asBytes(&so));
         g.dispatch(self.fftPipe("so3", "spectrum"), k.f[0], k.f[1], 1, &.{ u[0], t.tw.at(2), u[1], w.at(4), t.dq.at(5), alm.at(6), self.spec.at(7) });
-        self.fftLines(self.spec, ph.nc, n_items * so.nb * t.L, ph.nc);
+        if (along_c) self.fftLines(self.spec, ph.nc, n_items * so.nb * t.L, ph.nc);
+    }
+
+    /// Whether a_peak_m can take an (item, j) slab of this phase at a time: the slab, half the
+    /// grid by the master's orders, in one workgroup's memory (so3.wgsl AM_SLOTS), and enough
+    /// columns for the transform along c.
+    fn slabFits(self: *const Spherical, ph: *const PhaseGpu) bool {
+        const h = self.t.n / 2;
+        return ph.nc >= 4 and h * ph.nc <= 2048 and self.t.L <= h;
     }
 
     /// The last transform's parameters: the `n_items · nb · nc` lines along a, as a transform
@@ -422,24 +440,33 @@ pub const Spherical = struct {
         const g = self.g;
         const t = self.t;
         const per = (t.n / 2 + 1) * ph.nc;
-        self.spectrum(ph, ph.w_f, self.alm, n_items);
+        const slab = self.slabFits(ph);
+        self.spectrum(ph, ph.w_f, self.alm, n_items, !slab);
         g.ensure(&self.cand_v, @as(u64, n_items) * per * 4);
         g.ensure(&self.cand_i, @as(u64, n_items) * per * 4);
         g.ensure(&self.best, @as(u64, n_items) * 8);
         g.ensure(&self.peaks, @as(u64, n_items) * 32);
         var so = self.soParams(ph, n_items);
         so.rden_div = @max(rden_div, 1);
+        so.u_in_spec = @intFromBool(slab);
         var rd = rden;
         rd.slot = 8;
-        const k = self.aParams(ph, n_items);
+        var k = self.aParams(ph, n_items);
+        if (slab) {
+            // a workgroup an (item, j) slab
+            k.f = Gpu.flat(n_items * so.nb);
+            k.u.grid_x = k.f[0];
+        }
         const u = g.uniformPair(0, std.mem.asBytes(&k.u), 3, std.mem.asBytes(&so));
-        g.dispatch(self.fftPipe("so3", "a_peak"), k.f[0], k.f[1], 1, &.{ u[0], t.tw.at(2), u[1], self.spec.at(7), rd, self.cand_v.at(9), self.cand_i.at(10) });
+        g.dispatch(if (slab) self.fftPipe("so3", "a_peak_m") else self.fftPipe("so3", "a_peak"), k.f[0], k.f[1], 1, &.{ u[0], t.tw.at(2), u[1], self.spec.at(7), rd, self.cand_v.at(9), self.cand_i.at(10) });
         var f = Gpu.flat(n_items);
         so.grid_x = f[0];
         g.dispatch(self.pipe("so3", "peak_reduce"), f[0], f[1], 1, &.{ g.uniform(3, std.mem.asBytes(&so)), self.cand_v.at(9), self.cand_i.at(10), self.best.at(11) });
-        f = Gpu.flat((n_items + 63) / 64);
+        // (on a_peak_m's path a workgroup an item, which takes V along c itself)
+        f = Gpu.flat(if (slab) n_items else (n_items + 63) / 64);
         so.grid_x = f[0];
-        g.dispatch(self.pipe("so3", "peak_finish"), f[0], f[1], 1, &.{ g.uniform(3, std.mem.asBytes(&so)), self.spec.at(7), rd, self.best.at(11), self.peaks.at(17) });
+        const uf = g.uniformPair(0, std.mem.asBytes(&k.u), 3, std.mem.asBytes(&so));
+        g.dispatch(if (slab) self.pipe("so3", "peak_finish_m") else self.pipe("so3", "peak_finish"), f[0], f[1], 1, &.{ uf[0], t.tw.at(2), uf[1], self.spec.at(7), rd, self.best.at(11), self.peaks.at(17) });
     }
 
     /// Record: the correlation volumes of the `n_items` window coefficient sets in `w_alm`
@@ -447,7 +474,7 @@ pub const Spherical = struct {
     fn volume(self: *Spherical, ph: *const PhaseGpu, w: Buf, n_items: u32, out: Buf) void {
         const g = self.g;
         const t = self.t;
-        self.spectrum(ph, w, self.w_alm, n_items);
+        self.spectrum(ph, w, self.w_alm, n_items, true);
         const so = self.soParams(ph, n_items);
         const k = self.aParams(ph, n_items);
         const u = g.uniformPair(0, std.mem.asBytes(&k.u), 3, std.mem.asBytes(&so));
@@ -481,7 +508,7 @@ pub const Spherical = struct {
     }
     fn candidateSlab(self: *Spherical, ph: *const PhaseGpu, item: u32, first: u32, rows: u32, out: Buf) void {
         var so = self.soParams(ph, 1);
-        so.pad0 = item;
+        so.n_items = item; // This dispatch uses the field as its single item index.
         so.pad1 = first;
         so.pad2 = rows;
         const k = self.lineParams(self.t.n / 2, rows * ph.nc);
@@ -551,6 +578,7 @@ pub const Spherical = struct {
         so.grid_x = grid[0];
         var rd = s.rden;
         rd.slot = 8;
+        const k = self.aParams(s.ph, n_items);
         const peak_bytes = @as(u64, n_items) * @sizeOf([8]f32);
         var ranks: usize = 0;
         for (0..8) |rank| {
@@ -563,7 +591,8 @@ pub const Spherical = struct {
             }
             if (!any) break;
             g.writeSlice(self.best, 0, peak_select.Key, best_page);
-            g.dispatch(self.pipe("so3", "peak_finish"), grid[0], grid[1], 1, &.{ g.uniform(3, std.mem.asBytes(&so)), self.spec.at(7), rd, self.best.at(11), self.peaks.at(17) });
+            const u = g.uniformPair(0, std.mem.asBytes(&k.u), 3, std.mem.asBytes(&so));
+            g.dispatch(self.pipe("so3", "peak_finish"), grid[0], grid[1], 1, &.{ u[0], self.t.tw.at(2), u[1], self.spec.at(7), rd, self.best.at(11), self.peaks.at(17) });
             g.copy(self.peaks, 0, self.seed_interpolated, rank * peak_bytes, peak_bytes);
             ranks += 1;
         }
@@ -591,6 +620,9 @@ pub const Spherical = struct {
         g.read(self.peaks, 0, std.mem.sliceAsBytes(out[0..n_items]));
         try g.wait();
         if (keep_n == 1) return;
+        // The fused rank-one kernel consumes U. The overlap slabs and page
+        // interpolation address V, so transform along c once for the pool.
+        if (self.slabFits(ph)) self.fftLines(self.spec, ph.nc, n_items * (t.n / 2 + 1) * t.L, ph.nc);
         const row_bytes = @as(u64, ph.nc) * t.n * 4;
         if (3 * row_bytes > lim) return error.BandwidthExceedsDeviceLimit;
         const core_rows: u32 = @intCast(@min(16, lim / row_bytes - 2));

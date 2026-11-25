@@ -44,7 +44,15 @@ fn fingerprint(e: *const engine.Engine) [32]u8 {
     hashValue(&h, e.set);
     hashValue(&h, e.geo);
     hashValue(&h, e.calibration);
+    hashValue(&h, e.scanSigns());
     e.calibration.hashDetectorAttitude(&h);
+    if (e.info() catch null) |info| {
+        // An explicit open hint can choose a dataset without changing Settings.
+        if (info.pattern_kinds != 0) {
+            hashValue(&h, info.pattern_kinds);
+            hashValue(&h, info.unprocessed);
+        }
+    }
     for (e.phases.items) |p| {
         const m = p.master;
         hashValue(&h, m.name);
@@ -94,7 +102,7 @@ fn payloadSize(n: usize, phases: usize) !usize {
 pub fn byteSize(e: *engine.Engine) !usize {
     _ = try e.info();
     const context = e.res.context orelse return error.NoIndexedResults;
-    if (!e.res.context_consistent or !engine.sameExportContext(context, .{ .settings = e.set, .geometry = e.geo, .calibration = e.calibration, .phase_generation = e.phase_generation })) return error.CheckpointContextChanged;
+    if (!e.res.context_consistent or !engine.sameExportContext(context, e.exportContext())) return error.CheckpointContextChanged;
     if (e.res.candidate_phases != e.phases.items.len or e.res.candidates.len != e.res.phase.len * e.phases.items.len) return error.CheckpointCandidatesMissing;
     return std.math.add(usize, header, try payloadSize(e.res.phase.len, e.phases.items.len));
 }
@@ -184,7 +192,7 @@ pub fn restore(e: *engine.Engine, input: []const u8) !void {
         sweep.* = c.get(i32);
         if (sweep.* < -1 or (sweep.* >= 0 and sweep.* >= e.set.sweeps)) return error.InvalidResultCheckpoint;
     }
-    replacement.context = .{ .settings = e.set, .geometry = e.geo, .calibration = e.calibration, .phase_generation = e.phase_generation };
+    replacement.context = e.exportContext();
     // A verified homogeneous checkpoint is the one safe route to restore proof
     // without reindexing. Mixed-context checkpoints remain rejected above.
     replacement.seed_context = replacement.context;

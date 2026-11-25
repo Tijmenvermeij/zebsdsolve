@@ -138,7 +138,7 @@ fn snapshotImpl(e: *engine.Engine, requested: ?rot.Quat, is_oxford: bool) ![]u8 
         try w.writeAll("],\"master_crystal_convention\":\"X||a,Z||c*\",\"output_crystal_convention\":\"X||a*,Z||c\"}");
     }
     try w.writeAll(",\"pattern_centres\":[");
-    const signs = context.calibration.scanSigns(context.settings.scan_x_sign, context.settings.scan_y_sign);
+    const signs = context.scan_signs;
     for (0..e.res.phase.len) |i| {
         const t = geometry.positionForRotation(context.calibration.rotation(&geometry), @floatFromInt(i / info.cols), @floatFromInt(i % info.cols), 0.5 * @as(f64, @floatFromInt(info.rows - 1)), 0.5 * @as(f64, @floatFromInt(info.cols - 1)), signs[0], signs[1], 1, @floatFromInt(info.pat_h), @floatFromInt(info.pat_w));
         const pc = engine.Geometry.pcOf(context.calibration.rotation(&geometry), t, @floatFromInt(info.pat_h), @floatFromInt(info.pat_w));
@@ -154,7 +154,8 @@ fn snapshotImpl(e: *engine.Engine, requested: ?rot.Quat, is_oxford: bool) ![]u8 
     try w.writeAll(",\"phases\":[");
     for (e.phases.items, 0..) |p, i| {
         if (i != 0) try w.writeByte(',');
-        try value(w, .{ .name = p.master.name, .space_group = p.master.space_group, .laue = @intFromEnum(p.master.exportLaue()), .lattice = p.master.lattice.?, .master_source = p.master.source, .master_source_format_version = p.master.source_format_version, .master_crystal_convention = p.master.crystal_frame.label() });
+        const laue = p.master.exportLaue();
+        try value(w, .{ .name = p.master.name, .space_group = p.master.space_group, .laue = @intFromEnum(laue), .laue_symbol = laue.name(), .lattice = p.master.lattice.?, .master_source = p.master.source, .master_source_format_version = p.master.source_format_version, .master_crystal_convention = p.master.crystal_frame.label() });
     }
     try w.writeAll("],\"results\":{\"quaternions\":[");
     const n = e.res.phase.len;

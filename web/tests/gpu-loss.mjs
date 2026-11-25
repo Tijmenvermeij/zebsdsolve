@@ -71,10 +71,10 @@ try {
   let nativeReturned = false, frameFreed = false, freedAt;
   const operation = z._serial(() => z._frame(async (f) => {
     f.alloc(8);
-    gpu.readBuffer(src, 0, 4, 128);
-    gpu.readBuffer(src, 4, 4, 132);
+    gpu.readBuffer(src, 0, 4, 128, 1);
+    gpu.readBuffer(src, 4, 4, 132, 2);
     gpu.submit();
-    const status = await gpu.wait();
+    const status = await gpu.wait(-1);
     nativeReturned = true;
     assert.equal(status, 1);
     nativeError = "index_step: ReadFailed";
@@ -132,6 +132,25 @@ try {
   assert.deepEqual(z.exportSnapshot(), { completed: 17 });
   z.state.errors.push("validation failure");
   assert.throws(() => z._check(0, "normal call"), /validation failure/);
+
+  // Settling the first batch leaves the second batch's mapping in flight.
+  const firstRead = buffers.length;
+  gpu.readBuffer(src, 0, 4, 128, 3);
+  gpu.readBuffer(src, 4, 4, 132, 4);
+  gpu.submit();
+  const firstWait = gpu.wait(3);
+  const firstMapping = buffers[firstRead], secondMapping = buffers[firstRead + 1];
+  firstMapping.data.set([1, 2, 3, 4]);
+  firstMapping.mapping.resolve();
+  assert.equal(await firstWait, 0);
+  assert.equal(firstMapping.destroyed, 1);
+  assert.equal(secondMapping.destroyed, 0);
+  assert.deepEqual(Array.from(new Uint8Array(memory.buffer, 128, 4)), [1, 2, 3, 4]);
+  secondMapping.data.set([5, 6, 7, 8]);
+  secondMapping.mapping.resolve();
+  assert.equal(await gpu.wait(-1), 0);
+  assert.equal(secondMapping.destroyed, 1);
+  assert.deepEqual(Array.from(new Uint8Array(memory.buffer, 132, 4)), [5, 6, 7, 8]);
 
   const supplied = await Zebsdsolve.create({ wasm: "https://example.test/test.wasm", device, warm: false });
   assert.deepEqual(supplied.adapterInfo, {}, "a supplied device must not invent adapter identity");

@@ -16,6 +16,7 @@ The [original upstream web app by Zachary Varley](https://zacharyvarley.github.i
 - **Reads** h5ebsd (kikuchipy, Bruker, EDAX, Oxford `.h5oina`), EDAX `.up1` / `.up2` (with the scan's `.ang` for the map's shape, steps, image quality and pattern centre: `solver.open("scan.up1", "scan.ang")`), Oxford `.ebsp`, NORDIF `Pattern.dat`. Master patterns: [ebsdsim](https://github.com/ZacharyVarley/ebsdsim) `.npz` and EMsoft `.h5`.
   When an Oxford acquisition contains both processed and unprocessed patterns, the browser
   asks which to use. A file with one pattern dataset opens directly.
+- **Batch** queues scans with their own settings and writes vendor results, EMSphInx HDF5, maps and project JSON. An optional Overlap stage writes a separate fit export.
 
 One engine (Zig and WGSL) runs natively through wgpu-native and as WebAssembly on WebGPU, so the app and the Python package do the same thing.
 
