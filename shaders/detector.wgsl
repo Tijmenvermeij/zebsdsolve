@@ -7,6 +7,7 @@
 // point, its ray is u / |u|, and the simulated intensity is the master in direction q · ray.
 //
 //   project       simulated patterns
+//   project_rot_jacobian   one raw simulation and three rotation derivatives
 //   project_dict  simulated patterns of dictionary orientations at one detector position
 //   seed          items with the orientations a search found (spherical peaks or dictionary hits)
 //   decoy         items with random orientations, for what mutual information chance gives
@@ -16,6 +17,7 @@
 //                 rotation of the crystal (3). Chunks of pixels in parallel; sums_reduce adds
 //                 the chunks.
 //   sums_rot      the same over the rotation alone, which is all orientation refinement uses
+//   sums_conditional_rot   the same after a fixed linear operator on the simulation
 //   refine_init, refine_step   Gauss–Newton on each item's orientation, on the device: a step
 //                 from the best point so far, accepted when the next sums score higher, with
 //                 the model's curvature rescaled by how each gain compares with its promise
@@ -29,6 +31,7 @@
 // zero outside it, so NCC = Σ (I − Ī) b / |I − Ī|.
 
 const NS: u32 = 43u;
+const REFINE_CONDITIONAL: u32 = 2u;
 
 struct DetP {
     n_items: u32,
@@ -38,7 +41,7 @@ struct DetP {
     grid_x: u32,
     // pixel chunks per item (sums)
     n_chunks: u32,
-    // refine_step: 1 = last call (keep the best, take no step)
+    // refinement: 1 = last call (keep the best, take no step), 2 = conditional pose
     flags: u32,
     n_bins: u32,
     // dictionary: entries in this chunk, index of its first entry, patterns scored
@@ -57,7 +60,8 @@ struct DetP {
     // finite-difference step on the sphere (radians), largest refinement step (radians),
     // smallest and largest curvature scale
     num: vec4<f32>,
-    // project_dict: the detector position every dictionary pattern is simulated at
+    // project_dict: the detector position every dictionary pattern is simulated at;
+    // conditional refinement: .w is the angular cap from the seed, in radians (0: disabled)
     t0: vec4<f32>,
 };
 
@@ -72,7 +76,8 @@ struct DetP {
 // refinement state per item (24 floats): current q (0–3), best q (4–7), best NCC (8), the
 // curvature scale (9), the best point's gradient (10–12) and matrix (13–18), the size of the
 // last step that improved (19), the gain the model promised for the step being tried (20) and
-// that step's size (21), the count of points accepted (22)
+// that step's size (21), the count of points accepted (22).
+// Conditional refinement has just one item and appends its seed quaternion (24–27).
 @group(0) @binding(9) var<storage, read_write> state: array<f32>;
 @group(0) @binding(10) var<storage, read_write> poses_rw: array<vec4<f32>>;
 @group(0) @binding(11) var<storage, read_write> score: array<f32>;
@@ -262,6 +267,22 @@ fn project(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_inde
 }
 
 @compute @workgroup_size(256)
+fn project_rot_jacobian(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
+    let pix = flat_id(wid, lid, dp.grid_x, 256u);
+    let hw = dp.pat_h * dp.pat_w;
+    if (pix >= hw) { return; }
+    let u = ray_of(0u, pix / dp.pat_w, pix % dp.pat_w);
+    let c = qrot(poses[1], normalize(u));
+    let m = grad_fit(c);
+    // dI/dϕ = ∇I · (ϕ × c) = ϕ · (c × ∇I), for q' = exp(ϕ) q.
+    let d = cross(c, m.xyz);
+    sims[pix] = m.w;
+    sims[hw + pix] = d.x;
+    sims[2u * hw + pix] = d.y;
+    sims[3u * hw + pix] = d.z;
+}
+
+@compute @workgroup_size(256)
 fn project_dict(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
     let tid = flat_id(wid, lid, dp.grid_x, 256u);
     let hw = dp.pat_h * dp.pat_w;
@@ -325,6 +346,20 @@ struct RotSums {
     ho: vec3<f32>,
 }
 
+fn rot_zero() -> RotSums {
+    return RotSums(vec4<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0));
+}
+
+fn rot_add(t: RotSums, val: f32, d: vec3<f32>, e: f32) -> RotSums {
+    return RotSums(
+        t.s0 + vec4<f32>(1.0, val, val * val, val * e),
+        t.sd + d,
+        t.sv + val * d,
+        t.se + e * d,
+        t.hd + d * d,
+        t.ho + d.xxy * d.yzz);
+}
+
 fn rot_sums(b: u32, chunk: u32) -> RotSums {
     let hw = dp.pat_h * dp.pat_w;
     let nc = dp.n_chunks;
@@ -337,19 +372,12 @@ fn rot_sums(b: u32, chunk: u32) -> RotSums {
     var col = chunk - row * dp.pat_w;
     let step_r = nc / dp.pat_w;
     let step_c = nc - step_r * dp.pat_w;
-    var t = RotSums(vec4<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0));
+    var t = rot_zero();
     for (var pix = chunk; pix < hw; pix = pix + nc) {
         if (in_mask(f32(row), f32(col))) {
             let c = qrot(q, normalize(ray_of(b, row, col)));
             let m = grad_at(c);
-            let d = cross(c, m.xyz);
-            let e = pats[pbase + pix];
-            t.s0 = t.s0 + vec4<f32>(1.0, m.w, m.w * m.w, m.w * e);
-            t.sd = t.sd + d;
-            t.sv = t.sv + m.w * d;
-            t.se = t.se + e * d;
-            t.hd = t.hd + d * d;
-            t.ho = t.ho + d.xxy * d.yzz;
+            t = rot_add(t, m.w, cross(c, m.xyz), pats[pbase + pix]);
         }
         row = row + step_r;
         col = col + step_c;
@@ -392,12 +420,7 @@ fn wpart_total(lid: u32, count: u32) {
 // reads are written. (An entry point of its own: compiled apart from `sums` and its array of
 // 43, it is not given the registers that array asks for.) The 19 are added up ten, then nine
 // at a time, so that a workgroup of 256 stays within 16 KiB of workgroup memory.
-@compute @workgroup_size(SUMS_WG)
-fn sums_rot(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
-    let tid0 = (wid.y * dp.grid_x + wid.x) * SUMS_WG;
-    let tid = tid0 + lid;
-    var t = RotSums(vec4<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0));
-    if (tid < dp.n_items * dp.n_chunks) { t = rot_sums(tid / dp.n_chunks, tid % dp.n_chunks); }
+fn rot_parts(t: RotSums, tid0: u32, lid: u32) {
     // the workgroup's item and its partial
     let live = tid0 < dp.n_items * dp.n_chunks;
     let b = tid0 / dp.n_chunks;
@@ -427,6 +450,31 @@ fn sums_rot(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_ind
     wpart[8u * SUMS_WG + lid] = t.hd.z;
     wpart_total(lid, 9u);
     if (live && lid < 9u) { part[out + rot_index(10u + lid) * nq] = wpart[lid * SUMS_WG]; }
+}
+
+@compute @workgroup_size(SUMS_WG)
+fn sums_rot(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
+    let tid0 = (wid.y * dp.grid_x + wid.x) * SUMS_WG;
+    let tid = tid0 + lid;
+    var t = rot_zero();
+    if (tid < dp.n_items * dp.n_chunks) { t = rot_sums(tid / dp.n_chunks, tid % dp.n_chunks); }
+    rot_parts(t, tid0, lid);
+}
+
+@compute @workgroup_size(SUMS_WG)
+fn sums_conditional_rot(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
+    let tid0 = (wid.y * dp.grid_x + wid.x) * SUMS_WG;
+    let hw = dp.pat_h * dp.pat_w;
+    var t = rot_zero();
+    // After the frozen transform, center and normalize under the usual mask via refine_item.
+    // The target is already centered and unit-normalized in that same mask.
+    for (var pix = tid0 + lid; pix < hw; pix = pix + dp.n_chunks) {
+        if (in_mask(f32(pix / dp.pat_w), f32(pix % dp.pat_w))) {
+            let d = vec3<f32>(sims_in[hw + pix], sims_in[2u * hw + pix], sims_in[3u * hw + pix]);
+            t = rot_add(t, sims_in[pix], d, pats[pix]);
+        }
+    }
+    rot_parts(t, tid0, lid);
 }
 
 // (SUMS_WG, this kernel's invocations per workgroup, is set in a line the engine puts before
@@ -538,6 +586,12 @@ fn refine_init(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_
     state[st + 7u] = q.w;
     state[st + 8u] = -2.0;
     state[st + 9u] = dp.mask.w;
+    if ((dp.flags & REFINE_CONDITIONAL) != 0u) {
+        state[24] = q.x;
+        state[25] = q.y;
+        state[26] = q.z;
+        state[27] = q.w;
+    }
 }
 
 @compute @workgroup_size(64)
@@ -554,6 +608,14 @@ fn collect(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_inde
     records[o + 5u] = score_in[b];
     records[o + 6u] = state_in[st + 19u];
     records[o + 7u] = 0.0;
+}
+
+// Principal rotation vector of a unit quaternion, in radians.
+fn rotation_vector(q: vec4<f32>) -> vec3<f32> {
+    let v = select(q.yzw, -q.yzw, q.x < 0.0);
+    let l = length(v);
+    if (l < 1e-8) { return 2.0 * v; }
+    return (2.0 * atan2(l, abs(q.x)) / l) * v;
 }
 
 // Orientation refinement's step for item b from its sums (laid out as rot_sums returns them).
@@ -630,12 +692,23 @@ fn refine_item(b: u32, t: RotSums) {
     var step = solve3(h, g);
     let len = length(step);
     if (len > dp.num.y) { step = step * (dp.num.y / len); }
+    var trial = qnormalize(qmul(qexp(step), qbest));
+    if ((dp.flags & REFINE_CONDITIONAL) != 0u && dp.t0.w > 0.0) {
+        let seed = vec4<f32>(state[24], state[25], state[26], state[27]);
+        let delta = rotation_vector(qmul(trial, qconj(seed)));
+        let angle = length(delta);
+        if (angle > dp.t0.w) {
+            trial = qnormalize(qmul(qexp(delta * (dp.t0.w / angle)), seed));
+            // The promise and reported step use the actual displacement after projection.
+            step = rotation_vector(qmul(trial, qconj(qbest)));
+        }
+    }
     // what the model promises this step gains: g·p − ½ p'(mu J'J)p
     let quad = h[0] * step.x * step.x + h[3] * step.y * step.y + h[5] * step.z * step.z
         + 2.0 * (h[1] * step.x * step.y + h[2] * step.x * step.z + h[4] * step.y * step.z);
     state[st + 20u] = dot(g, step) - 0.5 * quad;
     state[st + 21u] = length(step);
-    poses_rw[b * 2u + 1u] = qnormalize(qmul(qexp(step), qbest));
+    poses_rw[b * 2u + 1u] = trial;
 }
 
 // A workgroup an item: its partial sums (sums_rot's) of each sum added up, then the step

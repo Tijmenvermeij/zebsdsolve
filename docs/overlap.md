@@ -33,20 +33,28 @@ const result = await ze.overlapCells(cells, {
 });
 ```
 
-V6 keeps the detector geometry fixed and evaluates orientation changes using the
-same shared gain/blur and nonnegative amplitude objective as the final mixture.
-The experimental target is prepared once. No new background filter is applied
-while polishing or forming residuals. Each support gets its initial shared
-blur/gain fit before angular trials. During polishing, blur/gain stays fixed and
-the nonnegative amplitudes are refitted at each trial. When both fitting and
-polishing are enabled, **Refit blur / gain after polishing** optionally runs one
-more shared fit at the best moved pose. The equivalent API options are
+Profile version 3 first selects the support from the ordinary overlap search.
+When the overlap search retains two or more components, each orientation
+uses the detector's Gauss–Newton NCC refinement
+against the original prepared pattern minus all other fitted contributions.
+All targets use the same initial amplitudes and shared blur/gain profile.
+The simulated intensities and orientation derivatives use that same transfer,
+and detector geometry stays fixed. No new background filter is applied.
+Each pose is bounded around its native proposal by `polish_radius_deg`, with
+the configured detector refinement step and iterations. The amplitudes are
+refitted after all poses have been updated. A component that reaches zero
+weight is dropped while the surviving components keep their refined poses.
+If the fit is invalid, the original support is retained. Pixels where discovery
+selects one component keep their discovered pose. An explicit one-component API
+request still allows a standalone refinement check.
+
+**Refit blur / gain after polishing** optionally fits one shared profile to
+the isolated targets at the refined poses and then updates the amplitudes.
+It holds poses fixed and compares the sum of isolated-component squared errors
+using the current weights. It retains the existing profile if the refit
+would discard a surviving component. The equivalent API options are
 `refit_blur_gain_after_polish` in Python, `refitBlurGainAfterPolish` in JavaScript,
-and flag value 8 in C. Orientation polishing with blur/gain requires V6 profile
-version 2. The GPU scores the six neighbors of an angle together and reuses
-the unchanged prepared components and their inner products. Initial primary
-polishing can batch independent scan points. Later residual searches still
-follow each point's accepted support.
+and flag value 8 in C.
 V6 compacts zero coefficients: `active_count` is the strictly positive support
 size, while `fitted_count` retains the legacy `>1e-6` display convention. Inner
 nuisance-search evaluation bounds are not bounds on the whole profiled run.
@@ -69,18 +77,18 @@ The exact executed threshold and requested value are exported separately.
 
 `quaternions` contains the final fitted poses. `source_quaternions` retains the
 native proposal poses; `proposal_ncc` is the historical discovery score before
-joint polishing. A replaced primary can have a residual-derived score, so V6
+orientation refinement. A replaced primary can have a residual-derived score, so V6
 component slots do not imply discovery order. `profile_events` preserves rejected
 proposals, replacements, their scan-cell IDs and the selected trajectory. Event bit
-256 marks the event that produced the published fit when Options bit 4 is
+256 marks the event that selected the support before the final orientation refinement when Options bit 4 is
 requested (the current Python and browser SDKs request it automatically).
 Bit 512 indicates that
 the fit came from a singleton or a reduced support in that event. Add and
-replace bits and the stop reason describe the search path. Final fit arrays
+replace bits and the stop reason describe the search path. Screening and stage comparisons are recorded before the final orientation refinement. Final fit arrays
 hold the complete selected pose, coefficients and gain/blur.
 The profiled `best_single_sse` can describe a different achieved pose from the
-final mixture; incremental improvement compares the strongest achieved strictly
-lower-order model across both histories, without transplanting its components. The
+final mixture. The published incremental improvement compares final mixture SSE
+with the strongest lower-order model recorded across both discovery histories. The
 screen is a computational rule, not calibrated statistical confidence. All
 solutions remain **unassessed candidates** until a matching independent
 calibration is established.
@@ -570,8 +578,8 @@ explained energy. Correlated noise mixed with one real simulated pattern can als
 yield a sizeable second weight. A ratio among nonnegative fitted coefficients is
 not a component-presence test. Signed float range is not the cause: an affine
 positive-range control preserves scores and weights to numerical precision.
-Calibrated component acceptance and conditional orientation refinement remain
-separate work; no universal NCC cutoff is imposed.
+Calibrated component acceptance remains separate work. There is no universal
+NCC cutoff.
 
 
 ## Local regression checks

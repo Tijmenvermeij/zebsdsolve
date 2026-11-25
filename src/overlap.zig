@@ -3,7 +3,6 @@ const std = @import("std");
 const gpu = @import("gpu/gpu.zig");
 const shaders = @import("shaders");
 pub const capacity = 4;
-pub const polish_moment_count = 26;
 /// ABI: 16 f32, matching WGSL State. Flags: 1 ill-conditioned, 2 flat target,
 /// 4 full-Gram spectral condition unassessed, 8 unresolved attribution (NaN
 /// joint outputs), 16 unresolved discovery candidate skipped (prior fit retained).
@@ -120,42 +119,6 @@ pub const Fit = struct {
     }
     pub fn nuisanceTrial(self: *Fit, singleton: bool, k: u32) void {
         self.run("fit_nuisance", .{ .n = self.n, .px = self.px, .mode = if (singleton) 7 else 6, .k = k }, self.original, self.original);
-    }
-    /// Save the stable design moments against target row zero.
-    pub fn polishMoments(self: *Fit, k: u32, column: u32, incumbent: gpu.Buf, cache: gpu.Buf) void {
-        self.polish("polish_moments", k, column, incumbent, self.original, cache);
-    }
-    /// Each lane replaces the same support column with its own candidate.
-    pub fn polishTrials(self: *Fit, k: u32, column: u32, incumbent: gpu.Buf, candidates: gpu.Buf, cache: gpu.Buf) void {
-        self.polish("polish_trials", k, column, incumbent, candidates, cache);
-    }
-    fn polish(self: *Fit, comptime entry: []const u8, k: u32, column: u32, incumbent: gpu.Buf, candidates: gpu.Buf, cache: gpu.Buf) void {
-        std.debug.assert(k > 0 and k <= capacity and column < k and cache.size >= polish_moment_count * @sizeOf(f32));
-        const moments_only = comptime std.mem.eql(u8, entry, "polish_moments");
-        const grid = gpu.Gpu.flat(if (moments_only) 1 else self.n);
-        const p: Params = .{
-            .n = self.n,
-            .px = self.px,
-            .k = k,
-            .phase = column,
-            .grid_x = grid[0],
-            .width = self.width,
-            .pad1 = 1,
-            .mask = .{ self.mask[0], self.mask[1], self.mask[2], 0 },
-        };
-        const pipe = self.g.pipeline("overlap/" ++ entry, shaders.overlap, entry) catch gpu.NO_PIPE;
-        const u = self.g.uniform(0, std.mem.asBytes(&p));
-        if (moments_only) {
-            self.g.dispatch(pipe, grid[0], grid[1], 1, &.{ u, self.original.at(1), incumbent.at(2), cache.at(7) });
-        } else {
-            self.g.dispatch(pipe, grid[0], grid[1], 1, &.{ u, self.original.at(1), incumbent.at(2), candidates.at(3), self.state.at(4), self.progress.at(6), cache.at(7) });
-        }
-    }
-    /// Independent K1 fits with one column and one observed row per lane.
-    pub fn polishSingletons(self: *Fit, candidates: gpu.Buf) void {
-        if (candidates.id != self.bank.id) self.g.copy(candidates, 0, self.bank, 0, @as(u64, self.n) * self.px * 4);
-        self.contrast = true;
-        self.nuisanceTrial(false, 1);
     }
     pub fn fixed(self: *Fit, k: u32) void {
         self.run("fit", .{ .n = self.n, .px = self.px, .k = k, .mode = 1 }, self.original, self.original);

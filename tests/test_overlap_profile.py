@@ -37,14 +37,17 @@ class ProfileProduction(unittest.TestCase):
         self.fixture=fixtures.NativeDiscovery();self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups);self.s=self.fixture.s
         self.s.configure(method='spherical')
-    def test_monotone_polish_and_inspection(self):
+    def test_conditional_polish_and_inspection(self):
         old=self.s.overlap_cells([1,2],max_components=1,blur_gain=True)
         polished_one=self.s.overlap_cells([1,2],max_components=1,blur_gain=True,polish=True)
         new=self.s.overlap_cells([1,2],blur_gain=True,polish=True)
-        self.assertEqual(new['profile_version'],2)
+        self.assertEqual(new['profile_version'],3)
         self.assertTrue(np.all(polished_one['sse']<=old['sse']+3e-6),(old['sse'],polished_one['sse']))
-        self.assertTrue(np.all(new['sse']<=polished_one['sse']+3e-6),(polished_one['sse'],new['sse']))
+        self.assertEqual(new['profile_optimizer']['method'], 'conditional_detector_gauss_newton')
         self.assertEqual(new['source_quaternions'].shape,(2,2,4))
+        np.testing.assert_allclose(new['incremental_improvement'],
+                                   np.maximum(0, new['previous_sse'] - new['sse']),
+                                   atol=3e-6, rtol=0)
         for row,cell in enumerate([1,2]):
             images=self.s.overlap_inspect(cell,new,row=row)
             self.assertAlmostEqual(float(np.sum(images['residual'].astype(float)**2)),float(new['sse'][row]),delta=5e-5)
@@ -62,10 +65,10 @@ class ProfileProduction(unittest.TestCase):
         self.assertFalse(np.array_equal(refit['blur_gain_theta'], fixed['blur_gain_theta']))
         self.assertFalse(fixed['refit_blur_gain_after_polish'])
         self.assertTrue(refit['refit_blur_gain_after_polish'])
-        self.assertEqual(fixed['profile_optimizer']['nuisance_schedule'], 'full_at_entry')
-        self.assertEqual(refit['profile_optimizer']['nuisance_schedule'], 'full_at_entry_and_after_final_pose_change')
+        self.assertEqual(fixed['profile_optimizer']['nuisance_schedule'], 'discovery_only')
+        self.assertEqual(refit['profile_optimizer']['nuisance_schedule'], 'discovery_then_isolated_endpoint')
 
-    def test_batched_polishing_matches_scalar_with_distinct_scan_positions(self):
+    def test_refinement_is_stable_across_tile_budgets_and_scan_positions(self):
         self.s.configure(refine=False, mask=True, mask_radius=.85)
         self.s.set_patterns(np.zeros((1, 4, 96, 96), np.float32))
         cells = [2, 1, 3, 0, 1]
@@ -78,7 +81,7 @@ class ProfileProduction(unittest.TestCase):
         options = dict(primary='stored', max_components=2, min_residual_ncc=.1, blur_gain=True,
                        polish=True, refit_blur_gain_after_polish=True)
         batched = self.s.overlap_cells(cells, **options)
-        self.s.configure(tile_mb=8)  # Below the workspace needed for six 96 × 96 angles.
+        self.s.configure(tile_mb=8)
         scalar = self.s.overlap_cells(cells, **options)
         self.assertTrue(np.any(batched['retained_order'] == 2))
         self.assertTrue(np.any(abs(batched['quaternions'] - batched['source_quaternions']) > 1e-4))
@@ -143,7 +146,7 @@ class ProfileProduction(unittest.TestCase):
 
     def test_screen_rollback_and_proposal_trace(self):
         options = dict(blur_gain=True, polish=True, refit_blur_gain_after_polish=True, min_residual_ncc=1)
-        one=self.s.overlap_cells([1,2],max_components=1,**options)
+        one=self.s.overlap_cells([1,2],max_components=1,blur_gain=True,min_residual_ncc=1)
         screened=self.s.overlap_cells([1,2],max_components=2,**options)
         np.testing.assert_array_equal(screened['sse'],one['sse'])
         np.testing.assert_array_equal(screened['quaternions'][:,0],one['quaternions'][:,0])

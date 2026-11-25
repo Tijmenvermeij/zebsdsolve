@@ -8,6 +8,13 @@ const Prep = @import("prep.zig").Prep;
 pub const Theta = [7]f32;
 pub const identity: Theta = .{ 0, 0, 1, 1, 1, 0, 0 };
 pub const max_evaluations: u32 = 104;
+/// End-of-refinement searches share the shader's nuisance parameter bounds.
+pub fn clampParameter(value: f32, j: usize) f32 {
+    const lower: Theta = .{ 0, -1.38629436, 0.25, 0.6, 0.6, -0.15, -0.15 };
+    const upper: Theta = .{ 5, 1.38629436, 8, 1.4, 1.4, 0.15, 0.15 };
+    return std.math.clamp(value, lower[j], upper[j]);
+}
+
 const P = extern struct {
     n: u32,
     px: u32,
@@ -229,8 +236,24 @@ pub const Model = struct {
     }
 
     fn prepareWarmTheta(self: *Model) void {
+        self.transformWarmTheta(true);
+    }
+
+    fn transformWarmTheta(self: *Model, normalize: bool) void {
         self.run("propose", .{ .seed = 1 }, &.{ self.cells.at(5), self.trial.state.at(6), self.fit.state.at(8), self.fit.progress.at(9) }, false);
-        self.transform(false);
+        self.transformWithArgs(.{}, normalize);
+    }
+
+    /// Apply the same linear detector transfer to the intensity and its three
+    /// orientation derivatives. The detector computes masked centering and
+    /// differentiation of the NCC norm from the transferred columns.
+    pub fn transferJacobian(self: *Model, jacobian: gpu.Buf, theta: Theta) gpu.Buf {
+        std.debug.assert(self.fit.n == 1 and self.contrast);
+        self.g.copy(jacobian, 0, self.raw, 0, @as(u64, 4) * self.fit.px * @sizeOf(f32));
+        self.profileRawChanged(4);
+        self.g.writeSlice(self.cells, 24 * 4, f32, &theta);
+        self.transformWarmTheta(false);
+        return self.trial.bank;
     }
 
     fn fixedWarmTheta(self: *Model) void {

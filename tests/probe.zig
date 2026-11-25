@@ -58,7 +58,6 @@ pub fn main(init: std.process.Init) !void {
     try checkSphericalAllocationGuards(&g);
     try checkOverlapTrajectoryChoice();
     try checkOverlapTrajectoryFinalization();
-    try checkProfilePose(&g);
     try checkProfileRawCache(&g);
     try checkProfileSupersededJointEvidence();
     try checkOverlapStageComparison();
@@ -755,33 +754,6 @@ fn checkOverlapTrajectoryFinalization() !void {
         if (!std.mem.eql(u8, std.mem.asBytes(&ps[row]), std.mem.asBytes(&es)) or !std.mem.eql(f32, &pt[row], &et) or !std.mem.eql(u8, std.mem.asBytes(&pp[row]), std.mem.asBytes(&ep))) return error.TrajectoryFinalizationMixedState;
     }
     std.debug.print("overlap trajectory finalization: forced mixed winners/unavailable, whole payload and cancellation sentinel pass\n", .{});
-}
-
-/// Actual production pose shader readback for a noncommuting sample-to-crystal
-/// seed. Print sufficient f32 precision for independent MTEX verification.
-fn checkProfilePose(g: *gpu.Gpu) !void {
-    const profile = ze.engine.overlap_profile;
-    const seed = [4]f32{ 0.8, 0.4, -0.4, 0.2 };
-    var poses = g.storage(32);
-    defer g.release(&poses);
-    var result: [7][4]f32 = undefined;
-    var deltas: [7][3]f32 = @splat(@splat(0));
-    for (0..7) |i| {
-        if (i > 0) deltas[i][(i - 1) / 2] = std.math.degreesToRadians(@as(f32, if (i % 2 == 1) 0.5 else -0.5));
-        g.writeSlice(poses, 16, f32, &seed);
-        profile.applyPoseOffset(g, poses, deltas[i]);
-        g.read(poses, 16, std.mem.asBytes(&result[i]));
-    }
-    try g.wait();
-    if (!std.mem.eql(f32, &result[0], &seed)) return error.IdentityProfileStepChangedSeed;
-    for (result, deltas, 0..) |q, delta, i| {
-        var norm: f32 = 0;
-        for (q) |v| norm += v * v;
-        if (@abs(norm - 1) > 1e-6 or (i > 0 and std.mem.eql(f32, &q, &seed))) return error.InvalidProfilePose;
-        std.debug.print("PROFILE_POSE,{d},{d:.9},{d:.9},{d:.9},{d:.9},{d:.9},{d:.9},{d:.9},{d:.9},{d:.9},{d:.9},{d:.9}\n", .{
-            i, seed[0], seed[1], seed[2], seed[3], delta[0], delta[1], delta[2], q[0], q[1], q[2], q[3],
-        });
-    }
 }
 
 fn checkProfileRawCache(g: *gpu.Gpu) !void {

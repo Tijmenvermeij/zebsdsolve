@@ -17,6 +17,7 @@ pub const NS = 43;
 /// step that improved the match (radians), and one the host fills (how far the NMI stands
 /// above chance).
 pub const RECORD = 8;
+const REFINE_CONDITIONAL = 2;
 
 /// An item: detector position for the pattern (pixels), the pattern's index, an orientation.
 pub const Pose = extern struct {
@@ -58,6 +59,9 @@ pub const RefineOptions = struct {
     iters: u32 = 8,
     /// largest rotation of one iteration, radians
     max_step: f32 = 0.035,
+    /// largest angular displacement from the seed in conditional refinement, radians
+    /// (zero disables the cap)
+    max_total: f32 = 0,
     /// the scale of the Gauss–Newton curvature a refinement starts with, and its bounds (the
     /// steps adapt it; see refine_step)
     scale0: f32 = 1,
@@ -138,6 +142,14 @@ pub const Detector = struct {
         self.run("project", self.params(m, fr, n), @intCast((n * hw + 255) / 256), &.{ m.buf.at(1), self.poses.at(2), self.sims.at(4) });
     }
 
+    /// Record: the first pose's raw simulation and left crystal-frame derivatives (per
+    /// radian) in contiguous [value, dx, dy, dz] planes in `sims`, including outside the mask.
+    pub fn projectRotationJacobian(self: *Detector, m: MasterGpu, fr: Frame) void {
+        const hw: u64 = @as(u64, fr.pat_h) * fr.pat_w;
+        self.g.ensure(&self.sims, 4 * hw * @sizeOf(f32));
+        self.run("project_rot_jacobian", self.params(m, fr, 1), @intCast((hw + 255) / 256), &.{ self.poses.at(2), self.sims.at(4), m.grad.at(21) });
+    }
+
     /// Record: the NS sums of each item against its pattern in `pats`, into `sums`.
     pub fn sumsOf(self: *Detector, m: MasterGpu, fr: Frame, pats: Buf, n: u32) void {
         var p = self.params(m, fr, n);
@@ -155,31 +167,61 @@ pub const Detector = struct {
         self.run("sums_reduce", p, (n * NS + 63) / 64, &.{ self.part.at(6), self.sums.at(7) });
     }
 
-    /// Orientation refinement's partial sums (detector.wgsl sums_rot) into `part`; returns how
-    /// many each item's are in (refine_rot_step adds them up). An item's chunks are made a
-    /// multiple of the workgroup, so that a workgroup holds one item's and adds them up itself.
-    fn rotSums(self: *Detector, m: MasterGpu, fr: Frame, pats: Buf, n: u32) u32 {
-        var p = self.params(m, fr, n);
-        p.n_chunks = @min(std.mem.alignForward(u32, p.n_chunks, self.wg), 1024);
-        const nq = p.n_chunks / self.wg;
-        self.g.ensure(&self.part, @as(u64, n) * nq * NS * 4);
-        const f = Gpu.flat((n * p.n_chunks + self.wg - 1) / self.wg);
-        p.grid_x = f[0];
-        const pipe_id = self.g.pipelineWith("detector/sums_rot", shaders.sums_wg, self.wg, shaders.detector_body, "sums_rot") catch gpu_mod.NO_PIPE;
-        self.g.dispatch(pipe_id, f[0], f[1], 1, &.{ self.g.uniform(0, std.mem.asBytes(&p)), self.poses.at(2), pats.at(3), self.part.at(5), m.grad.at(21) });
-        return nq;
-    }
-
-    /// Record: refine the n items' orientations against their patterns, score them (NCC and
-    /// NMI), and write one record per item to `records` starting at record `out0`.
-    pub fn refine(self: *Detector, m: MasterGpu, fr: Frame, pats: Buf, n: u32, o: RefineOptions, records: Buf, out0: u32) void {
-        const g = self.g;
+    fn refineParams(self: *const Detector, m: MasterGpu, fr: Frame, n: u32, o: RefineOptions) P {
         var p = self.params(m, fr, n);
         p.mask[3] = o.scale0;
         p.num[1] = o.max_step;
         p.num[2] = o.scale_min;
         p.num[3] = o.scale_max;
         p.n_bins = o.nmi_bins;
+        return p;
+    }
+
+    /// Orientation refinement's partial sums (detector.wgsl) into `part`; returns how
+    /// many each item's are in (refine_rot_step adds them up). An item's chunks are made a
+    /// multiple of the workgroup, so that a workgroup holds one item's and adds them up itself.
+    fn rotSums(self: *Detector, comptime entry: []const u8, p0: P, binds: []const Bind) u32 {
+        var p = p0;
+        p.n_chunks = @min(std.mem.alignForward(u32, p.n_chunks, self.wg), 1024);
+        const nq = p.n_chunks / self.wg;
+        self.g.ensure(&self.part, @as(u64, p.n_items) * nq * NS * 4);
+        const f = Gpu.flat(p.n_items * nq);
+        p.grid_x = f[0];
+        const pipe_id = self.g.pipelineWith("detector/" ++ entry, shaders.sums_wg, self.wg, shaders.detector_body, entry) catch gpu_mod.NO_PIPE;
+        var all: [5]Bind = undefined;
+        all[0] = self.g.uniform(0, std.mem.asBytes(&p));
+        all[1] = self.part.at(5);
+        @memcpy(all[2..][0..binds.len], binds);
+        self.g.dispatch(pipe_id, f[0], f[1], 1, all[0 .. binds.len + 2]);
+        return nq;
+    }
+
+    /// Record: initialize one pose for conditional refinement, retaining the seed for the
+    /// angular cap. The caller supplies a fixed target and the four transformed planes each step.
+    pub fn beginConditionalRefine(self: *Detector, fr: Frame, o: RefineOptions) void {
+        var p = self.refineParams(.{}, fr, 1, o);
+        p.flags = REFINE_CONDITIONAL;
+        self.g.ensure(&self.state, 28 * @sizeOf(f32));
+        self.run("refine_init", p, 1, &.{ self.state.at(9), self.poses.at(10) });
+    }
+
+    /// Record: evaluate the current pose against `target` (one unit-normalized plane), using
+    /// the `transformed` [value, dx, dy, dz] planes after the caller's frozen linear operator
+    /// and before final centering and normalization under the detector mask.
+    /// Keep the best pose so far and propose a new one, or restore the best when `last`.
+    pub fn conditionalRefineStep(self: *Detector, fr: Frame, target: Buf, transformed: Buf, o: RefineOptions, last: bool) void {
+        var p = self.refineParams(.{}, fr, 1, o);
+        p.flags = REFINE_CONDITIONAL | @as(u32, @intFromBool(last));
+        p.t0[3] = o.max_total;
+        p.n_chunks = self.rotSums("sums_conditional_rot", p, &.{ target.at(3), transformed.at(12) });
+        self.run("refine_rot_step", p, 1, &.{ self.part.at(6), self.state.at(9), self.poses.at(10) });
+    }
+
+    /// Record: refine the n items' orientations against their patterns, score them (NCC and
+    /// NMI), and write one record per item to `records` starting at record `out0`.
+    pub fn refine(self: *Detector, m: MasterGpu, fr: Frame, pats: Buf, n: u32, o: RefineOptions, records: Buf, out0: u32) void {
+        const g = self.g;
+        var p = self.refineParams(m, fr, n, o);
         p.out0 = out0;
         g.ensure(&self.state, @as(u64, n) * 24 * 4);
         g.ensure(&self.score, @as(u64, n) * 4);
@@ -187,7 +229,7 @@ pub const Detector = struct {
         var it: u32 = 0;
         while (it <= o.iters) : (it += 1) {
             var ps = p;
-            ps.n_chunks = self.rotSums(m, fr, pats, n);
+            ps.n_chunks = self.rotSums("sums_rot", p, &.{ self.poses.at(2), pats.at(3), m.grad.at(21) });
             ps.flags = if (it == o.iters) 1 else 0;
             // (a workgroup an item: its sums added up, then its step)
             self.run("refine_rot_step", ps, n, &.{ self.part.at(6), self.state.at(9), self.poses.at(10) });

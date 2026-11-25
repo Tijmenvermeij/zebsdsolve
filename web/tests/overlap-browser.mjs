@@ -510,7 +510,7 @@ try {
     require(bw.disabled && bw.valueAsNumber===primaryBandwidth,'relink did not restore primary bandwidth');
     link.checked=false;link.dispatchEvent(new Event('change'));
     require(bw.valueAsNumber===primaryBandwidth+4,'custom bandwidth was not retained');
-    require(fitted.metadata.profile_version===2 && fitted.metadata.orientation_polish===true,'profile provenance not exported');
+    require(fitted.metadata.profile_version===3 && fitted.metadata.orientation_polish===true,'profile provenance not exported');
     require(fitted.metadata.refit_blur_gain_after_polish===false,'disabled endpoint refit must be frozen');
     require(fitted.metadata.oxford_detector_attitude_version===0,'generic camera provenance not exported');
     require(fitted.metadata.residual_screen.enabled && Math.abs(fitted.metadata.min_residual_ncc-threshold)<1e-6,'computational screen not frozen');

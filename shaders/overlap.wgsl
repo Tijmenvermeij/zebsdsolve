@@ -18,7 +18,6 @@ struct Progress {
 @group(0) @binding(4) var<storage, read_write> state: array<State>;
 @group(0) @binding(5) var<storage, read_write> residual: array<f32>;
 @group(0) @binding(6) var<storage, read_write> progress: array<Progress>;
-@group(0) @binding(7) var<storage, read_write> polish_cache: array<f32>;
 // Runtime payload: Tint forbids compile-time nonfinite f32 expressions. All
 // payload values remain quiet NaNs; native/browser missing-value semantics agree.
 fn unavailable() -> f32 { return bitcast<f32>(0x7fc00000u | (p.n & 0x7fu)); }
@@ -601,75 +600,4 @@ fn finish_nuisance(b:u32,k:u32,lane:u32,old:State,polish:bool) {
     out.sse=best_score;out.trial_sse=best_score;out.amplitude=coefficient;
     out.flags=select(0.0,1.0,nuisance_condition<=(1.0-.995)/(1.0+.995));
     state[b]=out;
-}
-
-
-// Use the same contrast bins and reduction tree as fit_nuisance. Only entries
-// independent of the replaced column need to be cached.
-@compute @workgroup_size(64)
-fn polish_moments(@builtin(local_invocation_index) lane:u32) {
-    var bins:array<array<f32,8>,25>;
-    var yy:array<f32,8>;
-    var n_mask=0.0;
-    for(var i=lane;i<p.px;i+=64u){
-        let y=observed[i];let bin=(i/64u)&7u;
-        if(inside(i)){n_mask+=1.0;}
-        yy[bin]+=y*y;
-        var v:array<f32,4>;
-        for(var j=0u;j<p.k;j++){
-            if(j==p.phase){continue;}
-            v[j]=bank[j*p.px+i];
-            bins[16u+j][bin]+=v[j]*y;
-            bins[20u+j][bin]+=v[j];
-        }
-        for(var j=0u;j<p.k;j++){
-            if(j==p.phase){continue;}
-            for(var l=0u;l<p.k;l++){
-                if(l!=p.phase){bins[j*4u+l][bin]+=v[j]*v[l];}
-            }
-        }
-    }
-    for(var j=0u;j<24u;j++){moments[j][lane]=sum_eight(bins[j]);}
-    moments[24][lane]=n_mask;
-    energy[lane]=sum_eight(yy);
-    reduce_moments(lane,25u,true);
-    if(lane==0u){
-        for(var j=0u;j<25u;j++){polish_cache[j]=moments[j][0];}
-        polish_cache[25]=energy[0];
-    }
-}
-
-@compute @workgroup_size(64)
-fn polish_trials(@builtin(workgroup_id) w:vec3<u32>,@builtin(local_invocation_index) lane:u32) {
-    let b=w.y*p.grid_x+w.x;
-    if(b>=p.n){return;}
-    let k=p.k;let column=p.phase;let old=state[b];
-    // Four Gram terms, the replaced RHS, and the replaced column's sum.
-    var bins:array<array<f32,8>,6>;
-    for(var i=lane;i<p.px;i+=64u){
-        let bin=(i/64u)&7u;
-        let v=candidate[b*p.px+i];
-        bins[4][bin]+=v*observed[i];
-        bins[5][bin]+=v;
-        for(var j=0u;j<k;j++){
-            var other=v;
-            if(j!=column){other=bank[j*p.px+i];}
-            bins[j][bin]+=v*other;
-        }
-    }
-    for(var j=0u;j<6u;j++){moments[j][lane]=sum_eight(bins[j]);}
-    reduce_moments(lane,6u,false);
-    if(lane==0u){
-        var changed:array<f32,6>;
-        for(var j=0u;j<6u;j++){changed[j]=moments[j][0];}
-        for(var j=0u;j<25u;j++){moments[j][0]=polish_cache[j];}
-        for(var j=0u;j<k;j++){
-            moments[column*4u+j][0]=changed[j];
-            moments[j*4u+column][0]=changed[j];
-        }
-        moments[16u+column][0]=changed[4];
-        moments[20u+column][0]=changed[5];
-        energy[0]=polish_cache[25];
-    }
-    finish_nuisance(b,k,lane,old,true);
 }

@@ -1174,7 +1174,7 @@ export fn ze_overlap_trajectory_version() u32 {
 /// including source_q (one four-float quaternion per output component) and
 /// events (one 64-byte Event per slot). A failing call publishes zero events.
 export fn ze_overlap_profile_version() u32 {
-    return 2;
+    return 3;
 }
 
 export fn ze_overlap_profile_selection_version() u32 {

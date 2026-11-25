@@ -755,15 +755,18 @@ class Solver:
         follows fit_model, preserving legacy results. No target or residual receives
         another background filter.
 
-        polish=True enables bounded gain-aware orientation/profile refinement at
-        fixed detector geometry. min_residual_ncc optionally screens EACH refined
+        polish=True refines each retained pose by detector Gauss–Newton on
+        the signed experimental pattern minus the other fitted contributions.
+        Geometry, amplitudes and blur/gain stay fixed until all poses have been
+        refined. In multi-component runs, singletons keep their discovered pose.
+        min_residual_ncc optionally screens EACH refined
         residual proposal before fitting; it is separate from display filtering and
         is not a calibrated confidence threshold. Rejected proposals are retained
         in profile_events. Both controls are off by default, preserving V4/V5.
 
-        Blur/gain stays fixed during the angular search. To refit it once on
-        the best moved pose, enable refit_blur_gain_after_polish together with
-        polish and blur_gain.
+        Weights are refitted at the final orientations. To refit shared blur/gain
+        against the isolated component targets, enable refit_blur_gain_after_polish
+        together with polish and blur_gain. The endpoint refit holds poses fixed.
 
         All stages must use the same resolution. Set binning=1 for stored pixels
         or full_resolution='none' for reduced pixels. Residuals stay signed and bypass all nonlinear
@@ -809,7 +812,7 @@ class Solver:
             if not all(hasattr(self._lib, name) for name in ("ze_overlap_cells_v6", "ze_overlap_profile_version", "ze_overlap_profile_trace_capacity")):
                 raise Error("overlap profiling requires native V6 support; load a current library")
             profile_version = int(self._lib.ze_overlap_profile_version())
-            if profile_version not in (1, 2):
+            if profile_version not in (1, 2, 3):
                 raise Error("unsupported overlap profile version")
             if polish and blur_gain and profile_version < 2:
                 raise Error("Polishing with blur/gain requires an updated native library")
@@ -980,12 +983,25 @@ class Solver:
             diagnostics.update(
                 active_count_definition="strictly_positive_compacted_support_size",
                 fitted_count_definition="amplitude_above_1e-6_display_only",
-                profile_optimizer={"version":profile_version,"enabled":bool(polish),"method":"bounded_crystal_frame_axis_poll_variable_projection",
+                profile_optimizer={"version":profile_version,"enabled":bool(polish),
                     "geometry":"fixed","trust_centre":"immutable_native_source_pose","radius_deg":polish_radius_deg,
-                    "singleton_starts_x_radius_factors":[0,.5,-.5],"joint_starts":1,
-                    "angular_step_radius_factors":[.5,.25,.125],"max_sweeps_per_scale":2,
-                    "nuisance_schedule":("disabled" if not blur_gain else
-                        "full_at_entry_and_after_final_pose_change" if refit_blur_gain_after_polish else "full_at_entry"),
+                    **({
+                        "method":"conditional_detector_gauss_newton","scope":"retained_support_after_discovery",
+                        "minimum_retained_components":1 if max_components == 1 else 2,
+                        "target":"original_prepared_minus_other_frozen_contributions",
+                        "angular_iterations":self.settings["refine_iters"],
+                        "max_angular_step_deg":self.settings["refine_step"],
+                        "nuisance_schedule":("disabled" if not blur_gain else
+                            "discovery_then_isolated_endpoint" if refit_blur_gain_after_polish else "discovery_only"),
+                        "publication_weights":"final_joint_nnls",
+                        "event_metrics":"discovery_before_orientation_refinement"
+                    } if profile_version >= 3 else {
+                        "method":"bounded_crystal_frame_axis_poll_variable_projection",
+                        "singleton_starts_x_radius_factors":[0,.5,-.5],"joint_starts":1,
+                        "angular_step_radius_factors":[.5,.25,.125],"max_sweeps_per_scale":2,
+                        "nuisance_schedule":("disabled" if not blur_gain else
+                            "full_at_entry_and_after_final_pose_change" if refit_blur_gain_after_polish else "full_at_entry")
+                    }),
                     "max_replacements_per_attempted_order":2,
                     "best_single_scope":"strongest_achieved_across_eligible_supports_and_both_complete_histories"})
             if blur_gain:
@@ -994,7 +1010,8 @@ class Solver:
                 optimizer["max_evaluations_per_inner_singleton_search"]=optimizer.pop("singleton_max_evaluations")
                 optimizer.update(evaluation_bound_scope="one_inner_search_not_total_profile",
                     best_single="strongest_achieved_singleton_across_candidates_and_complete_histories",
-                    best_single_refinement="same_objective_bounded_pose_and_nuisance_profiles_when_enabled",
+                    best_single_refinement=("discovery_pose_and_nuisance_fit" if profile_version >= 3
+                        else "same_objective_bounded_pose_and_nuisance_profiles_when_enabled"),
                     joint_singleton_seeds={"k1":"separate_coarse_and_polished_theta_tables","k_gt_1":"same_achieved_member_theta_in_both_seed_tables"})
         return diagnostics
 
