@@ -26,6 +26,11 @@ export async function* batchArtifacts(engine, job, completed = new Set()) {
     if (oxford) { const snapshot = engine.exportOxfordSnapshot(); yield { name, data: await exportOxford(snapshot, job.sourceFiles[0], snapshot.oxford_frame) }; }
     else yield { name, data: engine.exportText("ang") };
   }
+  name = prefix + "_overlap.json";
+  if (job.overlap && !completed.has(name)) {
+    if (!job.overlapArtifact) throw new Error("Batch overlap results are unavailable.");
+    yield { name, data:job.overlapArtifact };
+  }
   for (const [kind, suffix] of [["ipf_z", "_IPF-Z.png"], ["ncc", "_NCC.png"]]) {
     name = prefix + suffix;
     if (!completed.has(name)) yield { name, data: await mapPNG(engine, kind) };

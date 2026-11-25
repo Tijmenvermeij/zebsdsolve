@@ -126,7 +126,8 @@ export class BatchDownloads {
       } else if (!entry.complete || !entry.saved || blob.size !== entry.saved.size || blob.lastModified !== entry.saved.lastModified) throw new Error("A staged Downloads result changed: " + entry.name + ".");
       members.push({ name: job.outputStem + "/" + entry.name, blob });
     }
-    if (members.length !== 5) throw new Error("A Downloads archive must contain exactly five job files.");
+    const expectedCount = job.overlap ? 6 : 5;
+    if (members.length !== expectedCount) throw new Error(`A Downloads archive must contain exactly ${expectedCount} job files.`);
     const blob = await this.pack(members);
     const archive = { blob, url: this.createObjectURL(blob), name: job.outputStem + ".zip", size: blob.size,
       members: members.map(member => ({ name: member.name, size: member.blob.size })) };

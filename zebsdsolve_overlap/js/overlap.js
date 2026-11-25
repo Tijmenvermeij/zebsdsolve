@@ -35,10 +35,13 @@ export function profileEventsForExport(events, cells) {
 export function createOverlap({ st, busy, runPrimary, selectTab, redraw, status, log, renderIpfKey, inspectPrimary }) {
   let active = false, run = null, launching = false, inspectSerial = 0, lastRanges = [[0,1],[0,1]], primaryColors=null;
   let ipfKind = "ipf_z", customBandwidth = null;
-  let rightMapCount = null;
+  let rightMapCount = null, pendingRun = null, renderedPreview = null;
   const ordinaryMapTitle = $("map-well").title;
   const filterState = () => ({key:$("overlap-filter-metric").value,operator:"min",cutoff:$("overlap-filter-value").valueAsNumber});
-  const primaryCutoff = () => $("overlap-primary-cutoff").valueAsNumber;
+  const requestedPrimaryCutoff = () => $("overlap-primary-cutoff").valueAsNumber;
+  const screenCutoff = () => $("overlap-screen").checked ? $("overlap-screen-value").valueAsNumber : null;
+  const effectivePrimaryCutoff = (primary, residual) => Math.fround(Math.max(primary, residual ?? -1));
+  const primaryCutoff = () => effectivePrimaryCutoff(requestedPrimaryCutoff(), screenCutoff());
   const residualCutoff = () => $("overlap-residual-cutoff").valueAsNumber;
   const bandwidthInput = $("overlap-bandwidth");
   const linkedBandwidth = () => $("overlap-link-bandwidth").checked;
@@ -99,7 +102,21 @@ export function createOverlap({ st, busy, runPrimary, selectTab, redraw, status,
   const colorContext = () => JSON.stringify([st.settings.ipf_colors,st.settings.ipf_lightness,st.settings.ipf_gray]);
   const clearCanvas = id => { const c = $(id); c.width = c.height = 1; c.getContext("2d").clearRect(0, 0, 1, 1); };
 
+  function showElapsed() {
+    const output = $("overlap-elapsed");
+    const attempt = pendingRun ?? run;
+    output.hidden = !attempt;
+    if (!attempt) return;
+    const seconds = Math.floor(((attempt.finishedAt ?? performance.now()) - attempt.startedAt) / 1000);
+    const units = [Math.floor(seconds / 3600), Math.floor(seconds / 60) % 60, seconds % 60];
+    output.textContent = "Elapsed " + units.map(unit => String(unit).padStart(2,"0")).join(":");
+  }
+
   function sync() {
+    showElapsed();
+    const effective = $("overlap-primary-effective");
+    const floor = screenCutoff();
+    effective.textContent = Number.isFinite(floor) && floor > requestedPrimaryCutoff() ? `Effective ${floor}` : "";
     const ready = !!st.scan && !st.gpuLost && !!st.phaseFiles.some(p=>p.on) && !st.batchRunning;
     $("btn-overlap-run").disabled = !ready || !!st.busy || launching || ($("overlap-primary").value === "stored" && !st.results);
     $("btn-overlap-primary").disabled = !ready || !!st.busy || launching;
@@ -146,8 +163,9 @@ export function createOverlap({ st, busy, runPrimary, selectTab, redraw, status,
       }
     }
     const current = fresh();
-    $("overlap-readout").textContent = !run ? "" : `${current ? run.state : "Context changed"} · ${run.completedCount.toLocaleString()} / ${run.requested.length.toLocaleString()} cells\n${run.fittedCount.toLocaleString()} candidate fits${run.unseededCount ? ` · ${run.unseededCount.toLocaleString()} missing primary` : ""}`;
-    if(current && !primaryMap(1)) {
+    const progressRun = pendingRun ?? run;
+    $("overlap-readout").textContent = !progressRun ? "" : `${pendingRun || current ? progressRun.state : "Context changed"} · ${progressRun.completedCount.toLocaleString()} / ${progressRun.requested.length.toLocaleString()} cells\n${progressRun.fittedCount.toLocaleString()} candidate fits${progressRun.unseededCount ? ` · ${progressRun.unseededCount.toLocaleString()} missing primary` : ""}`;
+    if(current && (!pendingRun || pendingRun === run) && !primaryMap(1)) {
       const source=mapSource(1), cutoff=residualCutoff(),filter=filterState();
       if (rightMapCount?.run !== run || rightMapCount.source !== source || !Object.is(rightMapCount.cutoff, cutoff) ||
           rightMapCount.filter.key !== filter.key || rightMapCount.filter.operator !== filter.operator ||
@@ -172,26 +190,29 @@ export function createOverlap({ st, busy, runPrimary, selectTab, redraw, status,
       const searchOption=select.querySelector('option[value="proposal_ncc"]');
       if(searchOption)searchOption.textContent=primary?"Primary NCC":mapSource(i)==="residual"?"Residual source NCC":"Source NCC";
     }
-    $("overlap-progress").hidden = !st.busy || !run || run.state !== "Running";
-    $("overlap-progress").value = run ? run.completedCount / Math.max(1, run.requested.length) : 0;
+    $("overlap-progress").hidden = !st.busy || !progressRun || progressRun.state !== "Running";
+    $("overlap-progress").value = progressRun ? progressRun.completedCount / Math.max(1, progressRun.requested.length) : 0;
   }
 
-  function newRun(k, requested, keepN, minStageImprovement, bandwidth) {
-    const settings = structuredClone(st.ze.settings);
-    return { k, requested, context: context(), colorContext:colorContext(), state: "Running", completedCount: 0, fittedCount:0, unseededCount:0,
-      completed: new Uint8Array(st.scan.rows * st.scan.cols), arrays: {}, rgba: {}, sourceRgba: {}, profileEvents: {},
-      metadata: {schema:"zebsdsolve-overlap-candidates-v1", model:null, keep_n:keepN, blur_gain:$("overlap-blur-gain").checked, assessment:"unassessed_candidates",
-        primary_ncc_minimum:primaryCutoff(), primary_snapshot:identity(st.results), orientation_polish:$("overlap-polish").checked, refit_blur_gain_after_polish:refitAfterPolish(), min_residual_ncc:$("overlap-screen").checked?$("overlap-screen-value").valueAsNumber:null,
-        requested_min_stage_improvement:structuredClone(minStageImprovement), component_axis:"stable discovery order", stop_reasons:STOP, engine_version:st.ze.version, seed_source_roi:null, scan_name:st.scanName, quaternion_convention:"wxyz, sample to crystal", geometry:structuredClone(st.ze.geometry),
-        residual_bandwidth:settings.method==="spherical" ? bandwidth || settings.bandwidth : null,
-        settings, phases:structuredClone(st.ze.phases), scan:structuredClone(st.scan), primary:"stored",
-        sources:st.sourceFiles.map(f => ({name:f.name,size:f.size,lastModified:f.lastModified})),
-        masters:st.phaseFiles.filter(p => p.on).map(p => ({name:p.file?.name,size:p.file?.size,lastModified:p.file?.lastModified})),
+  function newRun(engine, requested, options, provenance) {
+    const scan = provenance.scan ?? engine.scan;
+    const settings = structuredClone(engine.settings);
+    return { k:options.maxComponents, requested, state:"Running", startedAt:performance.now(), completedCount:0, fittedCount:0, unseededCount:0,
+      completed:new Uint8Array(scan.rows * scan.cols), arrays:{}, rgba:{}, sourceRgba:{}, profileEvents:{},
+      metadata:{schema:"zebsdsolve-overlap-candidates-v1", model:null, keep_n:options.keepN, blur_gain:options.fitBlurGain, assessment:"unassessed_candidates",
+        primary_ncc_minimum:effectivePrimaryCutoff(options.primaryMinimum, options.minResidualNcc), requested_primary_ncc_minimum:options.primaryMinimum,
+        primary_snapshot:provenance.snapshot ?? null, orientation_polish:options.polish, refit_blur_gain_after_polish:options.refitBlurGainAfterPolish,
+        min_residual_ncc:options.minResidualNcc, requested_min_stage_improvement:structuredClone(options.minStageImprovement),
+        component_axis:"stable discovery order", stop_reasons:STOP, engine_version:engine.version, seed_source_roi:null,
+        scan_name:provenance.scanName, quaternion_convention:"wxyz, sample to crystal", geometry:structuredClone(engine.geometry),
+        residual_bandwidth:settings.method==="spherical" ? options.residualBandwidth || settings.bandwidth : null,
+        settings, phases:structuredClone(engine.phases), scan:structuredClone(scan), primary:"stored",
+        sources:provenance.sources, masters:provenance.masters, opening_hints:structuredClone(provenance.openHints ?? null),
       },
     };
   }
 
-  function commit(target, result, cells) {
+  function commit(target, result, cells, colorEngine) {
     const n = cells.length, total = target.completed.length;
     if(result.keep_n !== undefined && result.keep_n !== target.metadata.keep_n)throw Error("Overlap candidate count changed between tiles");
     if(result.blur_gain!==undefined && result.blur_gain!==target.metadata.blur_gain)throw Error("Overlap fit model changed between tiles");
@@ -218,13 +239,13 @@ export function createOverlap({ st, busy, runPrimary, selectTab, redraw, status,
     }
     const colors = {}, sourceColors = {};
     const separateSource = target.metadata.orientation_polish && result.source_quaternions;
-    for (const axis of ["x", "y", "z"]) {
-      colors[axis] = st.ze.orientationColors(result.quaternions, result.phase, axis);
-      if(separateSource)sourceColors[axis]=st.ze.orientationColors(result.source_quaternions,result.phase,axis);
+    if (colorEngine) for (const axis of ["x", "y", "z"]) {
+      colors[axis] = colorEngine.orientationColors(result.quaternions, result.phase, axis);
+      if(separateSource)sourceColors[axis]=colorEngine.orientationColors(result.source_quaternions,result.phase,axis);
     }
     if(seedROI)target.metadata.seed_source_roi=seedROI;
     for (const [field,array] of updates) cells.forEach((cell,i) => field.values.set(array.subarray(i*field.stride,(i+1)*field.stride),cell*field.stride));
-    for (const axis of ["x", "y", "z"]) {
+    if (colorEngine) for (const axis of ["x", "y", "z"]) {
       target.rgba[axis] ||= new Uint8ClampedArray(total * target.k * 4);
       cells.forEach((cell,i) => target.rgba[axis].set(colors[axis].subarray(i*target.k*4,(i+1)*target.k*4),cell*target.k*4));
       if(separateSource) {
@@ -246,59 +267,139 @@ export function createOverlap({ st, busy, runPrimary, selectTab, redraw, status,
     }
   }
 
-  async function start() {
-    if (st.busy || launching || !st.scan || st.gpuLost) return;
+  function readOptions(settings) {
     const keepN=$("overlap-keep-n").valueAsNumber;
     const minResidualNcc=$("overlap-screen").checked?$("overlap-screen-value").valueAsNumber:null;
-    const bandwidth=residualBandwidth();
+    const bandwidth=settings.method === "spherical" && !linkedBandwidth() ? bandwidthInput.valueAsNumber : 0;
     if (!Number.isInteger(bandwidth) || (bandwidth!==0 && (bandwidth<8 || bandwidth>256)) ||
-        (st.settings?.method==="spherical" && !linkedBandwidth() && bandwidth===0)) {
-      status("Residual bandwidth must be an integer from 8 to 256",true);return;
+        (settings.method==="spherical" && !linkedBandwidth() && bandwidth===0)) {
+      throw new Error("Residual bandwidth must be an integer from 8 to 256");
     }
     const stages=stageThresholds();
     const minStageImprovement=stages.some(v=>v!==null)?stages:null;
-    if(stages.some(v=>v!==null&&(!Number.isFinite(v)||v<0||v>1))){status("Minimum ΔSSE must be between 0 and 1",true);return;}
+    if(stages.some(v=>v!==null&&(!Number.isFinite(v)||v<0||v>1))){throw new Error("Minimum ΔSSE must be between 0 and 1");}
     if(minStageImprovement) {
-      if(!$('overlap-screen').checked){status("Enable Screen residual NCC for ΔSSE thresholds",true);return;}
-      if(minStageImprovement.slice(0,+$('overlap-limit').value-1).some(v=>v===null)){status("Fill every ΔSSE threshold through Maximum components",true);return;}
+      if(!$('overlap-screen').checked){throw new Error("Enable Screen residual NCC for ΔSSE thresholds");}
+      if(minStageImprovement.slice(0,+$('overlap-limit').value-1).some(v=>v===null)){throw new Error("Fill every ΔSSE threshold through Maximum components");}
     }
-    if(minResidualNcc!==null&&(!Number.isFinite(minResidualNcc)||minResidualNcc< -1||minResidualNcc>1)){status("Minimum residual NCC must be between −1 and 1",true);return;}
+    if(minResidualNcc!==null&&(!Number.isFinite(minResidualNcc)||minResidualNcc< -1||minResidualNcc>1)){throw new Error("Minimum residual NCC must be between −1 and 1");}
 
-    if(!Number.isInteger(keepN) || keepN<1 || keepN>8){status("Search candidates must be an integer from 1 to 8",true);return;}
+    if(!Number.isInteger(keepN) || keepN<1 || keepN>8){throw new Error("Search candidates must be an integer from 1 to 8");}
+    const primaryMinimum = requestedPrimaryCutoff();
+    if (!Number.isFinite(primaryMinimum) || primaryMinimum < -1 || primaryMinimum > 1) throw new Error("Primary NCC minimum must be between −1 and 1");
+    return {
+      maxComponents: +$("overlap-limit").value, primary:"stored", keepN, fitBlurGain:$("overlap-blur-gain").checked,
+      polish:$("overlap-polish").checked, refitBlurGainAfterPolish:refitAfterPolish(),
+      minResidualNcc, minStageImprovement, residualBandwidth:bandwidth,
+      primaryMinimum, residualMapMinimum:residualCutoff(),
+    };
+  }
+
+  function restoreOptions(options) {
+    $("overlap-limit").value = options.maxComponents;
+    $("overlap-keep-n").value = options.keepN;
+    $("overlap-blur-gain").checked = options.fitBlurGain;
+    $("overlap-polish").checked = options.polish;
+    $("overlap-refit-after-polish").checked = options.refitBlurGainAfterPolish;
+    $("overlap-screen").checked = options.minResidualNcc !== null;
+    if (options.minResidualNcc !== null) $("overlap-screen-value").value = options.minResidualNcc;
+    $("overlap-primary-cutoff").value = options.primaryMinimum;
+    $("overlap-residual-cutoff").value = options.residualMapMinimum;
+    $("overlap-link-bandwidth").checked = options.residualBandwidth === 0;
+    if (options.residualBandwidth) bandwidthInput.value = customBandwidth = options.residualBandwidth;
+    for (let k=2; k<=4; k++) $(`overlap-stage-${k}`).value = options.minStageImprovement?.[k-2] ?? "";
+    sync();
+  }
+
+  function eligibleCells(engine, results, options, scan=engine.scan) {
+    const cutoff = effectivePrimaryCutoff(options.primaryMinimum, options.minResidualNcc);
+    const seeds = engine.storedPrimaryValidity();
+    return roiCells(scan, engine.settings).filter(cell=>acceptsPrimary(results,cell,cutoff,seeds[cell]));
+  }
+
+  async function computeTiles(engine, candidate, options, check, onTile, colors) {
+    const batch = Math.max(1, Math.min(64, engine.settings.batch));
+    const {primaryMinimum, residualMapMinimum, ...fitOptions} = options;
+    for (let first = 0; first < candidate.requested.length; first += batch) {
+      if (!check()) return false;
+      const cells = candidate.requested.slice(first, first + batch);
+      const result = await engine.overlapCells(cells, fitOptions);
+      if (!check()) return false;
+      commit(candidate, result, cells, colors ? engine : null);
+      await onTile(cells);
+      await new Promise(resolve => setTimeout(resolve, 0));
+    }
+    return true;
+  }
+
+  async function runBatchOverlap(engine, job, check, onTile) {
+    const options = job.overlap;
+    const requested = eligibleCells(engine, engine.results(), options);
+    const candidate = newRun(engine, requested, options, {
+      scanName:job.sourceFiles[0].name, sources:job.sources, masters:job.masters, openHints:job.openHints,
+    });
+    await onTile({done:0,total:requested.length});
+    const finished = await computeTiles(engine, candidate, options, check,
+      () => onTile({done:candidate.completedCount,total:requested.length}), false);
+    if (!finished) return null;
+    candidate.state = "Complete";
+    candidate.finishedAt = performance.now();
+    const payload = exportPayload(candidate,true,{component:"primary",
+      primary_ncc_minimum:candidate.metadata.primary_ncc_minimum,residual_ncc_minimum:options.residualMapMinimum,
+      scope:"display_only_all_computed_results_exported"});
+    return new Blob([JSON.stringify(payload)], {type:"application/json"});
+  }
+
+  async function start() {
+    if (st.busy || launching || !st.scan || st.gpuLost) return;
+    const options = readOptions(st.settings);
     launching = true; sync();
     try {
       if ($("overlap-primary").value === "index") {
         const indexed = await runPrimary();
         if (!indexed || st.stop || st.gpuLost) return;
       }
-      const cutoff=primaryCutoff();
-      if(!Number.isFinite(cutoff)||cutoff< -1||cutoff>1){status("Primary NCC minimum must be between −1 and 1",true);return;}
-      const seeds = st.results ? st.ze.storedPrimaryValidity() : [];
-      const requested = roiCells(st.scan, st.settings).filter(cell=>acceptsPrimary(st.results,cell,cutoff,seeds[cell])), k = +$("overlap-limit").value;
+      const requested = eligibleCells(st.ze, st.results, options, st.scan);
       if (!requested.length) { status("No accepted primary cells in overlap region", true); return; }
-      const candidate = newRun(k, requested, keepN, minStageImprovement, bandwidth);
+      const descriptor = f => ({name:f.name,size:f.size,lastModified:f.lastModified});
+      const candidate = newRun(st.ze, requested, options, {
+        scan:st.scan, scanName:st.scanName, openHints:st.sourceOpenHints, sources:st.sourceFiles.map(descriptor),
+        masters:st.phaseFiles.filter(p => p.on).map(p => descriptor(p.file || {})),
+        snapshot:identity(st.results),
+      });
+      candidate.context = context();
+      candidate.colorContext = colorContext();
       await busy("overlap indexing…", async () => {
-        const batch = Math.max(1, Math.min(64, st.settings.batch));
+        pendingRun = candidate;
+        sync();
+        const timer = setInterval(showElapsed, 1000);
         try {
-          for (let first = 0; first < requested.length && !st.stop; first += batch) {
+          const finished = await computeTiles(st.ze, candidate, options, () => {
+            if (st.stop) return false;
             if (context() !== candidate.context) throw Error("Overlap context changed; completed tiles retained");
-            const cells = requested.slice(first, first + batch);
-            const result = await st.ze.overlapCells(cells, {maxComponents:k, primary:"stored",keepN,fitBlurGain:$("overlap-blur-gain").checked,polish:$("overlap-polish").checked,refitBlurGainAfterPolish:refitAfterPolish(),minResidualNcc,minStageImprovement,residualBandwidth:bandwidth});
-            if (st.stop) { candidate.state = "Stopped"; break; }
-            if (context() !== candidate.context) throw Error("Overlap context changed; tile not committed");
-            commit(candidate, result, cells);
+            return true;
+          }, cells => {
             run = candidate;
             sync(); redraw();
-            await new Promise(resolve => setTimeout(resolve, 0));
-          }
-          candidate.state = st.stop ? "Stopped" : "Complete";
+            if (active && cells.includes(st.cell)) void showCell(st.cell);
+          }, true);
+          candidate.state = finished ? "Complete" : "Stopped";
         } catch (error) {
           candidate.state = /Cancelled/.test(error.message) ? "Stopped" : "Interrupted";
           if (candidate.completedCount) run = candidate;
           throw error;
-        } finally { sync(); redraw(); }
+        } finally {
+          clearInterval(timer);
+          candidate.finishedAt = performance.now();
+          pendingRun = null;
+          run ??= candidate;
+          sync(); redraw();
+        }
       });
-    } finally { launching = false; sync(); }
+    } finally {
+      launching = false; sync();
+      if (active && st.cell >= 0 && !st.busy) void showCell(st.cell);
+    }
   }
 
   function drawMap(canvas,i=0) {
@@ -425,15 +526,7 @@ export function createOverlap({ st, busy, runPrimary, selectTab, redraw, status,
     const serial = ++inspectSerial;++st.showRun;
     $("pat-cell").textContent = st.scan ? `row ${Math.floor(cell/st.scan.cols)}, col ${cell%st.scan.cols}` : "pattern";
     const table = $("overlap-components"); table.replaceChildren();
-    for (const id of ["overlap-target", "overlap-simulation", "overlap-residual", "overlap-gain"]) clearCanvas(id);
     $("overlap-facts").replaceChildren();
-    $("overlap-gain").hidden=true;
-    delete $("overlap-gain").dataset.theta;
-    delete $("overlap-gain").dataset.range;
-    $("overlap-gain-empty").hidden=false;
-    $("overlap-gain-empty").textContent="Unavailable";
-    $("overlap-gain-panel").title="";
-    $("overlap-gain-range").textContent="";
     const fallback=async()=>{
       if(serial!==inspectSerial)return;
       const seed=primarySeed(cell);
@@ -460,23 +553,38 @@ export function createOverlap({ st, busy, runPrimary, selectTab, redraw, status,
       $("overlap-facts").replaceChildren(...displayFacts);
       const [h,w]=st.ze.shape();
       drawGain(cell,w,h,true);
+      renderedPreview = key;
     };
     const inspector=$("overlap-component");
     const fitCurrent=run?.completed[cell] && fresh();
     const hasFit=j=>fitCurrent && acceptsFitComponent(run,cell,j);
     for (const option of inspector.options) option.disabled=option.value!=="primary" && !hasFit(+option.value-1);
-    if (selected()>=0 && !hasFit(selected())) {
+    if (selected()>=0 && !hasFit(selected()) && !(st.busy && !fitCurrent)) {
       const residual=fitCurrent?mapComponent("residual",cell):-1;
       const retained=Array.from(inspector.options).find(option=>option.value!=="primary" && !option.disabled);
       inspector.value=hasFit(residual)?String(residual+1):retained?.value ?? "primary";
     }
-    $("pats").hidden=true;$("overlap-pats").hidden=false;$("overlap-pattern-control").hidden=selected()<0;
-    if(selected()<0) { if(!st.busy && !st.gpuLost)await fallback();return; }
-    if (!run?.completed[cell] || !fresh() || st.busy || st.gpuLost) {
-      $("overlap-point-status").textContent = !run?.completed[cell] ? "Uncomputed" : !fresh() ? "Context changed" : st.gpuLost ? "GPU unavailable" : "Running";
-      if(primaryVisible(cell))await fallback();return;
+    const component = selected();
+    const key = JSON.stringify([context(), cell, component, $("overlap-inspection").value,
+      identity(fitCurrent ? run : null)]);
+    if (!st.busy || renderedPreview !== key) {
+      renderedPreview = null;
+      for (const id of ["overlap-target", "overlap-simulation", "overlap-residual", "overlap-gain"]) clearCanvas(id);
+      $("overlap-gain").hidden = true;
+      delete $("overlap-gain").dataset.theta;
+      delete $("overlap-gain").dataset.range;
+      $("overlap-gain-empty").hidden = false;
+      $("overlap-gain-empty").textContent = "Unavailable";
+      $("overlap-gain-panel").title = "";
+      $("overlap-gain-range").textContent = "";
     }
-    const k = run.k, component = selected(), get = key => run.arrays[key]?.values;
+    $("pats").hidden=true;$("overlap-pats").hidden=false;$("overlap-pattern-control").hidden=selected()<0;
+    if(component<0 && !st.busy) { if(!st.gpuLost)await fallback();return; }
+    if (!fitCurrent) {
+      $("overlap-point-status").textContent = pendingRun ? "Awaiting fit" : run?.completed[cell] ? "Context changed" : "Uncomputed";
+      if(!st.busy && !st.gpuLost && primaryVisible(cell))await fallback();return;
+    }
+    const k = run.k, get = key => run.arrays[key]?.values;
     for (let j=0; j<k; j++) {
       const slot=cell*k+j, phase=get("phase")?.[slot], row=document.createElement("tr"), button=document.createElement("button");
       button.type="button"; button.textContent=String(j+1); button.setAttribute("aria-pressed",String(j===component));
@@ -491,7 +599,7 @@ export function createOverlap({ st, busy, runPrimary, selectTab, redraw, status,
     }
 
     const stop=get("stop_reason")?.[cell];
-    const residualInMixture=get("winner_rank")?.[cell*k+component]>0 && get("active_count")?.[cell]>=2;
+    const residualInMixture=component>=0 && get("winner_rank")?.[cell*k+component]>0 && get("active_count")?.[cell]>=2;
     $("overlap-point-status").textContent=stageStop(cell) ?? ((STOP[stop] || "Candidate fit")+(residualInMixture && !visible(cell)?" · Hidden by residual map filters":""));
     for (const [label,key] of [["Mixture NCC","mixture_ncc"],["Residual SSE","sse"],["Incremental ΔSSE","incremental_improvement"],["ΔSSE over single","improvement_over_best_single"],["Condition ratio","relative_gram_condition"],["Active fits","active_count"]]) {
       const dt=document.createElement("dt"),dd=document.createElement("dd");dt.textContent=label;dd.textContent=key==="active_count"?String(get(key)?.[cell]??"—"):value(get(key)?.[cell]);dt.title=dd.title=key==="active_count"?mapDescription("count",selected(),run):METRICS[key]?.description||MAPS.count.description;$("overlap-facts").append(dt,dd);
@@ -502,7 +610,7 @@ export function createOverlap({ st, busy, runPrimary, selectTab, redraw, status,
         const dt=document.createElement("dt"),dd=document.createElement("dd");dt.textContent=label;dd.textContent=value(v);dt.title=dd.title=description;$("overlap-facts").append(dt,dd);
       }
     }
-    if(!(get("retained_order")?.[cell]>0))return;
+    if(!(get("retained_order")?.[cell]>0) || st.busy || st.gpuLost)return;
     try {
       const {blur_gain, blur_gain_optimizer, model, fit_model, gain_domain} = run.metadata;
       const result = {cells:Uint32Array.of(cell), max_components:k, blur_gain, blur_gain_optimizer, model, fit_model, gain_domain};
@@ -529,14 +637,23 @@ export function createOverlap({ st, busy, runPrimary, selectTab, redraw, status,
       $("overlap-target-caption").textContent=individual?"Conditional target":"Measured";
       $("overlap-simulation-caption").textContent=individual?"Fitted contribution":"Reconstruction";
       $("overlap-residual").closest("figure").querySelector("figcaption").textContent="Signed residual";
+      renderedPreview = key;
     } catch(error) { if(serial===inspectSerial){status(error.message,true);log(error.message,true);} }
+  }
+
+  function exportPayload(target, contextCurrent, viewFilter) {
+    const cells=Array.from(target.requested.subarray(0,target.completedCount));
+    const arrays=Object.fromEntries(Object.entries(target.arrays).map(([key,field])=>[key,{stride:field.stride,values:cells.flatMap(cell=>Array.from(field.values.subarray(cell*field.stride,(cell+1)*field.stride)))}]));
+    return {schema:target.metadata.schema,model:target.metadata.model,assessment:target.metadata.assessment,metadata:target.metadata,state:target.state,
+      elapsed_ms:(target.finishedAt ?? performance.now())-target.startedAt,context_current:contextCurrent,max_components:target.k,view_filter:viewFilter,
+      requested_cells:Array.from(target.requested),cells,arrays,profile_event_index_scope:"exported_cells_row; original request row in tile_cell_index",
+      profile_events:profileEventsForExport(Object.values(target.profileEvents).flat(),cells)};
   }
 
   function exportRun() {
     if (!run?.completedCount) return;
-    const cells=Array.from(run.completed.keys()).filter(cell=>run.completed[cell]);
-    const arrays=Object.fromEntries(Object.entries(run.arrays).map(([key,field])=>[key,{stride:field.stride,values:cells.flatMap(cell=>Array.from(field.values.subarray(cell*field.stride,(cell+1)*field.stride)))}]));
-    const payload={schema:run.metadata.schema,model:run.metadata.model,assessment:run.metadata.assessment,metadata:run.metadata,state:run.state,context_current:fresh(),max_components:run.k,view_filter:{...filterState(),component:selected()<0?"primary":selected()+1,primary_ncc_minimum:primaryCutoff(),residual_ncc_minimum:residualCutoff(),scope:"display_only_all_computed_results_exported"},requested_cells:Array.from(run.requested),cells,arrays,profile_event_index_scope:"exported_cells_row; original request row in tile_cell_index",profile_events:profileEventsForExport(Object.values(run.profileEvents).flat(),cells)};
+    const payload=exportPayload(run,fresh(),{...filterState(),component:selected()<0?"primary":selected()+1,primary_ncc_minimum:primaryCutoff(),
+      residual_ncc_minimum:residualCutoff(),scope:"display_only_all_computed_results_exported"});
     download(run.metadata.scan_name.replace(/\.[^.]+$/,"")+"_overlap.json",JSON.stringify(payload),"application/json");
   }
 
@@ -575,7 +692,7 @@ export function createOverlap({ st, busy, runPrimary, selectTab, redraw, status,
     updateView();
   });
   $("overlap-inspection").addEventListener("change",()=>showCell(st.cell));
-  return {get active(){return active;},get result(){return run;},sync,drawMap,drawLegend,showCell,
+  return {readOptions, restoreOptions, runBatchOverlap, get active(){return active;},get result(){return run;},sync,drawMap,drawLegend,showCell,
     inspectMap(i,cell){
       const source=mapSource(i);
       const component=source==="residual" && fresh()?mapComponent(source,cell):-1;
