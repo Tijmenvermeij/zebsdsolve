@@ -150,7 +150,8 @@ fn snapshotImpl(e: *engine.Engine, requested: ?rot.Quat, is_oxford: bool) ![]u8 
     try w.writeAll(",\"phases\":[");
     for (e.phases.items, 0..) |p, i| {
         if (i != 0) try w.writeByte(',');
-        try value(w, .{ .name = p.master.name, .space_group = p.master.space_group, .laue = @intFromEnum(p.master.exportLaue()), .lattice = p.master.lattice.?, .master_source = p.master.source, .master_source_format_version = p.master.source_format_version, .master_crystal_convention = p.master.crystal_frame.label() });
+        const laue = p.master.exportLaue();
+        try value(w, .{ .name = p.master.name, .space_group = p.master.space_group, .laue = @intFromEnum(laue), .laue_symbol = laue.name(), .lattice = p.master.lattice.?, .master_source = p.master.source, .master_source_format_version = p.master.source_format_version, .master_crystal_convention = p.master.crystal_frame.label() });
     }
     try w.writeAll("],\"results\":{\"quaternions\":[");
     const n = e.res.phase.len;

@@ -11,6 +11,8 @@ notes.
 - Planned pattern-centre fit points are red in the Geometry tab.
 - The browser build includes upstream's two-batch indexing pipeline. The fork's
   calibrated Oxford H5OINA and EMSphInx HDF5 exports remain available in Batch.
+- Oxford H5OINA exports report the new hit rate and success flags, and retain
+  the acquisition pattern centres outside the indexed area.
 
 ## 0.2.6 — 2026-11-25
 

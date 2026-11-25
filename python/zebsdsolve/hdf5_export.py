@@ -438,10 +438,15 @@ def write_oxford(path, reference, s, engine_to_cs1, frame_provenance, phase_id_m
                 _string(g, 'Phase Name', phase['name'])
                 _string(g, 'Reference', 'zebsdsolve master pattern: '+phase['name'])
                 g.create_dataset('Space Group', data=[phase['space_group']])
-                g.create_dataset('Laue Group', data=[phase['laue']])
+                laue = g.create_dataset('Laue Group', data=[phase['laue']])
+                if phase.get('laue_symbol'):
+                    laue.attrs['Symbol'] = phase['laue_symbol']
                 g.create_dataset('Lattice Dimensions', data=[phase['lattice'][:3]]).attrs['Unit'] = 'angstrom'
                 g.create_dataset('Lattice Angles', data=[np.deg2rad(phase['lattice'][3:])]).attrs['Unit'] = 'rad'
             r = s['results']; valid = np.asarray(r['phase']) >= 0
+            hit_rate = header.get('Hit Rate')
+            if isinstance(hit_rate, h5py.Dataset) and hit_rate.size == 1 and hit_rate.dtype.kind == 'f':
+                hit_rate[...] = 100 * valid.mean()
             root.create_dataset('IndexedMask', data=valid.astype('u1'))
             root.create_dataset('ReplacedMask', data=np.ones(len(valid), dtype='u1'))
             root.create_dataset('PhaseIDMap', data=np.asarray(mapping, dtype='u4'))
@@ -451,20 +456,23 @@ def write_oxford(path, reference, s, engine_to_cs1, frame_provenance, phase_id_m
                 if key not in data: continue
                 values = data[key][()]
                 if values.shape[0] != len(valid): raise ValueError('Oxford indexing layout differs from indexed pixels: '+key)
-                values[...] = np.nan if values.dtype.kind == 'f' and key not in ('Euler', 'Phase') else 0
+                values[...] = np.nan if values.dtype.kind == 'f' and key not in ('Euler', 'Phase', 'Error') else 0
                 if key == 'Euler': values[valid] = np.asarray(r['euler']).reshape(-1, 3)[valid]
                 elif key == 'Phase': values[valid] = np.asarray(mapping)[np.asarray(r['phase'], dtype=int)[valid]]
+                elif key == 'Error':
+                    if values.size != len(valid): raise ValueError('Oxford Error layout differs from indexed pixels')
+                    values[valid] = 1  # Oxford Error codes: 1 Success, 0 NotAnalyzed
                 data[key][...] = values
             if not s.get('oxford_frame', {}).get('preserve_source_pattern_centres', False):
                 pc = np.asarray(s['pattern_centres']).reshape(-1, 3)
                 ratio = s['scan']['pat_h']/s['scan']['pat_w']
                 for key, values in [('Pattern Center X', pc[:, 0]), ('Pattern Center Y', (1-pc[:, 1])*ratio), ('Detector Distance', pc[:, 2]*ratio)]:
-                    out = np.full(len(valid), np.nan)
-                    out[valid] = values[valid]
                     if key in data:
                         if data[key].shape != valid.shape: raise ValueError('Oxford calibration layout differs from indexed pixels')
-                        data[key][...] = out
-                    else: data.create_dataset(key, data=out).attrs['Unit'] = 'fraction'
+                        original_pc = data[key][()]
+                        original_pc[valid] = values[valid]
+                        data[key][...] = original_pc
+                    else: data.create_dataset(key, data=np.where(valid, values, np.nan)).attrs['Unit'] = 'fraction'
             for key in ('ncc', 'nmi', 'z', 'sweep'):
                 root.create_dataset(key.upper(), data=np.where(valid, r[key], np.nan))
         os.replace(temporary, path)

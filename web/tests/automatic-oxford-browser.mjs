@@ -109,6 +109,10 @@ try {
       require(close(saved,expected,1e-6),'Oxford Euler serialization changed orientation');
       const phaseMap = output.get('zebsdsolve/PhaseIDMap').value;
       require(data.get('Phase').value[cell]===phaseMap[0],'Oxford phase mapping differs from native selected phase');
+      const flags = data.get('Error').value;
+      require(flags[cell] === 1 && flags[0] === 0, 'Oxford success status does not match the ROI');
+      require(Math.abs(header.get('Hit Rate').value[0] - 100 / flags.length) < 1e-8, 'Oxford hit rate is stale');
+      require(data.get('Pattern Center X').value[0] === 0.480416476726532, 'Oxford source PC outside the ROI was changed');
       for (const name of ['Processed Patterns','Unprocessed Patterns','Raw Patterns']) require(!data.get(name),'Diffraction patterns must be omitted');
       const backup = output.get('zebsdsolve/OriginalCalibration');
       require(backup?.get('Detector Orientation Euler') && backup?.get('Tilt Angle'),'Original calibration backup missing');

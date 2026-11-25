@@ -95,6 +95,8 @@ class Exports(unittest.TestCase):
             d.create_dataset('Y',data=np.repeat(np.arange(2)*.25,3)).attrs['Unit']='um'
             d.create_dataset('Euler',data=np.zeros((6,3),dtype='f4')).attrs['Unit']='rad'
             d.create_dataset('Phase',data=np.full(6,1,dtype='u1'))
+            d.create_dataset('Error',data=np.full(6,1,dtype='u1'))
+            h.create_dataset('Hit Rate',data=np.array([100],dtype='f4'))
             d.create_dataset('Mean Angular Deviation',data=np.ones(6,dtype='f4')).attrs['Unit']='rad'
             d.create_dataset('Bands',data=np.full(6,8,dtype='u1'))
             d.create_dataset('Processed Patterns',data=np.arange(6*32*40,dtype='u1').reshape(6,32,40))
@@ -333,6 +335,9 @@ class Exports(unittest.TestCase):
             self.assertTrue(np.isnan(f['1/EBSD/Data/Mean Angular Deviation'][()][valid]).all())
             pc=np.asarray(self.snapshot['pattern_centres']).reshape(6,3)
             self.assertTrue(np.allclose(f['1/EBSD/Data/Pattern Center X'][()][valid],pc[valid,0]))
+            np.testing.assert_allclose(f['1/EBSD/Data/Pattern Center X'][()][~valid], .4)
+            np.testing.assert_array_equal(f['1/EBSD/Data/Error'][()], valid.astype('u1'))
+            self.assertAlmostEqual(float(f['1/EBSD/Header/Hit Rate'][0]), 100 * valid.mean(), places=4)
 
     def test_computed_solutions_survive_missing_quality_and_unaccepted_sweep(self):
         s = deepcopy(self.snapshot)
