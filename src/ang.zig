@@ -229,6 +229,8 @@ pub fn load(gpa: Allocator, file: *File, expected_count: u64, up_steps: ?[2]f64,
     var xcol: usize = 3;
     var ycol: usize = 4;
     var iqcol: usize = 5;
+    var euler_cols = [3]usize{ 0, 1, 2 };
+    var phase_col: usize = 7;
     var names_seen = false;
     var units: ?[]u8 = null;
     defer if (units) |v| gpa.free(v);
@@ -289,10 +291,23 @@ pub fn load(gpa: Allocator, file: *File, expected_count: u64, up_steps: ?[2]f64,
                 xcol = std.math.maxInt(usize);
                 ycol = xcol;
                 iqcol = xcol;
+                euler_cols = @splat(xcol);
+                phase_col = xcol;
                 var names = Columns.init(value);
                 var k: usize = 0;
                 while (names.next()) |name| : (k += 1) {
-                    const out = if (eq(name, "x")) &xcol else if (eq(name, "y")) &ycol else if (eq(name, "IQ") or eq(name, "ImageQuality") or eq(name, "Image Quality") or eq(name, "image_quality")) &iqcol else continue;
+                    const out = if (eq(name, "x")) &xcol else if (eq(name, "y")) &ycol else if (eq(name, "IQ") or eq(name, "ImageQuality") or eq(name, "Image Quality") or eq(name, "image_quality"))
+                        &iqcol
+                    else if (eq(name, "Phi1"))
+                        &euler_cols[0]
+                    else if (eq(name, "Phi"))
+                        &euler_cols[1]
+                    else if (eq(name, "Phi2"))
+                        &euler_cols[2]
+                    else if (eq(name, "Phase") or eq(name, "Phase index") or eq(name, "Phase ID"))
+                        &phase_col
+                    else
+                        continue;
                     if (out.* != std.math.maxInt(usize)) return error.DuplicateANGColumns;
                     out.* = k;
                 }
@@ -340,10 +355,15 @@ pub fn load(gpa: Allocator, file: *File, expected_count: u64, up_steps: ?[2]f64,
             if (k == xcol or k == ycol or k == iqcol) {
                 const n = std.fmt.parseFloat(f64, v) catch return error.InvalidANGRecord;
                 if (k == xcol) x = n else if (k == ycol) y = n else quality = n;
-            } else if (k < 3) {
-                angles[k] = std.fmt.parseFloat(f64, v) catch std.math.nan(f64);
-            } else if (k == 7) {
-                label = std.fmt.parseInt(i32, v, 10) catch -1;
+            } else if (k == phase_col) {
+                const phase_value = std.fmt.parseFloat(f64, v) catch -1;
+                if (phase_value >= 0 and phase_value <= std.math.maxInt(i32) and @trunc(phase_value) == phase_value) {
+                    label = @intFromFloat(phase_value);
+                }
+            } else {
+                for (euler_cols, 0..) |col, i| {
+                    if (k == col) angles[i] = std.fmt.parseFloat(f64, v) catch std.math.nan(f64);
+                }
             }
         }
         if (k < 8 or k <= @max(xcol, @max(ycol, iqcol))) return error.InvalidANGRecord;

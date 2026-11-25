@@ -453,6 +453,7 @@ pub const ExportContext = struct {
     geometry: Geometry,
     calibration: @import("oxford.zig").Calibration,
     phase_generation: u64,
+    scan_signs: [2]i32,
 };
 
 pub fn sameExportContext(a: ExportContext, b: ExportContext) bool {
@@ -464,7 +465,7 @@ pub fn sameExportContext(a: ExportContext, b: ExportContext) bool {
     }
     x.ipf_colors = .classic;
     y.ipf_colors = .classic;
-    return std.meta.eql(x, y) and std.meta.eql(a.geometry, b.geometry) and @import("oxford.zig").Calibration.eql(a.calibration, b.calibration) and a.phase_generation == b.phase_generation;
+    return std.meta.eql(x, y) and std.meta.eql(a.geometry, b.geometry) and @import("oxford.zig").Calibration.eql(a.calibration, b.calibration) and a.phase_generation == b.phase_generation and std.meta.eql(a.scan_signs, b.scan_signs);
 }
 
 pub const Results = struct {
@@ -967,15 +968,18 @@ pub const Engine = struct {
         if (ok) {
             // the engine's own change from the middle cell to the next column and the next row,
             // the beam as the signs say
-            const R = self.geo.rotation();
+            // Infer the acquisition's turn before applying the caller's requested scan signs.
+            const defaults: Settings = .{};
+            const signs = [2]i32{ defaults.scan_x_sign, defaults.scan_y_sign };
+            const R = self.calibration.rotation(&self.geo);
             const sz = self.sizeOf(.full) catch {
                 self.scan_turn = said;
                 return;
             };
-            const mid = @as(u64, si.rows / 2) * si.cols + si.cols / 2;
+            const mid = @as(u64, (si.rows - 1) / 2) * si.cols + (si.cols - 1) / 2;
             const at = [3]u64{ mid, mid + 1, mid + si.cols };
             var pc: [3]rot.Vec3 = undefined;
-            for (at, &pc) |c, *p| p.* = Geometry.pcOf(R, self.placeOf(&self.geo, c, .full) catch {
+            for (at, &pc) |c, *p| p.* = Geometry.pcOf(R, self.placeWithSigns(&self.geo, c, .full, signs) catch {
                 self.scan_turn = said;
                 return;
             }, sz[0], sz[1]);
@@ -1001,6 +1005,10 @@ pub const Engine = struct {
     pub fn scanSigns(self: *const Engine) [2]i32 {
         if (self.calibration.status() == .supported) return self.calibration.scanSigns(self.set.scan_x_sign, self.set.scan_y_sign);
         return .{ self.set.scan_x_sign * self.scan_turn, self.set.scan_y_sign * self.scan_turn };
+    }
+
+    pub fn exportContext(self: *const Engine) ExportContext {
+        return .{ .settings = self.set, .geometry = self.geo, .calibration = self.calibration, .phase_generation = self.phase_generation, .scan_signs = self.scanSigns() };
     }
 
     /// Take patterns from memory: rows · cols patterns of h × w pixels, row-major, copied.
@@ -1712,11 +1720,14 @@ pub const Engine = struct {
 
     /// The detector's position for a cell under `geo`, in a level's pixels.
     pub fn placeOf(self: *const Engine, geo: *const Geometry, cell: u64, lv: Level) !rot.Vec3 {
+        return self.placeWithSigns(geo, cell, lv, self.scanSigns());
+    }
+
+    fn placeWithSigns(self: *const Engine, geo: *const Geometry, cell: u64, lv: Level, signs: [2]i32) !rot.Vec3 {
         const i = try self.info();
         const sz = try self.sizeOf(lv);
         const row: f64 = @floatFromInt(cell / i.cols);
         const col: f64 = @floatFromInt(cell % i.cols);
-        const signs = self.scanSigns();
         return geo.positionForRotation(self.calibration.rotation(geo), row, col, 0.5 * @as(f64, @floatFromInt(i.rows - 1)), 0.5 * @as(f64, @floatFromInt(i.cols - 1)), signs[0], signs[1], self.binOf(lv), sz[0], sz[1]);
     }
 
@@ -2450,7 +2461,7 @@ pub const Engine = struct {
             outside = true;
             break;
         };
-        const context: ExportContext = .{ .settings = self.set, .geometry = self.geo, .calibration = self.calibration, .phase_generation = self.phase_generation };
+        const context: ExportContext = self.exportContext();
         if (!outside) {
             self.res.context_consistent = true;
         } else if (self.res.context) |old| {
@@ -2566,7 +2577,7 @@ pub const Engine = struct {
         const left = self.index_cells.len - self.index_done;
         if (left == 0 or self.cancel) return 0;
         if (self.res.context) |context| {
-            if (!sameExportContext(context, .{ .settings = self.set, .geometry = self.geo, .calibration = self.calibration, .phase_generation = self.phase_generation })) self.res.context_consistent = false;
+            if (!sameExportContext(context, self.exportContext())) self.res.context_consistent = false;
         }
         // A few batches a call, about 4096 patterns, two at a time in flight (indexBatches); a
         // call ends with nothing in flight, so whatever comes between calls finds the device
@@ -2928,6 +2939,7 @@ pub const Engine = struct {
         @memset(data, 0);
         // an empty scan of the shape first: a cell's place in it is part of its geometry
         const calibration = self.calibration;
+        const scan_turn = self.scan_turn;
         var geometry = self.geo;
         try self.setPatterns(std.mem.sliceAsBytes(data), .f32, s.toy_rows, s.toy_cols, s.toy_height, s.toy_width);
         // A generic scan without a known pixel size takes the default for this new
@@ -2936,6 +2948,7 @@ pub const Engine = struct {
         if (calibration.metadata == null and !(geometry.px_um > 0)) geometry.px_um = self.geo.px_um;
         geometry.adoptPlaneReference(s.toy_rows, s.toy_cols);
         self.calibration = calibration;
+        self.scan_turn = scan_turn;
         self.geo = geometry;
 
         // the microstructure
@@ -3044,6 +3057,7 @@ pub const Engine = struct {
         }
         try self.setPatterns(std.mem.sliceAsBytes(data), .f32, s.toy_rows, s.toy_cols, s.toy_height, s.toy_width);
         self.calibration = calibration;
+        self.scan_turn = scan_turn;
         self.geo = geometry;
         self.events.log("toy scan: {d} × {d} patterns of {d} × {d}, {d} grains of {d} phase(s), {d} blank cells, contrast {d:.2}, {d:.4} electrons a pixel, seed {d}", .{ s.toy_rows, s.toy_cols, s.toy_height, s.toy_width, grains.len, n_ph, n - crystals, s.toy_contrast, s.toy_counts, s.toy_seed });
     }

@@ -261,6 +261,7 @@ class Solver:
         i32p = ctypes.POINTER(ctypes.c_int32)
         self._check(self._lib.ze_synthesize(self._e, _ptr(q, _n.f32p), ph.ctypes.data_as(i32p), gr.ctypes.data_as(i32p), n), "synthesize")
         self._source_path = None
+        self._opened = []
         return {"quaternions": q.reshape(rows, cols, 4), "phase": ph.reshape(rows, cols), "grain": gr.reshape(rows, cols), "geometry": self.geometry}
 
     def set_patterns(self, patterns):
@@ -281,6 +282,7 @@ class Solver:
         rows, cols, h, w = a.shape
         self._check(self._lib.ze_set_patterns(self._e, a.ctypes.data, a.nbytes, pixel, rows, cols, h, w), "set_patterns")
         self._source_path = None
+        self._opened = []
         return self
 
     @property
@@ -916,6 +918,10 @@ class Solver:
         engine_to_cs1 overrides require frame_provenance.
         HDF5 exports require the optional h5py dependency.
         """
+        target = os.path.abspath(path)
+        if os.path.exists(target) and any(os.path.exists(source) and os.path.samefile(target, source)
+                                         for source in getattr(self, "_opened", [])):
+            raise Error("export would replace an open source file")
         suffix = str(path).rsplit(".", 1)[-1].lower()
         if suffix in ("h5", "hdf5"):
             from .hdf5_export import write_emsphinx

@@ -8,6 +8,7 @@ sense, the crystal's axes on the lattice; and each a small misorientation from t
 a maker whose geometry differs would have them. Opened, indexed and asked, the engine names each
 convention and measures each misorientation, which no export applies.
 """
+import ctypes
 import os
 from pathlib import Path
 import sys
@@ -25,6 +26,15 @@ from zebsdsolve import Solver  # noqa: E402
 DATA = Path(os.environ.get("ZEBSDSOLVE_TESTDATA", ROOT / "testdata"))
 NI = DATA / "nickel" / "Ni_master_20kV.npz"
 GAN = DATA / "gan" / "GaN_master_20kV.npz"
+
+
+def native_oxford_export(solver, path):
+    """Exercise the upstream native writer on its fallback-calibration fixture."""
+    write = solver._lib.ze_export_h5oina
+    size = solver._check(write(solver._e, None, 0), "export")
+    buf = ctypes.create_string_buffer(size)
+    solver._check(write(solver._e, buf, size), "export")
+    path.write_bytes(buf.raw)
 
 
 def passive(q):
@@ -251,9 +261,11 @@ class StoredOrientations(unittest.TestCase):
             s.add_phase(GAN)
             s.set_geometry(**self.geometry)
             s.index()
-            with self.assertRaises(Exception):
+            original = src.read_bytes()
+            with self.assertRaisesRegex(Exception, "replace an open source file"):
                 s.export(src)
-            s.export(out)
+            self.assertEqual(src.read_bytes(), original)
+            native_oxford_export(s, out)
             r = s.results()
             q = r["quaternions"].reshape(-1, 4).astype(np.float64)
             ph = r["phase"].reshape(-1)
@@ -322,7 +334,7 @@ class StoredOrientations(unittest.TestCase):
             s.set_geometry(**self.geometry)
             s.index()
             with self.assertRaisesRegex(Exception, "AlreadyAZebsdsolveExport"):
-                s.export(Path(self.tmp.name) / "again.h5oina")
+                native_oxford_export(s, Path(self.tmp.name) / "again.h5oina")
             off = Path(self.tmp.name) / "off.h5"
             shutil.copy(src, off)
             with h5py.File(off, "r+") as f:
@@ -331,7 +343,7 @@ class StoredOrientations(unittest.TestCase):
             s.set_geometry(**self.geometry)
             s.index()
             with self.assertRaisesRegex(Exception, "CellsOffTheRaster"):
-                s.export(Path(self.tmp.name) / "off.h5oina")
+                native_oxford_export(s, Path(self.tmp.name) / "off.h5oina")
         finally:
             s.close()
         # only from an Oxford acquisition
@@ -343,7 +355,7 @@ class StoredOrientations(unittest.TestCase):
             s.set_geometry(**self.geometry)
             s.index()
             with self.assertRaisesRegex(Exception, "NotAnOxfordAcquisition"):
-                s.export(Path(self.tmp.name) / "no.h5oina")
+                native_oxford_export(s, Path(self.tmp.name) / "no.h5oina")
         finally:
             s.close()
 
@@ -360,7 +372,7 @@ class StoredOrientations(unittest.TestCase):
                 s.set_geometry(**self.geometry)
                 s.index()
                 out = Path(self.tmp.name) / f"{name}.h5oina"
-                s.export(out)
+                native_oxford_export(s, out)
             finally:
                 s.close()
             with h5py.File(out, "r") as f:

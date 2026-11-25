@@ -826,12 +826,15 @@ pub const Scan = struct {
                     if ((h.numbers(a, &m.specimen_euler) catch 0) != 3) m.specimen_euler = @splat(std.math.nan(f64));
                 }
                 info.calibration = .{ .metadata = m };
-                // (and how they move over the map: x as it is, y turned over, both scaled as above)
-                const dx = num.drift(h, gpa, data, "Pattern Center X", info.rows, info.cols);
-                const dy = num.drift(h, gpa, data, "Pattern Center Y", info.rows, info.cols);
-                const dz = num.drift(h, gpa, data, "Detector Distance", info.rows, info.cols);
-                info.pc_per_col = .{ dx[0], -dy[0] * ratio, dz[0] * ratio };
-                info.pc_per_row = .{ dx[1], -dy[1] * ratio, dz[1] * ratio };
+                // Only the fallback raster convention needs these additional full-map reads.
+                if (info.calibration.status() != .supported) {
+                    // (and how they move over the map: x as it is, y turned over, both scaled as above)
+                    const dx = num.drift(h, gpa, data, "Pattern Center X", info.rows, info.cols);
+                    const dy = num.drift(h, gpa, data, "Pattern Center Y", info.rows, info.cols);
+                    const dz = num.drift(h, gpa, data, "Detector Distance", info.rows, info.cols);
+                    info.pc_per_col = .{ dx[0], -dy[0] * ratio, dz[0] * ratio };
+                    info.pc_per_row = .{ dx[1], -dy[1] * ratio, dz[1] * ratio };
+                }
                 // The scan's turn (Scanning Rotation Angle): at a half turn the beam goes as the
                 // settings' signs say (checked on an AZtec acquisition: its stored pattern
                 // centres move as the engine's do); unturned, the other way along both (as #13,

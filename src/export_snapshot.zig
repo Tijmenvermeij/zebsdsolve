@@ -134,7 +134,7 @@ fn snapshotImpl(e: *engine.Engine, requested: ?rot.Quat, is_oxford: bool) ![]u8 
         try w.writeAll("],\"master_crystal_convention\":\"X||a,Z||c*\",\"output_crystal_convention\":\"X||a*,Z||c\"}");
     }
     try w.writeAll(",\"pattern_centres\":[");
-    const signs = context.calibration.scanSigns(context.settings.scan_x_sign, context.settings.scan_y_sign);
+    const signs = context.scan_signs;
     for (0..e.res.phase.len) |i| {
         const t = geometry.positionForRotation(context.calibration.rotation(&geometry), @floatFromInt(i / info.cols), @floatFromInt(i % info.cols), 0.5 * @as(f64, @floatFromInt(info.rows - 1)), 0.5 * @as(f64, @floatFromInt(info.cols - 1)), signs[0], signs[1], 1, @floatFromInt(info.pat_h), @floatFromInt(info.pat_w));
         const pc = engine.Geometry.pcOf(context.calibration.rotation(&geometry), t, @floatFromInt(info.pat_h), @floatFromInt(info.pat_w));

@@ -254,6 +254,9 @@ pub fn write(e: *Engine) ![]u8 {
         else => return error.NotAnOxfordAcquisition,
     };
     if (s.format != .h5_oxford) return error.NotAnOxfordAcquisition;
+    // The fork's Oxford calibration uses a source-derived detector baseline.
+    // Its snapshot exporter owns this path and preserves the acquisition metadata.
+    if (e.calibration.status() == .supported) return error.OxfordCalibrationRequiresSnapshotExport;
     if (e.phases.items.len == 0) return error.NoPhases;
     for (e.phases.items) |p| if (p.master.lattice == null) return error.MissingPhaseLattice;
     const info = s.info;

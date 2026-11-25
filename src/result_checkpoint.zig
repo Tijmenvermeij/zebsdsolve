@@ -44,6 +44,7 @@ fn fingerprint(e: *const engine.Engine) [32]u8 {
     hashValue(&h, e.set);
     hashValue(&h, e.geo);
     hashValue(&h, e.calibration);
+    hashValue(&h, e.scanSigns());
     // Every supported Oxford acquisition now uses the corrected detector CS3
     // direction. Old calibrated and fallback results require fresh indexing.
     if (e.calibration.status() == .supported) h.update("oxford-detector-cs3-v2");
@@ -96,7 +97,7 @@ fn payloadSize(n: usize, phases: usize) !usize {
 pub fn byteSize(e: *engine.Engine) !usize {
     _ = try e.info();
     const context = e.res.context orelse return error.NoIndexedResults;
-    if (!e.res.context_consistent or !engine.sameExportContext(context, .{ .settings = e.set, .geometry = e.geo, .calibration = e.calibration, .phase_generation = e.phase_generation })) return error.CheckpointContextChanged;
+    if (!e.res.context_consistent or !engine.sameExportContext(context, e.exportContext())) return error.CheckpointContextChanged;
     if (e.res.candidate_phases != e.phases.items.len or e.res.candidates.len != e.res.phase.len * e.phases.items.len) return error.CheckpointCandidatesMissing;
     return std.math.add(usize, header, try payloadSize(e.res.phase.len, e.phases.items.len));
 }
@@ -186,7 +187,7 @@ pub fn restore(e: *engine.Engine, input: []const u8) !void {
         sweep.* = c.get(i32);
         if (sweep.* < -1 or (sweep.* >= 0 and sweep.* >= e.set.sweeps)) return error.InvalidResultCheckpoint;
     }
-    replacement.context = .{ .settings = e.set, .geometry = e.geo, .calibration = e.calibration, .phase_generation = e.phase_generation };
+    replacement.context = e.exportContext();
     e.res.free(e.gpa);
     e.res = replacement;
 }

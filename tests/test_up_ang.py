@@ -165,13 +165,16 @@ class UpAng(unittest.TestCase):
             np.testing.assert_equal(quality,expected.reshape(2,3))
     def test_comma_columns_preserve_spaces_and_empty_unit_slots(self):
         up,_=self.up();_,standard=self.ang()
-        records=standard[:,[0,1,2,7,3,4,5,6,8,9]]
+        records=standard[:,[2,1,0,7,3,4,5,6,8,9]]
         ang,_=self.ang(records=records,
-            headers='phi1, Phi, phi2, Phase index, x, y, Image Quality, CI, SEM, Fit',
+            headers='phi2, Phi, phi1, Phase index, x, y, Image Quality, CI, SEM, Fit',
             units='radians, radians, radians, , microns, microns, , , , degrees')
         with Solver() as s:
             s.open(up,ang)
             np.testing.assert_array_equal(s.stored_overview()['values'],standard[:,5].reshape(2,3))
+            stored = s.stored_orientations()
+            np.testing.assert_array_equal(stored["euler"], standard[:, :3].reshape(2, 3, 3))
+            np.testing.assert_array_equal(stored["phase"], standard[:, 7].reshape(2, 3))
 
     def test_float32_positions_printed_to_five_decimals_remain_registered(self):
         for origin, step in [(0., .2), (1000., .025)]:
