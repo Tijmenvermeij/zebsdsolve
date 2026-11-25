@@ -354,10 +354,20 @@ try {
     console.log('cancellation fixture',JSON.stringify({eligible:eligible.length,batch:batchSize,cutoff:primaryCutoff,roi:[ze.settings.roi_x,ze.settings.roi_y,ze.settings.roi_w,ze.settings.roi_h]}));
     require(eligible.length>batchSize,'cancellation fixture needs more accepted primary cells than one batch: '+eligible.length+' eligible, batch '+batchSize);
     primary.value='stored';primary.dispatchEvent(new Event('change'));
-    const observer=new MutationObserver(()=>{if(document.getElementById('overlap-readout').textContent.includes(batchSize.toLocaleString()+' / '+eligible.length.toLocaleString()+' cells')){observer.disconnect();document.getElementById('btn-stop').click();}});
+    const first=eligible[0];
+    clickPrimaryCell(Math.floor(first/ze.scan.cols),first%ze.scan.cols);
+    let liveTable=false,liveElapsed=false;
+    const observer=new MutationObserver(()=>{
+      if(!document.getElementById('overlap-readout').textContent.includes(batchSize.toLocaleString()+' / '+eligible.length.toLocaleString()+' cells'))return;
+      observer.disconnect();
+      liveTable=document.getElementById('app').dataset.busy==='1' && !!document.querySelector('#overlap-components button:not([disabled])');
+      liveElapsed=!document.getElementById('overlap-elapsed').hidden;
+      document.getElementById('btn-stop').click();
+    });
     observer.observe(document.getElementById('overlap-readout'),{childList:true,subtree:true,characterData:true});
     document.getElementById('btn-overlap-run').click();
     await waitFor(()=>document.getElementById('app').dataset.busy==='0' && document.getElementById('overlap-readout').textContent.startsWith('Stopped'),'stop after first tile ('+eligible.length+' eligible, batch '+batchSize+')');
+    require(liveTable && liveElapsed,'live component table or elapsed time missing');
     saved=await exportOverlap();
     require(saved.state==='Stopped' && saved.cells.length===batchSize && saved.requested_cells.length===eligible.length,'incomplete tile committed or completed tile lost; eligible '+eligible.length+', batch '+batchSize);
     // Hold the serial queue so Stop arrives before the native operation starts.
@@ -465,14 +475,33 @@ try {
       require(batched.stop_reason[row]===scalar.stop_reason[0] && Math.abs(batched.sse[row]-scalar.sse[0])<1e-6,
         'WebGPU residual batch differs from the one-cell fit');
     }
-    screen.checked=true;screen.dispatchEvent(new Event('change'));cutoff.value='1';cutoff.dispatchEvent(new Event('change'));
+    const primaryScores=ze.results().ncc;
+    const strongest=Array.from(validity.keys()).filter(i=>validity[i]===1 && Number.isFinite(primaryScores[i]))
+      .sort((a,b)=>primaryScores[b]-primaryScores[a]).slice(0,8);
+    let screenCell,threshold;
+    for(const cell of strongest){
+      const control=await ze.overlapCells([cell],{primary:'stored',maxComponents:2,fitBlurGain:true,
+        polish:true,minResidualNcc:1,residualBandwidth:primaryBandwidth+4});
+      const scores=control.profile_events.filter(e=>e.order===2).map(e=>e.residual_ncc).filter(Number.isFinite);
+      if(scores.length && primaryScores[cell]>Math.max(0,...scores)){
+        screenCell=cell;threshold=(primaryScores[cell]+Math.max(0,...scores))/2;break;
+      }
+    }
+    require(screenCell!==undefined,'fixture needs a primary that outscores its residual');
+    const row=Math.floor(screenCell/ze.scan.cols),col=screenCell%ze.scan.cols;
+    await configureUI({roi_x:col,roi_y:row,roi_w:1,roi_h:1});
+    clickPrimaryCell(row,col);
+    await waitFor(()=>document.getElementById('pat-cell').textContent==='row '+row+', col '+col,'screened test cell selected');
+    screen.checked=true;screen.dispatchEvent(new Event('change'));cutoff.value=String(threshold);cutoff.dispatchEvent(new Event('change'));
+    require(document.getElementById('overlap-primary-effective').textContent.includes(String(threshold)),'effective primary cutoff missing');
     polish.checked=true;polish.dispatchEvent(new Event('change'));
     document.getElementById('btn-overlap-run').click();
     await waitFor(()=>document.getElementById('app').dataset.busy==='0' && document.getElementById('overlap-readout').textContent.startsWith('Complete'),'V6 profile and screen');
     const fitted=await exportOverlap();
+    require(fitted.elapsed_ms>=0 && !document.getElementById('overlap-elapsed').hidden,'completed elapsed time missing');
     const left=document.getElementById('overlap-map-component');left.value='primary';left.dispatchEvent(new Event('change'));
     require(document.getElementById('map').toDataURL()!==document.getElementById('overlap-map-canvas').toDataURL(),'screened residual must leave original primary visible');
-    require(fitted.metadata.primary_ncc_minimum===0,'primary execution cutoff missing');
+    require(fitted.metadata.primary_ncc_minimum===Math.fround(threshold) && fitted.metadata.requested_primary_ncc_minimum===0,'primary execution cutoff missing');
     require(fitted.metadata.residual_bandwidth===primaryBandwidth+4 && fitted.metadata.settings.bandwidth===primaryBandwidth,
       'manual bandwidth must be distinct from the primary setting in the export');
     require(ze.settings.bandwidth===primaryBandwidth && ze.storedPrimaryValidity(fitted.cells[0],1)[0]===1,
@@ -484,7 +513,7 @@ try {
     require(fitted.metadata.profile_version===2 && fitted.metadata.orientation_polish===true,'profile provenance not exported');
     require(fitted.metadata.refit_blur_gain_after_polish===false,'disabled endpoint refit must be frozen');
     require(fitted.metadata.oxford_detector_attitude_version===0,'generic camera provenance not exported');
-    require(fitted.metadata.residual_screen.enabled && fitted.metadata.min_residual_ncc===1,'computational screen not frozen');
+    require(fitted.metadata.residual_screen.enabled && Math.abs(fitted.metadata.min_residual_ncc-threshold)<1e-6,'computational screen not frozen');
     require(fitted.arrays.source_quaternions.stride===8,'native proposal poses missing');
     require(fitted.arrays.retained_order.values[0]===1,'screen did not preserve singleton');
     require(fitted.profile_events.some(e=>e.flags&2),'screened proposal diagnostic missing');

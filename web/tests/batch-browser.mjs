@@ -89,6 +89,7 @@ try {
     window.addConfigured=async(settings,geometry=null)=>{
       await ze.openScan([fixtureSource]);
       ze.configure(settings);if(geometry)ze.setGeometry(geometry);
+      document.getElementById('batch-overlap').checked=expected.length===1;
       document.getElementById('btn-batch-current').click();
       await waitBatch(()=>document.querySelectorAll('#batch-jobs tr').length===expected.length+1);
       const row=[...document.querySelectorAll('#batch-jobs tr')].at(-1);
@@ -114,6 +115,7 @@ try {
     require(JSON.stringify(ze.geometry)===JSON.stringify(beforeBatch.geometry),'Interactive geometry changed');
     require(JSON.stringify(ze.exportSnapshot().results.quaternions)===JSON.stringify(beforeBatch.selected),'Interactive result changed');
   `);
+  await evaluate(`document.getElementById('batch-overlap').checked=false;`);
   console.error('batch: two jobs indexed, interactive state retained');
   const first = await evaluate(`
     const h=await import('/web/app/js/vendor/h5wasm/hdf5_hl.js');await h.ready;
@@ -121,14 +123,23 @@ try {
     for(const prefix of ['Ni_test','Ni_test_02']){
       const dir=await testOutput.getDirectoryHandle(prefix);
       const config=JSON.parse(await(await(await dir.getFileHandle(prefix+'.json')).getFile()).text());
-      require(config.batch.status==='complete' && config.batch.outputs.length===5,'Journal completion');configs.push(config);
+      require(config.batch.status==='complete' && config.batch.outputs.length===(prefix==='Ni_test'?5:6),'Journal completion');configs.push(config);
     }
     require(configs[0].batch.directory==='Ni_test' && configs[1].batch.directory==='Ni_test_02','Collision suffix');
     for(let k=0;k<2;k++){
       const job=configs[k].batch,dir=await testOutput.getDirectoryHandle(job.directory),prefix=job.outputStem;
       const entries=[];for await(const name of dir.keys())entries.push(name);
-      require(entries.sort().join(',')===[prefix+'.ang',prefix+'.h5',prefix+'_IPF-Z.png',prefix+'_NCC.png',prefix+'.json'].sort().join(','),'Expected exactly five same-stem files');
+      const expectedEntries=[prefix+'.ang',prefix+'.h5',prefix+'_IPF-Z.png',prefix+'_NCC.png',prefix+'.json'];
       const read=async name=>(await (await dir.getFileHandle(name)).getFile());
+      if(k===1){
+        const name=prefix+'_overlap.json';
+        expectedEntries.push(name);
+        const result=JSON.parse(await(await read(name)).text());
+        require(result.schema==='zebsdsolve-overlap-candidates-v1' && result.state==='Complete','Batch overlap JSON missing');
+        require(result.cells.length===2 && result.arrays.phase.stride===2,'Batch overlap lost the frozen ROI or component count');
+        require(result.metadata.settings.binning===2 && result.metadata.primary_ncc_minimum===Math.fround(.1),'Batch overlap settings not preserved');
+      }
+      require(entries.sort().join(',')===expectedEntries.sort().join(','),'Unexpected batch output files');
       const bytes=new Uint8Array(await (await read(prefix+'.h5')).arrayBuffer());
       h.FS.writeFile('/batch-result.h5',bytes);const file=new h.File('/batch-result.h5','r');
       try{

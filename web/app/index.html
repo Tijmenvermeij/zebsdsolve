@@ -195,6 +195,10 @@
           <label class="check" title="Refine component orientations while holding blur/gain fixed and updating mixture weights. Pattern centre stays fixed. A stronger smaller fit can restart the search. Stage thresholds instead require a passing addition to continue."><input type="checkbox" id="overlap-polish"> Polish orientations</label>
           <label class="check" title="Refit shared blur/gain once after an orientation changes during polishing."><input type="checkbox" id="overlap-refit-after-polish" disabled> Refit blur / gain after polishing</label>
           <div class="fields">
+            <label class="field"><span>Primary NCC minimum</span><input id="overlap-primary-cutoff" type="number" min="-1" max="1" step="0.01" value="0" title="Inclusive acceptance of the original primary NCC. Controls the primary map and cells eligible for the next overlap run within the ROI; completed fits retain their execution cutoff."></label>
+            <output id="overlap-primary-effective" aria-live="polite"></output>
+          </div>
+          <div class="fields">
             <label class="check" title="Screen each refined residual proposal before mixture fitting. If all proposals fail, retain the previous fit. This changes computation and is separate from Show only; the threshold is not calibrated confidence."><input type="checkbox" id="overlap-screen" checked> Screen residual NCC</label>
             <label class="field"><span>Minimum NCC</span><input id="overlap-screen-value" type="number" min="-1" max="1" step="0.01" value="0.1" title="Inclusive minimum signed residual NCC for each proposed component. Dataset quality, search settings and pattern-centre accuracy affect this score. Rejected proposals remain in the export."></label>
           </div>
@@ -206,8 +210,8 @@
           <div class="row"><button type="button" class="act" id="btn-overlap-primary">Index primary</button><button type="button" class="act" id="btn-overlap-settings">Index settings</button></div>
           <progress id="overlap-progress" max="1" value="0" aria-label="Overlap progress" hidden></progress>
           <p class="readout" id="overlap-readout" role="status"></p>
+          <output id="overlap-elapsed" class="readout" hidden></output>
           <div class="fields">
-            <label class="field"><span>Primary NCC minimum</span><input id="overlap-primary-cutoff" type="number" min="-1" max="1" step="0.01" value="0" title="Inclusive acceptance of the original primary NCC. Controls the primary map and cells eligible for the next overlap run within the ROI; completed fits retain their execution cutoff."></label>
             <label class="field"><span>Residual map NCC minimum</span><input id="overlap-residual-cutoff" type="number" min="-1" max="1" step="0.01" value="0" title="Inclusive historical NCC of the refined residual-source orientation, before joint fitting or polishing. Filters the First accepted residual component map, independently of computational screening."></label>
             <label class="field wide"><span>Inspect</span><select id="overlap-component" title="Inspect the original primary or a component in the final fit."><option value="primary">Original primary</option><option value="1">Fit component 1</option><option value="2">Fit component 2</option></select></label>
           </div>
@@ -218,6 +222,7 @@
           <div class="row"><button type="button" id="btn-overlap-export">Export results</button></div>
         </section>
         <section class="panel" data-tab="batch" role="tabpanel" aria-labelledby="tab-batch" hidden>
+          <label class="check" title="Use the current Overlap settings for this job. Each batch job indexes its own primary before fitting overlap."><input type="checkbox" id="batch-overlap"> Include overlap indexing</label>
           <div class="row"><button type="button" class="primary act" id="btn-batch-current">Add current scan</button></div>
           <label class="check batch-download-option" title="One ZIP per scan, using your browser's download location. The browser may ask to allow multiple downloads."><input type="checkbox" id="batch-downloads"> Save to Downloads</label>
           <button type="button" class="act" id="btn-batch-setup">Set up output folders…</button>

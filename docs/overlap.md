@@ -628,3 +628,23 @@ so `dict_grid` did not affect them. Its padded 512-point correlation grid has
 0.703125-degree Euler-axis increments before peak interpolation and detector-plane
 orientation refinement. Those increments are not equivalent to a uniform SO(3)
 dictionary spacing or a worst-case angular coverage bound.
+
+
+## Interactive and batch runs
+
+With **Screen residual NCC** enabled, Overlap uses the higher of the primary
+NCC minimum and the residual screen as the effective primary minimum. This
+sets eligibility from the stored primary results and filters the original
+primary map. It does not change the primary indexer's search. The residual
+screen applies again at each proposed residual component. The separate
+**Residual map NCC minimum** only filters the residual-source map and does
+not remove fits from the export.
+
+Set the Overlap options, then enable **Include overlap indexing** before
+adding a scan to Batch. Each queued job captures its own Overlap options.
+It indexes its primary patterns in its selected region, runs Overlap from
+those results, then saves the ordinary outputs and a separate
+`_overlap.json` file. Loading a completed Batch job restores the primary
+results and queued settings. The JSON contains the published overlap fits
+and diagnostics. It does not contain the search state needed to resume a fit
+at a higher component order.

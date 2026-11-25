@@ -73,6 +73,7 @@ function snapshot(spec) {
     settings: freeze(clone(spec.settings)), geometry: freeze(clone(spec.geometry)),
     openGeometry: spec.openGeometry == null ? null : freeze(clone(spec.openGeometry)),
     openHints: freeze(openHints), scanInfo: freeze(clone(spec.scanInfo)),
+    overlap: spec.overlap == null ? null : freeze(clone(spec.overlap)),
     phases: freeze(clone(spec.phases || [])), version: clone(spec.version ?? null), detectorAttitudeVersion: spec.detectorAttitudeVersion ?? null,
     sources: freeze(sourceFiles.map(descriptor)), masters: freeze(masterFiles.map(descriptor)),
   };
@@ -80,8 +81,8 @@ function snapshot(spec) {
 const STOPPED = Symbol("stopped");
 
 export class BatchQueue {
-  constructor({ createEngine, artifacts, onChange = () => {}, downloadsAdapter = new BatchDownloads(), onDownloadReady = () => {} }) {
-    this.createEngine = createEngine; this.artifacts = artifacts; this.onChange = onChange;
+  constructor({ createEngine, artifacts, overlap, onChange = () => {}, downloadsAdapter = new BatchDownloads(), onDownloadReady = () => {} }) {
+    this.createEngine = createEngine; this.artifacts = artifacts; this.overlap = overlap; this.onChange = onChange;
     this._downloads = downloadsAdapter; this.onDownloadReady = onDownloadReady; this.downloadsEnabled = false;
     this.jobs = []; this.running = false; this.directory = null; this.error = null;
     this._nextId = 1; this._stop = false;
@@ -199,7 +200,9 @@ export class BatchQueue {
         job._folder = await root.getDirectoryHandle(name, { create: true });
         job._transport = this.modeFor(job); job._root = root; job.folderName = name; job.directoryName = name; job.outputStem = name;
         job.journalName = `${name}.json`;
-        job.outputs = [".h5", isOxfordH5(job.scanInfo.format) ? ".h5oina" : ".ang", "_IPF-Z.png", "_NCC.png", ".json"].map((suffix) => ({ name: name + suffix, complete: false }));
+        const suffixes = [".h5", isOxfordH5(job.scanInfo.format) ? ".h5oina" : ".ang", "_IPF-Z.png", "_NCC.png", ".json"];
+        if (job.overlap) suffixes.push("_overlap.json");
+        job.outputs = suffixes.map(suffix => ({ name:name + suffix, complete:false }));
       }
       if (!job._journal) {
         if (await this._exists(job._folder, job.journalName)) throw new Error(`Output already exists: ${job.journalName}.`);
@@ -243,6 +246,7 @@ export class BatchQueue {
       oxford_detector_attitude_version: job.detectorAttitudeVersion,
       geometry: job.geometry, settings: job.settings, source_files: job.sources, master_files: job.masters,
       phases: job.phases, opening_hints: job.openHints, acquisition_geometry: job.openGeometry, scan_info: job.scanInfo,
+      ...(job.overlap ? { overlap:job.overlap } : {}),
       warnings: job.warnings, map_source: "native engine map: IPF-Z and detector NCC; same frame and colors as the GUI",
       batch: { schemaVersion: 1, id: job.id, outputStem: job.outputStem, directory: job.folderName, transport: this.modeFor(job),
         status: completing ? this.modeFor(job) === "downloads" ? "archive-ready" : "complete" : job.status, error: completing ? null : job.error,
@@ -321,18 +325,39 @@ export class BatchQueue {
     this._checkStop(); this._checkDevice();
     await engine.indexBegin();
     this._checkStop(); this._checkDevice();
-    const started = performance.now(); let visits = 0;
+    const started = performance.now();
+    let visits = 0, sweepStarted = started, lastChange = started;
     for (;;) {
       this._checkStop(); this._checkDevice();
       const before = engine.indexStatus;
       const status = await engine.indexStep();
       this._checkStop(); this._checkDevice();
-      visits += Math.min(Math.max(0, before.total - before.done), job.settings.batch || before.total);
-      const pps = visits / Math.max((performance.now() - started) / 1000, 0.001);
-      job.progress = { done: status.done, total: status.total, sweep: status.sweep, sweeps: status.sweeps, pps,
-        etaSeconds: status.left === 0 ? 0 : Math.max(0, status.total - status.done) / pps };
-      this._change();
+      const now = performance.now();
+      const nextSweep = status.sweep !== before.sweep;
+      visits += Math.max(0, nextSweep ? before.total - before.done : status.done - before.done);
+      if (nextSweep) sweepStarted = now;
+      const pps = visits / Math.max((now - started) / 1000, 0.001);
+      job.progress = { done:status.done, total:status.total, sweep:status.sweep, sweeps:status.sweeps, pps,
+        etaSeconds:status.left > 0 && status.done > 0 ? (now - sweepStarted) * status.left / (1000 * status.done) : 0 };
+      if (status.left === 0 || nextSweep || now - lastChange >= 250) {
+        lastChange = now;
+        this._change();
+      }
       if (status.left === 0) break;
+    }
+    if (job.overlap) {
+      if (!this.overlap) throw new Error("Overlap indexing is unavailable for this batch.");
+      job.overlapArtifact = await this.overlap(engine, job, () => {
+        this._checkStop(); this._checkDevice(); return true;
+      }, progress => {
+        job.progress = {...progress, stage:"overlap"};
+        const now = performance.now();
+        if (progress.done === 0 || progress.done === progress.total || now - lastChange >= 250) {
+          lastChange = now;
+          this._change();
+        }
+      });
+      this._checkStop(); this._checkDevice();
     }
   }
   async _export(job) {
@@ -370,6 +395,7 @@ export class BatchQueue {
       await this._validateCompleted(job);
       job.archive = await this._downloads.archive(job);
     }
+    job.overlapArtifact = null;
     job.status = "complete"; job.error = null; this._change();
     if (job.archive && !job._downloadNotified) {
       job._downloadNotified = true;
@@ -419,6 +445,10 @@ export class BatchQueue {
           this._retainedJob = null;
           if (this._engine.deviceLost) this._stop = true;
         } catch (error) {
+          if (!exporting) {
+            job.overlapArtifact = null;
+            if (this._stop && !this._engine?.deviceLost) error = STOPPED;
+          }
           job.error = error === STOPPED ? "Stopped by user." : message(error);
           job.status = exporting ? "export-pending" : error === STOPPED ? "cancelled" : "failed";
           if (exporting && this.modeFor(job) === "downloads") job.outputs.find(entry => entry.name === job.journalName).complete = false;

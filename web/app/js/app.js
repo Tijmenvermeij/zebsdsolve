@@ -2766,6 +2766,7 @@ function updateWiring() {
 const batch = new BatchQueue({
   createEngine: () => Zebsdsolve.create({ wasm: new URL("../zebsdsolve/zebsdsolve.wasm", import.meta.url), warm: false }),
   artifacts: batchArtifacts,
+  overlap: (engine, job, check, progress) => overlapUI.runBatchOverlap(engine, job, check, progress),
   onDownloadReady: job => startBatchDownload(job),
   onChange: () => renderBatch(),
 });
@@ -2778,6 +2779,7 @@ function startBatchDownload(job) {
 }
 
 function renderBatch() {
+  $("batch-overlap").disabled = !!(st.busy || st.batchRunning || st.scanPicking);
   const ready = !!st.ze && !!st.sourceFiles.length && st.phaseFiles.some((p) => p.on) && !st.gpuLost && !st.busy && !st.batchRunning && !st.scanPicking;
   for (const id of ["btn-batch-add", "btn-batch-current"]) {
     $(id).disabled = !ready;
@@ -2804,8 +2806,12 @@ function renderBatch() {
   if (active?.progress && active.status === "indexing") {
     const p = active.progress;
     bar.value = Math.min(1, Math.max(0, p.done / Math.max(p.total, 1)));
-    const eta = remainingTime(p.etaSeconds);
-    $("batch-readout").textContent = `${active.sourceFiles[0].name}\nsweep ${p.sweep + 1}/${p.sweeps} · ${p.done.toLocaleString()} / ${p.total.toLocaleString()}\n${p.pps.toFixed(0)} patterns/s${eta ? ` · ~${eta} left` : ""}`;
+    if (p.stage === "overlap") {
+      $("batch-readout").textContent = `${active.sourceFiles[0].name}\nOverlap · ${p.done.toLocaleString()} / ${p.total.toLocaleString()} cells`;
+    } else {
+      const eta = remainingTime(p.etaSeconds);
+      $("batch-readout").textContent = `${active.sourceFiles[0].name}\nsweep ${p.sweep + 1}/${p.sweeps} · ${p.done.toLocaleString()} / ${p.total.toLocaleString()}\n${p.pps.toFixed(0)} patterns/s${eta ? ` · ~${eta} left` : ""}`;
+    }
   } else if (active) {
     bar.removeAttribute("value");
     $("batch-readout").textContent = `${active.sourceFiles[0].name}\n${active.status === "exporting" ? "Saving outputs…" : "Preparing indexing…"}`;
@@ -2859,6 +2865,7 @@ async function addBatchJob() {
     if (files !== st.sourceFiles || st.busy || st.batchRunning || st.scanPicking) return;
     const spec = { sourceFiles: files, masterFiles: st.phaseFiles.filter((p) => p.on).map((p) => p.file), settings: st.ze.settings, geometry: st.ze.geometry,
       openHints: st.sourceOpenHints, openGeometry: st.geoOpened, scanInfo: st.scan, phases: st.ze.phases, version: st.ze.version, detectorAttitudeVersion: st.ze.detectorAttitudeVersion };
+    spec.overlap = $("batch-overlap").checked ? overlapUI.readOptions(spec.settings) : null;
     const editing = batch.jobs.find(job => job.id === st.batchEditing);
     spec.directory = editing ? batch.directoryFor(editing) : await sourceFolders.find(files[0]).catch(() => null);
     if (files !== st.sourceFiles || st.busy || st.batchRunning || st.scanPicking) return;
@@ -2891,6 +2898,8 @@ async function loadBatchJob(job) {
       showResolution(); showStage(); showSweeps(); showAngle(); showRoi();
       if (!await rebuildPhases()) return;
       st.batchEditing = job.status === "queued" && !job.folderName ? job.id : null;
+      $("batch-overlap").checked = !!job.overlap;
+      if (job.overlap) overlapUI.restoreOptions(job.overlap);
       selectTab("index");
     } finally { phasesChanged(); updateEnabled(); }
     if (job.status === "complete") {
