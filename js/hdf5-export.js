@@ -301,7 +301,9 @@ function writeOxford(f, h, s, frame, n) {
     }
     for (const [id, p] of pending) {
       const g = pg.create_group(String(id));
-      put(g, "Phase Name", [p.name]); put(g, "Reference", ["zebsdsolve master pattern"]); put(g, "Space Group", new Uint32Array([p.space_group])); put(g, "Laue Group", new Uint32Array([p.laue]));
+      put(g, "Phase Name", [p.name]); put(g, "Reference", ["zebsdsolve master pattern"]); put(g, "Space Group", new Int32Array([p.space_group]));
+    const laue = put(g, "Laue Group", new Int32Array([p.laue]));
+    if (p.laue_symbol) laue.create_attribute("Symbol", p.laue_symbol);
       put(g, "Lattice Dimensions", new Float64Array(p.lattice.slice(0, 3)), [1, 3]).create_attribute("Unit", "angstrom");
       put(g, "Lattice Angles", Float64Array.from(p.lattice.slice(3), (v) => v * Math.PI / 180), [1, 3]).create_attribute("Unit", "rad");
     }
@@ -310,14 +312,19 @@ function writeOxford(f, h, s, frame, n) {
       for (let j = 0; j < 3; j++) eulerValues[3 * i + j] = indexed[i] ? s.results.euler[3 * i + j] : 0;
     }
     euler.write_slice([[0, n], [0, 3]], eulerValues); phase.write_slice([[0, n]], phaseValues);
-    // Keep every source PC value, including unindexed cells and missing fields.
+  const hitRate = hd.get("Hit Rate");
+  if (hitRate instanceof h.Dataset && hitRate.value?.length === 1 && /^Float(32|64)Array$/.test(hitRate.value.constructor.name)) {
+    hitRate.write_slice(hitRate.shape.map(size => [0, size]), new hitRate.value.constructor([100 * indexed.reduce((sum, v) => sum + v, 0) / n]));
+  }
+    // Leave source PCs outside the indexed area, and all source PCs after a plane fit.
     if (!preservesSourcePC(s)) for (let j = 0; j < PC_FIELDS.length; j++) {
       const name = PC_FIELDS[j], d = data.get(name);
       if (d && (d.shape?.join() !== `${n}` || !/^Float(32|64)Array$/.test(d.value?.constructor?.name))) throw new Error(`Unsupported Oxford ${name} layout; use Python export.`);
       const values = d ? d.value : new Float64Array(n).fill(NaN);
-      for (let i = 0; i < n; i++) {
-        const v = s.pattern_centres[3 * i + j], ratio = s.scan.pat_h / s.scan.pat_w;
-        values[i] = indexed[i] ? (j === 0 ? v : (j === 1 ? 1 - v : v) * ratio) : NaN;
+      const ratio = s.scan.pat_h / s.scan.pat_w;
+      for (let i = 0; i < n; i++) if (indexed[i]) {
+        const v = s.pattern_centres[3 * i + j];
+        values[i] = j === 0 ? v : (j === 1 ? 1 - v : v) * ratio;
       }
       if (d) d.write_slice([[0, n]], values);
       else put(data, name, values).create_attribute("Unit", "fraction");
@@ -327,8 +334,12 @@ function writeOxford(f, h, s, frame, n) {
       if (d.shape?.[0] !== n) throw new Error(`Unsupported Oxford indexing metric ${name} layout; use Python export.`);
       const values = d.value;
       if (!ArrayBuffer.isView(values) || values instanceof DataView || values instanceof BigInt64Array || values instanceof BigUint64Array) throw new Error(`Unsupported Oxford indexing metric ${name}; use Python export.`);
-      const width = values.length / n;
-      for (let i = 0; i < n; i++) if (replaced[i]) values.fill(values instanceof Float32Array || values instanceof Float64Array ? NaN : 0, i * width, (i + 1) * width);
+      if (name === "Error") {
+        if (values.length !== n) throw new Error("Unsupported Oxford Error layout; use Python export.");
+        values.set(indexed); // 1 Success, 0 NotAnalyzed
+      } else {
+        values.fill(values instanceof Float32Array || values instanceof Float64Array ? NaN : 0);
+      }
       d.write_slice(d.shape.map((size) => [0, size]), values);
     }
     // Solver metrics live under provenance, without relabelling NCC as Oxford MAD.

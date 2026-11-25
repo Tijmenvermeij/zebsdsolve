@@ -6,6 +6,7 @@ import { drawGray, drawSigned, drawHeat, fit, svg, download, quantiles } from ".
 import { createVotes } from "./votes.js";
 import { exportH5, exportOxford } from "./hdf5-export.js";
 import { BatchQueue, defaultOutputStem } from "./batch.js";
+import { createBatchLiveMap } from "./batch-live.js";
 import { batchArtifacts } from "./batch-artifacts.js";
 import { isOxfordH5, oxfordExportWarnings, geometryConvention, acceptsGeometryConvention } from "./oxford-export-policy.js";
 import { createPlaneView } from "./planeview.js";
@@ -15,12 +16,12 @@ import { drawEnergy } from "./energy.js";
 import { filesFromHandles, rememberFileHandle, fileHandleFor, sourceFolders, chooseScanFolder } from "./source-folders.js";
 import { replacePhaseEntries } from "./phase-state.js";
 import { pairUPScan, chooseANG, validateUPProjectSources, validateScanSelection } from "./up-scan-files.js";
+import { createConventions } from "./conventions.js";
 
 const $ = (id) => document.getElementById(id);
 const app = $("app");
 const PHASE_COLORS = ["#3b82f6", "#f59e0b", "#10b981", "#ef4444", "#8b5cf6", "#14b8a6", "#ec4899", "#84cc16"];
 const RESULT_KINDS = ["ipf", "ncc", "nmi", "phase", "sweep"];
-const TABS = ["simulate", "data", "patterns", "geometry", "index", "batch"];
 // settings outside the pattern's own groups that change what the pattern view shows of a
 // pattern indexed on the spot
 const LIVE_KEYS = new Set(["fit_bandwidth", "refine", "refine_iters", "refine_step", "nmi_bins", "phase_by", "scan_x_sign", "scan_y_sign"]);
@@ -79,12 +80,14 @@ const st = {
   keys: new Map(),     // Laue class → its inverse pole figure key
   legendFolded: false,
   chance: null,        // what NMI chance gives on this scan (the last indexing run's calibration)
+  frameFound: null,    // the frame the scan file's own orientations were found in (identifyFrame)
   truth: null,         // a toy scan's own answer: { quaternions, phase } per cell
   tuned: "",
   busy: 0,
   gpuLost: null,
   masterRun: 0,
   stop: false,
+  indexBandwidth: null,
   showRun: 0,
   roiDrag: null,
   // the map's view: zoom (1: all of it), the cell at the well's centre, screen pixels per cell
@@ -94,37 +97,52 @@ const st = {
 
 // ── status, log, busy ──
 
+function indexedCount() {
+  return st.results?.phase.reduce((n, phase) => n + (phase >= 0), 0) || 0;
+}
+
 function status(text, err = false) {
+  if (st.gpuLost) {
+    const count = st.busy ? 0 : indexedCount();
+    text = st.busy ? "GPU device lost. Finishing the current operation…"
+      : count ? `GPU device lost. ${count.toLocaleString()} indexed results retained. Export before reloading.`
+      : "GPU device lost. Reload to continue.";
+    err = true;
+  }
   const el = $("status");
   el.textContent = text;
   el.title = text;
   el.classList.toggle("err", err);
 }
 
-function gpuLossMessage() {
-  const n = st.results?.phase.reduce((count, phase) => count + (phase >= 0), 0) || 0;
-  return `GPU device lost. ${n.toLocaleString()} indexed results retained. Export before reloading.`;
-}
-
-// Device loss may arrive while WASM is suspended. This callback only touches JS/DOM state.
+// The engine may still be suspended. Only touch JavaScript and DOM state here.
 function deviceLost(info) {
   if (st.gpuLost) return;
   st.gpuLost = info;
-  st.roiDrag = null;
+  app.dataset.gpuLost = "1";
   ++st.showRun;
   ++st.masterRun;
-  app.dataset.gpuLost = "1";
+  ++st.pcRun;
+  st.roiDrag = null;
   invalidateOverview();
-  for (const id of ["btn-open", "btn-example", "btn-phase", "btn-toy", "btn-fit-auto", "btn-fit-pc", "btn-fit-plane", "btn-simulate", "btn-sim-phase", "btn-index", "btn-tune", "btn-geo-undo", "btn-geo-file", "btn-geo-plane", "pat-live", "file-scan", "file-phase", "file-ang", "bin-choices", "btn-roi", "btn-roi-clear"]) $(id).disabled = true;
-  for (const input of document.querySelectorAll(".panel .fields input, .panel .fields select, .panel .tri input")) input.disabled = true;
-  for (const button of $("phases").querySelectorAll("button")) button.disabled = true;
-  log(`GPU device lost: ${JSON.stringify({ ...info, adapter: st.ze.adapterInfo, bandwidth: st.settings.bandwidth, batch: st.settings.batch, tile_mb: st.settings.tile_mb })}`, true);
-  if (!st.busy) status(gpuLossMessage(), true);
+  for (const id of ["btn-open", "btn-example", "btn-phase", "btn-toy", "btn-fit-auto", "btn-fit-pc", "btn-fit-plane",
+    "btn-simulate", "btn-sim-phase", "btn-index", "btn-tune", "btn-geo-undo", "btn-geo-file", "btn-geo-plane",
+    "btn-roi", "btn-roi-clear", "pat-live", "file-scan", "file-phase", "file-ang", "bin-choices", "btn-stop"]) $(id).disabled = true;
+  for (const control of document.querySelectorAll(".panel .fields input, .panel .fields select, .panel .tri input, #phases input, #phases button, #btn-add-ang")) control.disabled = true;
+  if (st.busy || !indexedCount()) {
+    for (const button of document.querySelectorAll(".needs-results, #btn-h5oina")) button.disabled = true;
+  }
+  const { batch, tile_mb } = st.settings;
+  const bandwidth = st.indexBandwidth ?? st.settings.bandwidth;
+  log(`GPU device lost: ${JSON.stringify({ ...info, adapter: st.ze.adapterInfo, bandwidth, batch, tile_mb })}`, true);
+  $("compile").hidden = true;
+  progress(null);
+  status("");
 }
 
 function gpuAvailable() {
   if (!st.gpuLost) return true;
-  status(gpuLossMessage(), true);
+  status("");
   return false;
 }
 
@@ -168,14 +186,15 @@ function progress(frac) {
 
 /** Run one engine job: the actions and the settings are off and Stop is on while it runs. The
  *  selected pattern is shown again when it is done (a job changes what there is to show). */
-async function busy(label, fn) {
-  if (st.busy) return;
+async function busy(label, fn, { cpuExport = false } = {}) {
+  if (st.busy || (st.gpuLost && !cpuExport) || (st.batchRunning && cpuExport)) return;
   st.busy = 1;
   ++st.pcRun;
+  st.indexBandwidth = null;
   st.stop = false;
   app.dataset.busy = "1";
   renderBatch();
-  $("btn-stop").hidden = false;
+  $("btn-stop").hidden = cpuExport || st.batchRunning;
   status(label);
   const t0 = performance.now();
   let succeeded = false;
@@ -183,21 +202,21 @@ async function busy(label, fn) {
     await fn();
     succeeded = true;
     const elapsed = ((performance.now() - t0) / 1000).toFixed(2);
-    status(st.gpuLost ? gpuLossMessage() : st.stop ? "stopped" : `${label.replace(/…$/, "")}: done in ${elapsed} s`, !!st.gpuLost);
+    status(st.stop ? "stopped" : `${label.replace(/…$/, "")}: done in ${elapsed} s`);
   } catch (e) {
     ++st.showRun;
     ++st.masterRun;
     const msg = String(e.message || e);
-    if (/Cancelled/.test(msg)) status("stopped"); else { status(st.gpuLost ? gpuLossMessage() : msg, true); log(msg, true); console.error(e); }
+    if (!st.gpuLost && /Cancelled/.test(msg)) status("stopped"); else { status(msg, true); log(msg, true); console.error(e); }
   } finally {
     st.busy = 0;
     app.dataset.busy = "0";
     renderBatch();
     $("btn-stop").hidden = true;
     progress(null);
-    st.live.clear();
-    if (st.gpuLost) updateEnabled();
-    if (succeeded && !st.gpuLost) showCell();
+    if (!st.batchRunning) st.live.clear();
+    if (st.gpuLost) { updateEnabled(); status(""); }
+    if (succeeded && !st.gpuLost && !cpuExport) showCell();
   }
 }
 
@@ -224,7 +243,7 @@ function showImportedGeometryNotice() {
 }
 
 function selectTab(name) {
-  if (st.batchRunning && name !== "batch") return;
+  if (st.batchRunning && name !== "batch" && name !== "index") return;
   app.dataset.tab = name;
   $("batch-workspace").hidden = name !== "batch";
   for (const b of $("tabs").children) {
@@ -234,6 +253,8 @@ function selectTab(name) {
   }
   for (const p of $("panels").children) p.hidden = p.dataset.tab !== name;
   $("panels").scrollTop = 0;
+  showBatchView();
+  if (st.batchRunning) return;
   if (name === "geometry") showImportedGeometryNotice();
   // the Geometry step is a console for the fits: the dock takes most of the stage there, and
   // shows a fit (the pattern-centre search, unless it is already on the plane)
@@ -263,6 +284,12 @@ const sweepLabel = (p) => (p.method === "spherical" ? `spherical ${p.bandwidth}`
 
 async function applySetting(key, value) {
   if (!gpuAvailable()) return;
+  if (key === "stored_patterns" && st.scan?.storedKinds.length === 2 && st.sourceFiles.length) {
+    const hints = { ...st.sourceOpenHints };
+    if (isOxfordH5(st.scan.format)) hints.oxford_patterns = value;
+    if (!await openScan(st.sourceFiles, { [key]: value }, hints)) fields.show(st.settings);
+    return;
+  }
   try {
     st.ze.configure({ [key]: value });
   } catch (e) {
@@ -343,9 +370,9 @@ function buildGeometry() {
       continue;
     }
     if (key === "rot") {
-      const box = $("geo-turn-fields");
+      const box = $("geo-rot-fields");
       box.title = hint;
-      box.append(cell(""), cell("h", "swing"), cell("h", "tilt"), cell("h", "twist"), cell("k", label), mk(0), mk(1), mk(2));
+      box.append(cell(""), cell("h", "azimuthal"), cell("h", "tilt"), cell("h", "twist"), cell("k", label), mk(0), mk(1), mk(2));
       continue;
     }
     const el = document.createElement("label");
@@ -364,9 +391,10 @@ function buildGeometry() {
 function showGeometry() {
   const g = st.ze.geometry;
   const per = Object.fromEntries(GEOMETRY.map((f) => [f[0], f[4]]));
-  for (const input of document.querySelectorAll("#geometry-fields input, #pc-grid input, #geo-turn-fields input")) {
+  for (const input of document.querySelectorAll("#geometry-fields input, #pc-grid input, #geo-rot-fields input")) {
     const v = input.dataset.i !== undefined ? g[input.dataset.geo][+input.dataset.i] : g[input.dataset.geo];
-    input.value = String(+(v * per[input.dataset.geo]).toFixed(6));
+    // (the pattern centre to the four places the file's and the change beside it have)
+    input.value = input.dataset.geo === "pc" ? v.toFixed(4) : String(+(v * per[input.dataset.geo]).toFixed(6));
   }
   $("btn-geo-undo").disabled = !st.geoBefore || !!st.gpuLost;
   $("btn-geo-undo").textContent = st.geoIsBefore ? "redo fit" : "undo fit";
@@ -406,8 +434,7 @@ function geometryChanged(byFit = false) {
 }
 
 /** Remember the pattern centre and rotation a fit is about to change. */
-function beforeFit() {
-  const g = st.ze.geometry;
+function beforeFit(g = st.ze.geometry) {
   st.geoBefore = { pc: g.pc, rot: g.rot, pxUm: g.pxUm, plane: g.plane, planeKind: g.planeKind };
   st.geoIsBefore = false;
 }
@@ -553,14 +580,15 @@ async function openScan(files, projectSettings = null, projectHints = null, expe
     const hints = { ...projectHints };
     const savedSource = hints.oxford_patterns;
     hints.oxford_patterns = savedSource ?? "ask";
+    if (savedSource === "processed" || savedSource === "unprocessed") settings.stored_patterns = savedSource;
     try {
       await st.ze.openScan(files, { settings, hints });
     } catch (error) {
       if (savedSource != null || !String(error.message).endsWith(": OxfordPatternChoiceRequired")) throw error;
-      const source = await chooseOxfordPatterns();
+      const source = projectSettings?.stored_patterns ?? await chooseOxfordPatterns();
       if (!source || st.stop) throw new Error("Cancelled opening scan");
       if (!gpuAvailable()) return;
-      hints.oxford_patterns = source;
+      hints.oxford_patterns = settings.stored_patterns = source;
       await st.ze.openScan(files, { settings, hints });
     }
     if (hints.oxford_patterns === "processed" || hints.oxford_patterns === "unprocessed") {
@@ -577,6 +605,7 @@ async function openScan(files, projectSettings = null, projectHints = null, expe
 
 /** A scan is open: clear the previous scan's views and remember the files needed to reopen it. */
 function afterOpen(files = [], hints = null) {
+  $("map-hover").textContent = hoverText(null);
   invalidateOverview();
   ++st.showRun;
   st.roiDrag = null;
@@ -592,6 +621,7 @@ function afterOpen(files = [], hints = null) {
   st.resultsGeo = "";
   st.pcSims = st.pcPair = null;
   clearInterval(st.pcTimer);
+  st.frameFound = null;
   st.fit = null;
   st.votes = null;
   st.plane = null;
@@ -623,13 +653,10 @@ function afterOpen(files = [], hints = null) {
   $("scan-meta").title = $("scan-meta").textContent;
   const facts = [
     ["format", s.format], ["map", `${s.rows} × ${s.cols} (${(s.rows * s.cols).toLocaleString()} patterns)`],
-    ["pattern", `${s.patH} × ${s.patW} ${s.dtype}`], ["size", gb >= 1 ? `${gb.toFixed(2)} GiB` : `${(s.bytes / 2 ** 20).toFixed(1)} MiB`],
-    ["background", s.hasBackground ? "stored" : "none"], ["pattern centre", s.hasPc ? "from the file" : "unknown"],
+    ["pattern", `${s.patH} × ${s.patW} ${s.dtype}${s.storedKinds.length === 2 ? (s.unprocessed ? " · unprocessed" : " · processed") : ""}`], ["size", gb >= 1 ? `${gb.toFixed(2)} GiB` : `${(s.bytes / 2 ** 20).toFixed(1)} MiB`],
+    ["background", s.hasBackground ? "stored" : "none"], ["PC", s.hasPc ? st.pcFile.map((v) => v.toFixed(4)).join("  ") : "none"],
     ["pixel", s.hasPx ? `${st.ze.geometry.pxUm.toFixed(1)} µm` : "none"],
   ];
-  if (s.format === "Oxford h5oina" && hints?.oxford_patterns) {
-    facts.push(["pattern source", hints.oxford_patterns]);
-  }
   if (s.voltageKv) facts.push(["voltage", `${s.voltageKv} kV`]);
   $("scan-facts").replaceChildren(...factRows(facts));
   // an EDAX .up1 / .up2 can take its scan's .ang (OIM's export of the same map)
@@ -664,6 +691,7 @@ function afterOpen(files = [], hints = null) {
   st.cell = Math.floor(s.rows / 2) * s.cols + Math.floor(s.cols / 2);
   drawMapOverlay();
   loadStoredOverview();
+  showFrame();
   updateEnabled();
 }
 
@@ -679,7 +707,7 @@ function updateOverviewControls() {
   selector.replaceChildren();
   if (st.storedOverview) selector.add(new Option(st.storedOverview.label, "stored"));
   else {
-    const empty = new Option("overview", "none");
+    const empty = new Option("none", "none");
     empty.disabled = true;
     selector.add(empty);
   }
@@ -723,6 +751,7 @@ async function loadStoredOverview() {
 
 /** Progressive contrast for scans without stored quality, or on request. Each batch yields to other jobs. */
 async function runOverview() {
+  if (st.gpuLost) return;
   const run = ++st.overviewRun, ze = st.ze;
   const { rows, cols, patH, patW, pixel } = st.scan;
   const values = new Float32Array(rows * cols).fill(NaN);
@@ -792,6 +821,7 @@ function forgetPhases() {
   clearInterval(st.pcTimer);
   st.live.clear();
   st.results = null;
+  st.frameFound = null;
   st.fit = null;
 }
 
@@ -800,6 +830,7 @@ function phasesChanged() {
   st.keys.clear();
   done("index", false);
   showPhases();
+  showFrame();
   if (st.mapKind !== "overview") setMapKind("overview"); else drawMap();
   showMaster();
 }
@@ -877,9 +908,10 @@ function showPhases() {
     li.title = entry.info ? `${p.name}: point group ${p.pointGroupName}, Laue class ${p.laue}, ${p.side} × ${p.side} per hemisphere${p.voltageKv ? `, ${p.voltageKv} kV` : ""}${entry.on ? "" : ". Off: not fitted or indexed with, nor shown; switch it on with the box"}` : p.name;
     li.innerHTML = `<input type="checkbox" class="on" title="On: a candidate phase for the fits and the indexing. Off: kept here, set aside"><span class="dot"></span><span class="nm"></span><span class="pg"></span><button type="button" class="ghost" title="Remove this phase"><svg><use href="#i-x"/></svg></button>`;
     li.querySelector(".on").checked = entry.on;
-    li.querySelector(".dot").style.background = entry.on ? PHASE_COLORS[idx % PHASE_COLORS.length] : "#3a3a41";
+    li.querySelector(".dot").style.background = entry.on ? PHASE_COLORS[idx % PHASE_COLORS.length] : "var(--track)";
     li.querySelector(".nm").textContent = p.name;
     li.querySelector(".pg").textContent = p.pointGroupName;
+    li.querySelector(".on").disabled = li.querySelector("button").disabled = st.gpuLost;
     li.querySelector(".on").addEventListener("click", (ev) => { ev.stopPropagation(); });
     li.querySelector(".on").addEventListener("change", () => togglePhase(k));
     li.addEventListener("click", () => { if (idx < 0) return; st.phase = idx; st.masterSrc = idx; showPhases(); if ($("dock-master").hidden) selectDock("master"); else showMaster(); });
@@ -1048,8 +1080,8 @@ function showCrystal() {
       }));
     } else {
       const v = document.createElement("span");
-      v.textContent = fixed(c.cell[i], d);
-      v.title = `${sym} = ${fixed(c.cell[i], d)} ${unit}: tied by the crystal's family${i < 3 && tie[i] && Math.abs(c.cell[i] - c.cell[0]) < 1e-9 ? ` (${sym} ${tie[i]})` : ""}`;
+      v.textContent = String(+c.cell[i].toFixed(d + 2));
+      v.title = `${sym} = ${+c.cell[i].toFixed(d + 2)} ${unit}: tied by the crystal's family${i < 3 && tie[i] && Math.abs(c.cell[i] - c.cell[0]) < 1e-9 ? ` (${sym} ${tie[i]})` : ""}`;
       el.append(v);
     }
     pick(el, key);
@@ -1402,6 +1434,10 @@ function resetZoom() {
 function drawMapOverlay() {
   const over = $("map-over");
   over.replaceChildren();
+  // (the fits' lattice belongs to the fits: drawn on the Geometry step, its box dimmed elsewhere)
+  const fitStep = app.dataset.tab === "geometry" && !!st.scan;
+  $("show-fit").disabled = !fitStep;
+  $("show-fit").closest("label").dataset.off = fitStep ? "0" : "1";
   if (!st.scan) return;
   const { rows, cols } = st.scan;
   const s = st.settings;
@@ -1414,18 +1450,16 @@ function drawMapOverlay() {
     const d = st.roiDrag;
     over.append(svg("rect", { x: Math.min(d.c0, d.c1), y: Math.min(d.r0, d.r1), width: Math.abs(d.c1 - d.c0) + 1, height: Math.abs(d.r1 - d.r0) + 1, fill: "rgba(214,176,100,.15)", stroke: "#e8c77e", "stroke-width": u }));
   }
-  // (the fits' lattice belongs to the fits: drawn on the Geometry step, its box dimmed elsewhere)
-  const fitStep = app.dataset.tab === "geometry";
-  $("show-fit").disabled = !fitStep;
-  $("show-fit").closest("label").dataset.off = fitStep ? "0" : "1";
   if ($("show-fit").checked && fitStep) {
     const cells = st.fit ? st.fit.cells : fitLattice();
     // (a few fit patterns are rings; a dense lattice, the plane's, a light dotting that leaves the map legible)
     const spacing = Math.sqrt((rows * cols) / Math.max(cells.length, 1));
     const dense = cells.length > 150;
     const rad = dense ? Math.min(1.8 * u, 0.25 * spacing) : 3.5 * u;
+    const fill = st.fit ? "#7fbf6e" : dense ? "var(--bad)" : "none";
+    const stroke = dense ? "none" : st.fit ? "#0a0a0b" : "var(--bad)";
     for (const c of cells) {
-      over.append(svg("circle", { cx: (c % cols) + 0.5, cy: Math.floor(c / cols) + 0.5, r: rad, fill: st.fit ? "#7fbf6e" : "none", "fill-opacity": dense ? 0.75 : 1, stroke: dense ? "none" : st.fit ? "#0a0a0b" : "#9d9da4", "stroke-width": u }));
+      over.append(svg("circle", { cx: (c % cols) + 0.5, cy: Math.floor(c / cols) + 0.5, r: rad, fill, "fill-opacity": dense ? 0.75 : 1, stroke, "stroke-width": u }));
     }
   }
   if (st.cell >= 0) {
@@ -1455,11 +1489,17 @@ function mapCellAt(ev) {
   return { r, c, cell: r * cols + c };
 }
 
-function hoverText(p) {
-  const parts = [`row ${p.r}  col ${p.c}`];
-  const R = st.results;
-  if (R && R.phase[p.cell] >= 0) parts.push(`NCC ${R.ncc[p.cell].toFixed(3)}`, `NMI ${R.nmi[p.cell].toFixed(3)}`, `z ${R.z[p.cell].toFixed(1)}`);
-  return parts.join("   ");
+function hoverText(point) {
+  const results = st.results;
+  const cell = point?.cell;
+  const indexed = point && results && results.phase[cell] >= 0;
+  const score = (value, digits) => Number.isFinite(value) ? value.toFixed(digits) : "—";
+  return [
+    `row ${point?.r ?? "—"}  col ${point?.c ?? "—"}`,
+    `NCC ${score(indexed ? results.ncc[cell] : undefined, 3)}`,
+    `NMI ${score(indexed ? results.nmi[cell] : undefined, 3)}`,
+    `z ${score(indexed ? results.z[cell] : undefined, 1)}`,
+  ].join("   ");
 }
 
 // ── the pattern ──
@@ -1770,8 +1810,9 @@ function drawVotes() {
 
 async function fitPc() {
   await busy("fitting the pattern centre…", async () => {
-    beforeFit();
+    const before = st.ze.geometry;
     const r = await st.ze.fitPc();
+    beforeFit(before);
     st.fit = st.ze.fitPatterns();
     st.votes = st.ze.pcLevels();
     st.pcStart = r.start;
@@ -1816,7 +1857,7 @@ function planeReadout(r, before = []) {
     shown.push([calibrated ? "residual tilt" : "tilt", pm(r.saidRot[1], r.saidRotSe[1]), "wide"]);
     if (!calibrated) more.push(["sample", `${(g.sampleTiltDeg - deg(r.saidRot[1])).toFixed(2)}°`]);
     more.push(["frame", r.frame ? "plane" : calibrated ? "acquisition" : "nominal"]);
-    if (model !== "line") more.push(["swing", pm(r.saidRot[0], r.saidRotSe[0]), "wide"], ["scan turn", pm(r.saidRot[2], r.saidRotSe[2]), "wide"], ["skew", pm(r.skew, r.skewSe), "wide"]);
+    if (model !== "line") more.push(["azimuthal", pm(r.saidRot[0], r.saidRotSe[0]), "wide"], ["scan rotation", pm(r.saidRot[2], r.saidRotSe[2]), "wide"], ["skew", pm(r.skew, r.skewSe), "wide"]);
     if (r.step[0] > 0) {
       more.push(["row step", `${r.step[0].toFixed(3)} ± ${r.stepSe[0].toFixed(3)}`, "wide"]);
       if (model !== "line") more.push(["col step", `${r.step[1].toFixed(3)} ± ${r.stepSe[1].toFixed(3)}`, "wide"]);
@@ -1839,8 +1880,7 @@ function afterPlane(r, vote = []) {
   st.plane = { r, pts: st.ze.planePoints() };
   showKv($("fit-readout"), [...planeReadout(r, vote), ...againstTrueGeometry()]);
   done("geometry");
-  // (one centre leaves the vote's geometry: its search and the comparison are the view then)
-  selectDock(PLANE_MODELS[r.model] === "centre" ? "votes" : "plane");
+  selectDock("plane");
   planeView.show(r, st.plane.pts, st.scan);
   geometryChanged(true);
   drawMapOverlay();
@@ -1884,65 +1924,76 @@ async function runIndex() {
     bar.hidden = false;
     bar.removeAttribute("value");
     bar.setAttribute("aria-label", barLabel);
-    showKv(readout, [["", "Preparing indexing…", "wide"]]);
+    readout.replaceChildren();
     try {
       await st.ze.indexBegin();
       st.resultsGeo = JSON.stringify(st.ze.geometry);
       if (st.mapKind === "overview") setMapKind("ipf");
-      const start = performance.now();
-      let last = 0, visited = 0, sweepStart = start, s, rows;
+      const t0 = performance.now();
+      let last = 0, drawMs = 0, visited = 0, sweepStart = t0, s, rows;
       for (;;) {
         const before = st.ze.indexStatus;
+        st.indexBandwidth = before.bandwidth;
         s = await st.ze.indexStep();
+        // (a step indexes a few batches; one that ends a sweep took what the sweep had left)
+        visited += s.sweep !== before.sweep ? before.total - before.done : s.done - before.done;
         const now = performance.now();
-        visited += Math.max(0, s.sweep === before.sweep ? s.done - before.done : before.total - before.done);
+        const dt = (now - t0) / 1000;
         if (s.sweep !== before.sweep) sweepStart = now;
         const eta = s.left > 0 && s.done > 0 ? remainingTime(((now - sweepStart) / 1000) * s.left / s.done) : "";
-        const left = eta ? `~${eta}${s.sweeps > 1 ? " this sweep" : ""}` : "";
+        if (!st.stop) status(eta ? `indexing… · ~${eta} left${s.sweeps > 1 ? " this sweep" : ""}` : "indexing…");
         const fraction = s.done / Math.max(s.total, 1);
         progress(fraction);
         bar.value = fraction;
         bar.setAttribute("aria-label", s.sweeps > 1 ? `Indexing sweep ${s.sweep + 1} of ${s.sweeps}` : barLabel);
-        if (!st.stop) status(eta ? `indexing… · ~${eta} left${s.sweeps > 1 ? " this sweep" : ""}` : "indexing…");
-        rows = [
-          ...(s.sweeps > 1 ? [["sweep", `${s.sweep + 1} / ${s.sweeps} · ${sweepLabel(s)}`, "wide"]] : []),
-          ["indexed", `${s.done.toLocaleString()} / ${s.total.toLocaleString()}`],
-          ["rate", `${Math.round(visited / Math.max((now - start) / 1000, 1e-6)).toLocaleString()}/s`],
-          ["accepted", `${s.accepted.toLocaleString()} / ${s.region.toLocaleString()} (${acceptText()})`, "wide"],
-        ];
-        showKv(readout, left ? [...rows, ["left", left, "wide"]] : rows);
-        if (now - last > 250 || s.left === 0) {
+        rows = [...(s.sweeps > 1 ? [["sweep", `${s.sweep + 1} / ${s.sweeps} · ${sweepLabel(s)}`, "wide"]] : []),
+          ["indexed", `${s.done.toLocaleString()} / ${s.total.toLocaleString()}`], ["rate", `${Math.round(visited / Math.max(dt, 1e-6)).toLocaleString()}/s`],
+          ...(eta ? [["left", `~${eta}${s.sweeps > 1 ? " this sweep" : ""}`, "wide"]] : []),
+          ["accepted", `${s.accepted.toLocaleString()} / ${s.region.toLocaleString()} (${acceptText()})`, "wide"]];
+        showKv(readout, rows);
+        // The map follows, at most every 250 ms and no more often than keeps its drawing to a
+        // twentieth of the time: the device waits while it is drawn (a map of half a million
+        // cells takes some 70 ms).
+        if (s.left === 0 || st.stop) break;
+        if (performance.now() - last > Math.max(250, 20 * drawMs)) {
+          const t = performance.now();
           st.results = st.ze.results();
           drawMap();
-          last = now;
+          last = performance.now();
+          drawMs = last - t;
           await sleep(0);
         }
-        if (s.left === 0 || st.stop) break;
       }
+      const elapsed = (performance.now() - t0) / 1000;
       st.results = st.ze.results();
+      st.chance = st.ze.resultChance();
       showKv(readout, [...rows, ...againstTruth(), ...(st.stop ? [["", "Stopped", "wide"]] : [])]);
-      // Chance is calibrated once for the run, on the scan's own NMI scale.
-      try { st.chance = await st.ze.chance(0); } catch { st.chance = null; }
-      if (st.gpuLost) throw new Error(gpuLossMessage());
+      drawMap();
+      if (!st.stop) await identifyFrame();
       showSweeps();
       done("index", !st.stop);
-      drawMap();
+      // (with no search to show, the dock shows how the matches stand)
       if (!st.votes) selectDock("z"); else drawZ();
       updateEnabled();
       const R = st.results;
       let n = 0, sum = 0;
       for (let i = 0; i < R.ncc.length; i++) if (R.phase[i] >= 0) { n++; sum += R.ncc[i]; }
-      log(`indexed ${n.toLocaleString()} patterns in ${((performance.now() - start) / 1000).toFixed(2)} s${s.sweeps > 1 ? ` (${visited.toLocaleString()} pattern visits over ${s.sweep + 1} sweeps)` : ""}: mean NCC ${(sum / Math.max(n, 1)).toFixed(4)}, ${s.accepted.toLocaleString()} accepted`);
+      log(`indexed ${n.toLocaleString()} patterns in ${elapsed.toFixed(2)} s${s.sweeps > 1 ? ` (${visited.toLocaleString()} pattern visits over ${s.sweep + 1} sweeps)` : ""}: mean NCC ${(sum / Math.max(n, 1)).toFixed(4)}, ${s.accepted.toLocaleString()} accepted`);
     } catch (error) {
-      // Native indexStep commits only successful batches. Keep the original error if recovery fails.
-      try { st.results = st.ze.results(); } catch (secondary) { log(`Retaining previous result view: ${secondary.message || secondary}`, true); }
+      // The last rendered map may predate batches committed before the failure.
       done("index", false);
-      try { drawMap(); updateEnabled(); } catch (secondary) { log(`Result display: ${secondary.message || secondary}`, true); }
-      const n = st.results?.phase.reduce((count, phase) => count + (phase >= 0), 0) || 0;
-      showKv(readout, [[st.stop && !st.gpuLost ? "Stopped" : "Interrupted", `${n.toLocaleString()} indexed results retained`, "warn wide"]]);
+      try {
+        st.results = st.ze.results();
+        drawMap();
+      } catch (secondary) {
+        log(`Result display: ${secondary.message || secondary}`, true);
+      }
+      updateEnabled();
+      showKv(readout, [[st.stop && !st.gpuLost ? "Stopped" : "Interrupted", `${indexedCount().toLocaleString()} indexed results retained`, "warn wide"]]);
       throw error;
     } finally {
       bar.hidden = true;
+      st.indexBandwidth = null;
     }
   });
 }
@@ -1976,7 +2027,8 @@ function drawZ() {
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, W, H);
   const zs = [];
-  if (R) for (let i = 0; i < R.z.length; i++) if (R.phase[i] >= 0) zs.push(R.z[i]);
+  let settled = 0;
+  if (R) for (let i = 0; i < R.z.length; i++) if (R.phase[i] >= 0) { zs.push(R.z[i]); if (R.sweep[i] >= 0) settled++; }
   if (!zs.length) { $("z-hint").textContent = "Not indexed yet"; return; }
   // the threshold on z's scale: the calibration's own, or the absolute NMI's place on it
   const t = st.settings.accept_nmi > 0 && st.chance ? (st.settings.accept_nmi - st.chance.median) / st.chance.spread : st.settings.accept_z;
@@ -2014,7 +2066,7 @@ function drawZ() {
     ctx.fillText(String(z), x(z), H - pad.b + 4);
   }
   const sorted = zs.slice().sort((a, b) => a - b);
-  $("z-hint").textContent = `${zs.length.toLocaleString()} cells · median z ${sorted[sorted.length >> 1].toFixed(1)} · ${accepted.toLocaleString()} (${((100 * accepted) / zs.length).toFixed(1)} %) at or above ${st.settings.accept_nmi > 0 ? `NMI ${st.settings.accept_nmi} (z ${t.toFixed(1)})` : `z ${t}`}`;
+  $("z-hint").textContent = `${zs.length.toLocaleString()} cells · median z ${sorted[sorted.length >> 1].toFixed(1)} · ${accepted.toLocaleString()} (${((100 * accepted) / zs.length).toFixed(1)} %) at or above ${st.settings.accept_nmi > 0 ? `NMI ${st.settings.accept_nmi} (z ${t.toFixed(1)})` : `z ${t}`} · ${settled.toLocaleString()} accepted (settled too)`;
 }
 
 // ── docks, enabling, files ──
@@ -2045,7 +2097,7 @@ function setProjection(p) {
 }
 
 /** The lock applies to the flat projections only (dimmed on the globe); while it holds, the
- *  buttons that would turn the sphere are dimmed too (the first view is still there). */
+ *  buttons that would rotate the sphere are dimmed too (the first view is still there). */
 function showViewLock() {
   const flat = st.projection !== "globe";
   $("view-lock").disabled = !flat;
@@ -2100,6 +2152,7 @@ function setRoi(set) {
   if (!st.scan || st.busy || !gpuAvailable()) return;
   try { st.ze.configure(set); }
   catch (err) { status(String(err.message || err), true); return; }
+  st.fit = null;
   afterSettings(Object.keys(set));
 }
 
@@ -2107,13 +2160,16 @@ function updateEnabled() {
   showImportedGeometryNotice();
   const ready = !!st.scan && !st.gpuLost && st.ze.phases.length > 0;
   for (const id of ["btn-fit-auto", "btn-fit-pc", "btn-fit-plane", "btn-index", "btn-tune"]) $(id).disabled = !ready;
-  for (const b of document.querySelectorAll(".needs-results")) b.disabled = !st.results;
+  const canExport = st.results && (!st.gpuLost || indexedCount() > 0);
+  for (const b of document.querySelectorAll(".needs-results")) b.disabled = !canExport;
   for (const b of $("map-kind").children) if (RESULT_KINDS.includes(b.dataset.kind)) b.disabled = !st.results;
   $("btn-json").disabled = !st.scan;
   const oxford = !!st.sourceFile && isOxfordH5(st.scan?.format);
   const oxfordReason = !oxford ? "Open the original Oxford H5OINA scan."
-    : !st.results ? "Index the scan first." : "";
+    : !canExport ? "Index the scan first." : "";
   $("btn-h5oina").disabled = !!oxfordReason;
+  $("btn-roi").disabled = !st.scan || !!st.gpuLost;
+  $("btn-key").disabled = !st.scan;
   const addAng = $("btn-add-ang");
   if (addAng) addAng.disabled = !!st.gpuLost;
   $("btn-h5oina").title = oxfordReason || (JSON.parse(st.resultsGeo || "null")?.planeKind ? "Fitted-plane export retains the original Oxford PC fields." : "");
@@ -2183,14 +2239,19 @@ async function takeFiles(files) {
   }
   if (scans.length && !await openScan(scans, project?.settings, project?.opening_hints, project?.source_files)) return;
   if (masters.length) await addPhases(masters);
-  if (project) {
+  if (project && !st.gpuLost) {
     if (project.geometry && /Oxford h5oina/i.test(st.scan?.format || "") && !acceptsGeometryConvention(st.scan, project.geometry_convention)) {
       const message = "This Oxford project uses the previous geometry convention. The original calibration is loaded; refit any fitted geometry, reindex and save a new project.";
       log(message, true); status(message, true); updateEnabled(); return;
     }
     if (project.geometry) { beforeFit(); st.ze.setGeometry(project.geometry); geometryChanged(); }
-    log(`project ${projects[0].name}: ${[project.settings && "settings", project.geometry && "geometry"].filter(Boolean).join(" and ")} taken`);
-    if (!st.busy) status(`${projects[0].name}: ${[project.settings && "settings", project.geometry && "geometry"].filter(Boolean).join(" and ")} taken`);
+    if (project.frame) {
+      try { st.ze.frame = project.frame; } catch (e) { log(`project frame: ${e.message || e}`, true); }
+      showFrame();
+    }
+    const taken = [project.settings && "settings", project.geometry && "geometry", project.frame && "frame"].filter(Boolean).join(" and ");
+    log(`project ${projects[0].name}: ${taken} taken`);
+    if (!st.busy) status(`${projects[0].name}: ${taken} taken`);
     updateEnabled();
   }
 }
@@ -2269,14 +2330,14 @@ async function loadExample() {
     if (!await rebuildPhases()) return;
     st.ze.configure({ static_background: "file", dynamic_background: "subtract" });
     st.exampleBackground = previousBackground;
-    st.phaseFiles = [{ file: master, on: true, info: null }];
     afterOpen([scan], originalHints);
     phasesChanged();
   });
 }
 
 function projectJson() {
-  return JSON.stringify({ zebsdsolve: st.ze.version, scan: st.scanName, source_files: st.sourceFiles.map(file => ({ name: file.name, size: file.size, lastModified: file.lastModified })), geometry_convention: geometryConvention(st.scan), geometry: st.ze.geometry, settings: st.ze.settings, opening_hints: st.sourceOpenHints, phases: st.ze.phases.map((p) => p.name) }, null, 2);
+  const { text: _, ...frame } = st.ze.frame;
+  return JSON.stringify({ zebsdsolve: st.ze.version, scan: st.scanName, source_files: st.sourceFiles.map(file => ({ name: file.name, size: file.size, lastModified: file.lastModified })), geometry_convention: geometryConvention(st.scan), geometry: st.ze.geometry, settings: st.ze.settings, opening_hints: st.sourceOpenHints, frame, phases: st.ze.phases.map((p) => p.name) }, null, 2);
 }
 
 /** Keep independent browser directory memories for scans and master patterns. */
@@ -2301,11 +2362,120 @@ async function pickFiles(kind) {
   }
 }
 
+// ── the frame the exports write in ──
+
+const isEngineFrame = (f) => f.axes.join() === "1,2,3" && !f.active && f.crystal === "x_a_z_cstar";
+const sameFrame = (a, b) => a.axes.join() === b.axes.join() && a.active === b.active && a.crystal === b.crystal;
+const degOf = (v) => (180 / Math.PI) * Math.hypot(...v);
+
+/** After indexing: the frame the scan file's own orientations are in, when it stores any. */
+async function identifyFrame() {
+  st.frameFound = null;
+  try { st.frameFound = await st.ze.identifyFrame(); }
+  catch (e) {
+    const msg = String(e.message || e);
+    if (st.gpuLost) throw e;
+    if (!/NoStoredOrientations|TooFewCommonCells/.test(msg)) log(`frame: ${msg}`, true);
+  }
+  showFrame();
+}
+
+function showFrame() {
+  const f = st.ze.frame, found = st.frameFound;
+  const pick = $("frame-pick");
+  pick.options[1].disabled = !found;
+  pick.value = isEngineFrame(f) ? "engine" : "file";
+  const rows = [["frame", f.text, "wide"]];
+  if (found) {
+    rows.push(["vs file", `median ${found.median_deg.toFixed(2)}° · ${Math.round(100 * found.within)} % ≤ 2° · next ${found.runner_up_deg.toFixed(1)}°`, "wide"]);
+    const m = found.misorientation, d = (180 / Math.PI) * Math.hypot(...m);
+    const axis = d > 0 ? m.map((v) => (v / Math.hypot(...m)).toFixed(2)).join(", ") : "";
+    rows.push(["misorientation", `${d.toFixed(2)}°${axis ? ` about (${axis})` : ""} · rows ${degOf(found.misorientation_rows).toFixed(2)}° · cols ${degOf(found.misorientation_cols).toFixed(2)}°`, "wide"]);
+  }
+  if (!isEngineFrame(f) && found && !sameFrame(f, found.frame)) rows.push(["", "set, not the file's", "wide"]);
+  showKv($("frame-readout"), rows);
+  conventions?.refresh();
+}
+
+// ── the File menu: what opens and saves, the theme, the conventions ──
+
+let conventions = null;
+
+/** The theme: "dark", "light", or "system" (as the system is set, following it). */
+function setTheme(choice) {
+  const dark = choice === "system" ? matchMedia("(prefers-color-scheme: dark)").matches : choice !== "light";
+  document.documentElement.dataset.theme = dark ? "dark" : "light";
+  for (const b of $("theme-pick").querySelectorAll("button")) b.setAttribute("aria-pressed", String(b.dataset.theme === choice));
+  try { localStorage.setItem("zebsdsolve.theme", choice); } catch { /* private window */ }
+}
+
+function themeChoice() {
+  try { return localStorage.getItem("zebsdsolve.theme") || "dark"; } catch { return "dark"; }
+}
+
+/** A dropdown menu: `root` holds its button and its list. `pick(item)` hears an item chosen (and
+ *  returns true to keep the menu open); `opening()` runs before it shows. */
+function wireMenu(root, { pick, opening = () => {} }) {
+  const btn = root.querySelector("[aria-haspopup]"), menu = root.querySelector('[role="menu"]');
+  const close = () => { menu.hidden = true; btn.setAttribute("aria-expanded", "false"); };
+  const open = () => {
+    opening();
+    menu.hidden = false;
+    btn.setAttribute("aria-expanded", "true");
+    menu.querySelector("button:not(:disabled)")?.focus();
+  };
+  btn.addEventListener("click", () => (menu.hidden ? open() : close()));
+  menu.addEventListener("click", (e) => {
+    const item = e.target.closest("button");
+    if (!item || item.disabled) return;
+    if (!pick(item)) close();
+  });
+  document.addEventListener("pointerdown", (e) => { if (!menu.hidden && !root.contains(e.target)) close(); });
+  menu.addEventListener("keydown", (e) => {
+    const items = [...menu.querySelectorAll('[role="menuitem"]:not(:disabled), [role="radio"]')];
+    const at = items.indexOf(document.activeElement);
+    if (e.key === "Escape") { e.preventDefault(); close(); btn.focus(); }
+    else if (e.key === "ArrowDown" || e.key === "ArrowUp") { e.preventDefault(); items[(at + (e.key === "ArrowDown" ? 1 : items.length - 1)) % items.length]?.focus(); }
+  });
+}
+
+function buildMenu() {
+  wireMenu($("file-menu"), {
+    // each item as able as the control it stands for
+    opening: () => { for (const item of $("file-menu").querySelectorAll("[data-click]")) item.disabled = $(item.dataset.click).disabled || app.dataset.busy === "1"; },
+    pick: (item) => {
+      if (item.dataset.theme) { setTheme(item.dataset.theme); return true; }
+      if (item.dataset.click) $(item.dataset.click).click();
+      if (item.id === "btn-conventions") conventions.open();
+      return false;
+    },
+  });
+  // the export formats beyond .ang and .ctf (each item's own listener does the work)
+  wireMenu($("export-more"), { pick: () => false });
+  setTheme(themeChoice());
+  matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => { if (themeChoice() === "system") setTheme("system"); });
+  conventions = createConventions({
+    dialog: $("conv-dialog"), list: $("conv-list"), lab: $("conv-lab"), pattern: $("conv-pat"), kv: $("conv-kv"), title: $("conv-title"),
+    current: () => {
+      if (!st.ze || app.dataset.scan !== "1") return null;
+      const s = st.ze.scan, g = st.ze.geometry, set = st.ze.settings;
+      const rotated = (180 / Math.PI) * Math.hypot(...g.rot);
+      return {
+        format: s.format, found: st.frameFound, sampleTilt: g.sampleTiltDeg, detectorTilt: g.detectorTiltDeg, pc: g.pc,
+        shape: [s.patH, s.patW], signs: [set.scan_x_sign, set.scan_y_sign],
+        detector: rotated > 0.005 ? `the tilts, then rotated ${rotated.toFixed(2)}° (as the file stores it, or as fitted)` : "sample and detector tilts",
+      };
+    },
+  });
+  $("conv-close").addEventListener("click", () => $("conv-dialog").close());
+  $("conv-dialog").addEventListener("click", (e) => { if (e.target === $("conv-dialog")) $("conv-dialog").close(); });
+}
+
 // ── start ──
 
 async function main() {
   buildGeometry();
-  fields = buildFields(document, applySetting);
+  fields = buildFields(document, applySetting, () => st.scan);
   votes = createVotes({
     geometry: () => st.ze.geometry,
     // the candidate under the cross-hair becomes the pattern centre, to fit again from there
@@ -2327,6 +2497,7 @@ async function main() {
   try { projection = localStorage.getItem("zebsdsolve.projection") || "globe"; } catch { /* private window */ }
   setProjection(projection);
   app.dataset.crystal = "0";
+  buildMenu();
   updateWiring();
   try {
     st.ze = await Zebsdsolve.create({ wasm: new URL("../zebsdsolve/zebsdsolve.wasm", import.meta.url) });
@@ -2344,6 +2515,7 @@ async function main() {
   showSweeps();
   showStage();
   ze.onCompile(({ done: n, total }) => {
+    if (st.gpuLost) return;
     $("compile").hidden = n >= total;
     $("compile").textContent = `compiling shaders ${n}/${total}`;
   });
@@ -2362,9 +2534,10 @@ async function main() {
   if (ze.deviceLost) deviceLost(ze.deviceLost);
   updateEnabled();
   showMaster();
+  showFrame();
   // the example scan is served by the site and by a checkout, not carried in the wheels
   fetch("./presets/nickel/Ni_master_20kV.npz", { method: "HEAD" }).then((r) => { $("btn-example").hidden = !r.ok; }, () => { $("btn-example").hidden = true; });
-  status(st.gpuLost ? gpuLossMessage() : `ready · zebsdsolve ${ze.version}`, !!st.gpuLost);
+  status(`ready · zebsdsolve ${ze.version}`);
   log(`zebsdsolve ${ze.version} on ${ze.adapter}`);
 }
 
@@ -2415,10 +2588,12 @@ function updateWiring() {
   $("tabs").addEventListener("click", (e) => { const b = e.target.closest("button"); if (b) selectTab(b.dataset.tab); });
   $("tabs").addEventListener("keydown", (e) => {
     if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
-    const at = TABS.indexOf($("tabs").querySelector('[aria-selected="true"]').dataset.tab);
-    const next = TABS[(at + (e.key === "ArrowRight" ? 1 : TABS.length - 1)) % TABS.length];
-    selectTab(next);
-    $(`tab-${next}`).focus();
+    const tabs = [...$("tabs").querySelectorAll("button:not(:disabled)")];
+    const at = tabs.findIndex((tab) => tab.getAttribute("aria-selected") === "true");
+    const next = tabs[(at + (e.key === "ArrowRight" ? 1 : tabs.length - 1)) % tabs.length];
+    e.preventDefault();
+    selectTab(next.dataset.tab);
+    next.focus();
   });
   selectTab("data");
   wireSplits();
@@ -2470,9 +2645,15 @@ function updateWiring() {
   $("btn-index").addEventListener("click", runIndex);
   $("btn-tune").addEventListener("click", runTune);
   $("btn-stop").addEventListener("click", () => { st.stop = true; if (st.batchRunning) batch.stop(); else st.ze.cancel(); status("stopping…"); });
-  $("btn-ang").addEventListener("click", () => download(st.scanName.replace(/\.[^.]+$/, "") + ".ang", st.ze.exportText("ang"), "text/plain"));
-  $("btn-ctf").addEventListener("click", () => download(st.scanName.replace(/\.[^.]+$/, "") + ".ctf", st.ze.exportText("ctf"), "text/plain"));
-  $("btn-h5").addEventListener("click", () => busy("exporting HDF5…", async () => download(st.scanName.replace(/\.[^.]+$/, "") + ".h5", await exportH5(st.ze.exportSnapshot()), "application/x-hdf5")));
+  for (const kind of ["ang", "ctf"]) {
+    $(`btn-${kind}`).addEventListener("click", () => {
+      if (st.busy || st.batchRunning) return;
+      download(st.scanName.replace(/\.[^.]+$/, "") + `.${kind}`, st.ze.exportText(kind), "text/plain");
+    });
+  }
+  $("btn-h5").addEventListener("click", () => busy("exporting HDF5…", async () => {
+    download(st.scanName.replace(/\.[^.]+$/, "") + ".h5", await exportH5(st.ze.exportSnapshot()), "application/x-hdf5");
+  }, { cpuExport: true }));
   $("btn-h5oina").addEventListener("click", async () => {
     let warnings = [], saved = false;
     await busy("exporting Oxford HDF5…", async () => {
@@ -2481,8 +2662,13 @@ function updateWiring() {
       for (const warning of warnings) log(`Warning: ${warning}`);
       download(st.scanName.replace(/\.[^.]+$/, "") + ".h5oina", await exportOxford(snapshot, st.sourceFile, snapshot.oxford_frame), "application/x-hdf5");
       saved = true;
-    });
+    }, { cpuExport: true });
     if (saved && warnings.length) status(`H5OINA exported. Warning: ${warnings.join(" ")}`);
+  });
+  $("frame-pick").addEventListener("change", (e) => {
+    if (st.busy || st.batchRunning) return;
+    st.ze.frame = e.target.value === "file" && st.frameFound ? st.frameFound.frame : null;
+    showFrame();
   });
   $("btn-overview").addEventListener("click", () => {
     if (st.overviewCalculating) { invalidateOverview(); updateOverviewControls(); }
@@ -2529,7 +2715,7 @@ function updateWiring() {
   });
   $("cell-link").addEventListener("change", (e) => {
     st.link = e.target.checked;
-    // linked: the master turns to the cell as it is
+    // linked: the master rotates to the cell as it is
     if (st.link && st.cellView.rot) st.masterView.setRotation(st.cellView.rot);
   });
   $("energy-all").addEventListener("click", () => { if (st.simBin !== null) pickSimPart("bin", st.simBin); });
@@ -2601,7 +2787,7 @@ function updateWiring() {
   // Simulate step they step the master's energy bin, elsewhere the selected pattern on the map
   document.addEventListener("keydown", (e) => {
     const d = { ArrowLeft: [0, -1], ArrowRight: [0, 1], ArrowUp: [-1, 0], ArrowDown: [1, 0] }[e.key];
-    if (!d || e.altKey || e.ctrlKey || e.metaKey) return;
+    if (!d || st.batchRunning || e.defaultPrevented || e.altKey || e.ctrlKey || e.metaKey) return;
     const t = e.target;
     if (t.closest && t.closest("input, select, textarea, [contenteditable], #tabs, .pcv-search")) return;
     if (app.dataset.tab === "simulate") {
@@ -2620,8 +2806,7 @@ function updateWiring() {
     if (!st.scan || e.button !== 0) return;
     well.focus({ preventScroll: true });
     const p = mapCellAt(e);
-    if (e.shiftKey || st.roiTool) {
-      if (!gpuAvailable()) return;
+    if (!st.gpuLost && (e.shiftKey || st.roiTool)) {
       if (p) { st.roiDrag = { r0: p.r, c0: p.c, r1: p.r, c1: p.c }; drawMapOverlay(); }
       e.preventDefault();
       return;
@@ -2633,7 +2818,7 @@ function updateWiring() {
   map.addEventListener("mousemove", (e) => {
     if (!st.scan) return;
     const p = mapCellAt(e);
-    $("map-hover").textContent = p ? hoverText(p) : "";
+    $("map-hover").textContent = hoverText(p);
   });
   window.addEventListener("mousemove", (e) => {
     if (!st.scan) return;
@@ -2670,7 +2855,7 @@ function updateWiring() {
     setRoi(whole ? FULL_ROI : { roi_x: x, roi_y: y, roi_w: w, roi_h: h });
     status(whole ? "region of interest: the whole map" : `region of interest: ${w} × ${h} cells from column ${x}, row ${y}`);
   });
-  map.addEventListener("mouseleave", () => { $("map-hover").textContent = ""; });
+  map.addEventListener("mouseleave", () => { $("map-hover").textContent = hoverText(null); });
   // whatever is laid out by hand follows its pane
   new ResizeObserver(() => { if (st.scan) { layoutMap(); drawMapOverlay(); } }).observe(well);
   new ResizeObserver(() => { if (st.scan) { drawPc(); if (st.cmp.mode === "split") drawCompare(); } }).observe($("pats"));
@@ -2697,11 +2882,52 @@ function updateWiring() {
 }
 
 // ── batch queue ──
+const batchLiveMap = createBatchLiveMap($("batch-live-map"), $("batch-live-map-kind"),
+  (error) => log(`Live batch map: ${error.message || error}`, true));
+
+function showBatchView() {
+  const live = st.batchRunning && app.dataset.tab === "index";
+  app.dataset.batchLive = live ? "1" : "0";
+  $("index-interactive").hidden = live;
+  $("batch-live-controls").hidden = !live;
+  $("batch-live-workspace").hidden = !live;
+}
+
+function showBatchProgress(job) {
+  const p = job?.progress;
+  const indexing = job?.status === "indexing";
+  const eta = p?.etaSeconds > 0 ? remainingTime(p.etaSeconds) : "";
+  const fraction = p && Math.min(1, Math.max(0, p.done / Math.max(p.total, 1)));
+  const bar = $("batch-progress"), liveBar = $("batch-live-progress");
+  bar.hidden = !batch.running;
+  for (const el of [bar, liveBar]) {
+    if (p && indexing) el.value = fraction;
+    else el.removeAttribute("value");
+  }
+  liveBar.hidden = !!job && !indexing;
+  const name = job?.sourceFiles[0].name;
+  const state = st.stop ? "Stopping…" : job?.status === "exporting" ? "Saving outputs…" : p && indexing ? "Live indexing" : indexing ? "Opening scan…" : "Preparing batch…";
+  $("batch-live-scan").textContent = name || "Batch indexing";
+  if ($("batch-live-state").textContent !== state) $("batch-live-state").textContent = state;
+  showKv($("batch-live-readout"), p && indexing ? [
+    ...(p.sweeps > 1 ? [["Sweep", `${p.sweep + 1} / ${p.sweeps}`]] : []),
+    ["Indexed", `${p.done.toLocaleString()} / ${p.total.toLocaleString()}`],
+    ["Rate", `${Math.round(p.pps).toLocaleString()} patterns/s`],
+    ...(eta ? [["Left", `~${eta}`]] : []),
+  ] : []);
+  batchLiveMap.showJob(job);
+  if (!job) return "";
+  if (!p || !indexing) return `${name}\n${state}`;
+  return `${name}\nsweep ${p.sweep + 1}/${p.sweeps} · ${p.done.toLocaleString()} / ${p.total.toLocaleString()}\n${p.pps.toFixed(0)} patterns/s${eta ? ` · ~${eta} left` : ""}`;
+}
+
 const batch = new BatchQueue({
   createEngine: () => Zebsdsolve.create({ wasm: new URL("../zebsdsolve/zebsdsolve.wasm", import.meta.url), warm: false }),
   artifacts: batchArtifacts,
+  onScan: (_engine, job) => batchLiveMap.opened(job),
+  onProgress: (engine, job, status) => batchLiveMap.draw(engine, job, status, app.dataset.batchLive === "1" && !document.hidden),
   onDownloadReady: job => startBatchDownload(job),
-  onChange: () => renderBatch(),
+  onChange: (kind) => kind === "progress" ? renderBatchProgress() : renderBatch(),
 });
 
 function startBatchDownload(job) {
@@ -2709,6 +2935,18 @@ function startBatchDownload(job) {
   const link = document.createElement("a"); link.href = job.archive.url; link.download = job.archive.name;
   document.body.append(link);
   try { link.click(); } finally { link.remove(); }
+}
+
+function renderBatchProgress() {
+  const active = batch.jobs.find(job => job.status === "indexing" || job.status === "exporting");
+  const text = showBatchProgress(active ?? null);
+  if (text || batch.error) {
+    $("batch-readout").textContent = text || batch.error;
+    return;
+  }
+  const completed = batch.jobs.filter(job => job.status === "complete").length;
+  const outcome = batch.jobs.some(job => batch.modeFor(job) === "downloads") ? "processed" : "complete";
+  $("batch-readout").textContent = batch.jobs.length ? `${completed} of ${batch.jobs.length} jobs ${outcome}` : "";
 }
 
 function renderBatch() {
@@ -2719,7 +2957,9 @@ function renderBatch() {
   }
   const waiting = batch.jobs.some((job) => ["queued", "export-pending"].includes(job.status));
   $("btn-batch-run").disabled = st.busy || st.batchRunning || st.scanPicking || !waiting;
-  $("btn-batch-stop").disabled = !batch.running;
+  $("btn-batch-view-live").hidden = !st.batchRunning;
+  for (const id of ["btn-batch-stop", "btn-batch-live-stop"]) $(id).disabled = !batch.running || st.stop;
+  $("btn-batch-skip").disabled = !batch.canSkip;
   $("btn-batch-clear").disabled = st.busy || st.batchRunning || st.scanPicking || !batch.jobs.length;
   $("batch-downloads").checked = batch.downloadsEnabled;
   $("batch-downloads").disabled = st.busy || st.batchRunning || st.scanPicking || batch.jobs.some(job => job.folderName && job.status !== "complete");
@@ -2733,18 +2973,8 @@ function renderBatch() {
   const completed = batch.jobs.filter((job) => job.status === "complete").length;
   const outcome = batch.jobs.some(job => batch.modeFor(job) === "downloads") ? "processed" : "complete";
   $("batch-count").textContent = batch.jobs.length ? `${completed} / ${batch.jobs.length} ${outcome}` : "";
-  const active = batch.jobs.find((job) => ["indexing", "exporting"].includes(job.status));
-  const bar = $("batch-progress"); bar.hidden = !batch.running;
-  if (active?.progress && active.status === "indexing") {
-    const p = active.progress;
-    bar.value = Math.min(1, Math.max(0, p.done / Math.max(p.total, 1)));
-    const eta = remainingTime(p.etaSeconds);
-    $("batch-readout").textContent = `${active.sourceFiles[0].name}\nsweep ${p.sweep + 1}/${p.sweeps} · ${p.done.toLocaleString()} / ${p.total.toLocaleString()}\n${p.pps.toFixed(0)} patterns/s${eta ? ` · ~${eta} left` : ""}`;
-  } else if (active) {
-    bar.removeAttribute("value");
-    $("batch-readout").textContent = `${active.sourceFiles[0].name}\n${active.status === "exporting" ? "Saving outputs…" : "Preparing indexing…"}`;
-  } else $("batch-readout").textContent = batch.error || (batch.jobs.length ? `${completed} of ${batch.jobs.length} jobs ${outcome}` : "");
-  const labels = { queued: "Queued", indexing: "Indexing", exporting: "Saving", complete: "Complete", cancelled: "Stopped", failed: "Failed", "export-pending": "Export failed" };
+  renderBatchProgress();
+  const labels = { queued: "Queued", indexing: "Indexing", exporting: "Saving", complete: "Complete", cancelled: "Stopped", skipped: "Skipped", failed: "Failed", "export-pending": "Export failed" };
   const table = $("batch-jobs");
   const previousRows = new Map([...table.children].map(row => [row.dataset.job, row]));
   const rows = batch.jobs.map((job) => {
@@ -2775,7 +3005,7 @@ function renderBatch() {
     }
     button("Output…", () => configureBatchOutput(job), job.status !== "queued" || !!job.folderName);
     button("Load", () => loadBatchJob(job), job.status === "export-pending");
-    if (["failed", "cancelled", "export-pending"].includes(job.status)) button(job.status === "export-pending" ? "Retry export" : "Retry", async () => {
+    if (["failed", "cancelled", "skipped", "export-pending"].includes(job.status)) button(job.status === "export-pending" ? "Retry export" : "Retry", async () => {
       try { batch.retry(job.id); if (job.status === "export-pending") await runBatch(); } catch (e) { status(e.message, true); }
     });
     if (job.status !== "export-pending") button("Remove", () => { try { batch.remove(job.id); if (st.batchEditing === job.id) { st.batchEditing = null; renderBatch(); } } catch (e) { status(e.message, true); } });
@@ -2792,7 +3022,7 @@ async function addBatchJob() {
     await st.ze._queue;
     if (files !== st.sourceFiles || st.busy || st.batchRunning || st.scanPicking) return;
     const spec = { sourceFiles: files, masterFiles: st.phaseFiles.filter((p) => p.on).map((p) => p.file), settings: st.ze.settings, geometry: st.ze.geometry,
-      openHints: st.sourceOpenHints, openGeometry: st.geoOpened, scanInfo: st.scan, phases: st.ze.phases, version: st.ze.version };
+      openHints: st.sourceOpenHints, openGeometry: st.geoOpened, scanInfo: st.scan, phases: st.ze.phases, frame: st.ze.frame, version: st.ze.version };
     const editing = batch.jobs.find(job => job.id === st.batchEditing);
     spec.directory = editing ? batch.directoryFor(editing) : await sourceFolders.find(files[0]).catch(() => null);
     if (files !== st.sourceFiles || st.busy || st.batchRunning || st.scanPicking) return;
@@ -2820,6 +3050,7 @@ async function loadBatchJob(job) {
       st.settings = st.ze.settings; fields.show(st.settings); showGeometry();
       showResolution(); showStage(); showSweeps(); showAngle(); showRoi();
       if (!await rebuildPhases()) return;
+      if (job.frame) st.ze.frame = job.frame;
       st.batchEditing = job.status === "queued" && !job.folderName ? job.id : null;
       selectTab("index");
     } finally { phasesChanged(); updateEnabled(); }
@@ -2944,15 +3175,19 @@ async function runBatch() {
   selectTab("batch");
   // Take ownership before any permission or engine await.
   st.batchRunning = true; app.dataset.batchRunning = "1";
-  for (const b of $("tabs").children) if (b.dataset.tab !== "batch") b.disabled = true;
+  st.stop = false;
+  for (const b of $("tabs").children) b.disabled = b.dataset.tab !== "batch" && b.dataset.tab !== "index";
   let launchError = null, launched = false;
   renderBatch();
   try {
     if (!await prepareBatchFolders()) { status("Batch not started"); return; }
     launched = true;
+    selectTab("index");
+    $("tab-index").focus();
     await busy("batch indexing…", async () => {
       try {
-        invalidateOverview(); ++st.showRun; ++st.masterRun;
+        ++st.showRun;
+        ++st.masterRun;
         await st.ze._queue;
         if (!st.stop) await batch.run();
       } catch (e) { launchError = e; throw e; }
@@ -2961,6 +3196,7 @@ async function runBatch() {
   finally {
     st.batchRunning = false; app.dataset.batchRunning = "0";
     for (const b of $("tabs").children) b.disabled = false;
+    showBatchView();
     renderBatch();
     if (launchError) status(String(launchError.message || launchError), true);
     else if (!launched) status("Batch not started");
@@ -2981,7 +3217,16 @@ function wireBatch() {
   $("btn-batch-setup").addEventListener("click", setupBatchFolders);
   $("btn-batch-folder").addEventListener("click", chooseBatchFolder);
   $("btn-batch-run").addEventListener("click", runBatch);
-  $("btn-batch-stop").addEventListener("click", () => batch.stop());
+  $("btn-batch-view-live").addEventListener("click", () => {
+    selectTab("index");
+    $("tab-index").focus();
+  });
+  $("btn-batch-skip").addEventListener("click", () => batch.skip());
+  for (const id of ["btn-batch-stop", "btn-batch-live-stop"]) $(id).addEventListener("click", () => {
+    st.stop = true;
+    batch.stop();
+    status("stopping…");
+  });
   $("btn-batch-new").addEventListener("click", () => { if (st.busy || st.batchRunning || st.scanPicking) return; st.batchEditing = null; renderBatch(); });
   $("btn-batch-clear").addEventListener("click", async () => {
     if (st.busy || st.batchRunning || st.scanPicking) return;
