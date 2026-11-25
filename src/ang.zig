@@ -1,4 +1,6 @@
-//! ANG scalar/grid and producer-specific pattern-centre companion for UP patterns.
+//! Standard EDAX ANG scalar/grid companion for UP patterns, with the orientations and phases its
+//! maker stored (read as written: which frame they are in is convention.identify's to find).
+//! The header may also name the scalar columns and the pattern-centre convention.
 //! Positions and steps are micrometres. Validate x-fast/y-next acquisition order relative
 //! to the first position; engine geometry remains scan-local, with no origin fit or reorder.
 const std = @import("std");
@@ -11,6 +13,10 @@ pub const Metadata = struct {
     step_x_um: f64,
     step_y_um: f64,
     iq: []f32,
+    /// Bunge angles (radians, 3 per cell) and the phase column as written; −1 where the cell
+    /// carries ANG's not-indexed angles (4π)
+    euler: []f64,
+    phase: []i32,
     pc: ?[3]f64,
     pc_note: []const u8,
 };
@@ -228,6 +234,10 @@ pub fn load(gpa: Allocator, file: *File, expected_count: u64, up_steps: ?[2]f64,
     defer if (units) |v| gpa.free(v);
     var iq: []f32 = &.{};
     errdefer gpa.free(iq);
+    var euler: []f64 = &.{};
+    errdefer gpa.free(euler);
+    var phase: []i32 = &.{};
+    errdefer gpa.free(phase);
     var count: usize = 0;
     var x0: f64 = 0;
     var y0: f64 = 0;
@@ -313,19 +323,27 @@ pub fn load(gpa: Allocator, file: *File, expected_count: u64, up_steps: ?[2]f64,
                 if (found != 2) return error.UnsupportedANGUnits;
             }
             iq = try gpa.alloc(f32, @intCast(expected_count));
+            euler = try gpa.alloc(f64, @intCast(3 * expected_count));
+            phase = try gpa.alloc(i32, @intCast(expected_count));
         }
         if (count >= iq.len) return error.ANGPatternCountMismatch;
-        // Legacy ANG: phi1 Phi phi2 x y IQ CI phase [SEM fit ...]. Only x/y/IQ
-        // are scalar inputs; Euler angles and phase columns are left unread.
+        // Legacy ANG: phi1 Phi phi2 x y IQ CI phase [SEM fit ...]. x, y and IQ are the scan's;
+        // the angles and the phase are kept as written.
         var values = std.mem.tokenizeAny(u8, line, " \t");
         var k: usize = 0;
         var x: f64 = std.math.nan(f64);
         var y = x;
         var quality = x;
+        var angles: [3]f64 = @splat(std.math.nan(f64));
+        var label: i32 = -1;
         while (values.next()) |v| : (k += 1) {
             if (k == xcol or k == ycol or k == iqcol) {
                 const n = std.fmt.parseFloat(f64, v) catch return error.InvalidANGRecord;
                 if (k == xcol) x = n else if (k == ycol) y = n else quality = n;
+            } else if (k < 3) {
+                angles[k] = std.fmt.parseFloat(f64, v) catch std.math.nan(f64);
+            } else if (k == 7) {
+                label = std.fmt.parseInt(i32, v, 10) catch -1;
             }
         }
         if (k < 8 or k <= @max(xcol, @max(ycol, iqcol))) return error.InvalidANGRecord;
@@ -344,9 +362,14 @@ pub fn load(gpa: Allocator, file: *File, expected_count: u64, up_steps: ?[2]f64,
             checkCoordinate(y, y0 + uy, y0, uy, steps[1]) catch return error.UPANGStepMismatch;
         }
         iq[count] = if (std.math.isFinite(quality) and @abs(quality) <= std.math.floatMax(f32)) @floatCast(quality) else std.math.nan(f32);
+        euler[3 * count ..][0..3].* = angles;
+        // (4π: ANG's angles for a cell not indexed)
+        var indexed = label >= 0;
+        for (angles) |a| indexed = indexed and std.math.isFinite(a) and a < 2 * std.math.pi + 0.01;
+        phase[count] = if (indexed) label else -1;
         count += 1;
     }
     if (count != expected_count or count == 0) return error.ANGPatternCountMismatch;
     const pc = try pc_header.resolve(pattern_width, pattern_height);
-    return .{ .rows = rows, .cols = odd, .step_x_um = dx, .step_y_um = dy, .iq = iq, .pc = pc.value, .pc_note = pc.note };
+    return .{ .rows = rows, .cols = odd, .step_x_um = dx, .step_y_um = dy, .iq = iq, .euler = euler, .phase = phase, .pc = pc.value, .pc_note = pc.note };
 }

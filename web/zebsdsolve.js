@@ -27,7 +27,7 @@ const utf8enc = new TextEncoder();
 // each. The adapter remembers (in localStorage) which pipelines this origin created, and at
 // the next load starts compiling all of them in parallel while the page sets up, so the first
 // fit or indexing step finds them ready. The list belongs to one build of zebsdsolve.wasm (its
-// fingerprint), so a new build starts a new list. `warm: false` in Zebsdsolve.create turns this off.
+// fingerprint), so a new build starts a new list. `warm: false` in Zebsdsolve.create switches this off.
 // A first visit starts from a list shipped with the site (`pipelines.json` beside the wasm,
 // recorded by tests/test_web.mjs --save-pipelines) when it belongs to the same build.
 // sphereView's projections, in the engine's order (sphereview.zig Projection)
@@ -119,14 +119,12 @@ function gpuImports(state) {
   };
 
   // ── operations, issued directly (or replayed from the backlog) ──
-  // indirect: [buffer, byte offset] of the workgroup counts (3 × u32) instead of x, y, z
-  const doDispatch = (p, x, y, z, entries, indirect) => {
-    if (!p.pipeline) return; // failed to compile: reported through takeError
+  const doDispatch = (p, x, y, z, entries) => {
+    if (state.deviceLoss || !p.pipeline) return; // compile failures are reported through takeError
     if (!pass) pass = encoder().beginComputePass();
     pass.setPipeline(p.pipeline);
     pass.setBindGroup(0, device.createBindGroup({ layout: p.layout, entries }));
-    if (indirect) pass.dispatchWorkgroupsIndirect(indirect[0], indirect[1]);
-    else pass.dispatchWorkgroups(Math.max(1, x), Math.max(1, y), Math.max(1, z));
+    pass.dispatchWorkgroups(Math.max(1, x), Math.max(1, y), Math.max(1, z));
   };
   const bindEntries = (bindsPtr, n) => {
     const v = new DataView(mem(), bindsPtr, n * 24);
@@ -141,10 +139,14 @@ function gpuImports(state) {
     return entries;
   };
   const doSubmit = () => {
-    endPass();
-    if (enc) { st.submits++; device.queue.submit([enc.finish()]); enc = null; }
+    if (!state.deviceLoss) {
+      endPass();
+      if (enc) { st.submits++; device.queue.submit([enc.finish()]); }
+    }
+    pass = enc = null;
     for (const b of recorded) b.destroy();
     recorded = [];
+    if (state.deviceLoss) return;
     for (const r of state.reads) {
       if (r.promise || !r.issued) continue;
       r.promise = (async () => {
@@ -158,7 +160,7 @@ function gpuImports(state) {
           try { if (mapped) r.staging.unmap(); } finally { r.staging.destroy(); }
         }
       })();
-      // A submit may precede wait while the host reads the next batch's file ranges.
+      // A rejection can arrive while wasm is suspended on the next batch's file read.
       r.promise.catch(() => {});
     }
   };
@@ -189,7 +191,7 @@ function gpuImports(state) {
   // compile: their errors stay inside this error scope (not reported against a later call) and
   // they leave the list.
   const w = state.warm;
-  if (w?.saved) {
+  if (w?.saved && !state.deviceLoss) {
     w.list = w.saved.list.slice();
     device.pushErrorScope("validation");
     for (const [h, entry] of w.saved.list) {
@@ -227,7 +229,7 @@ function gpuImports(state) {
     createBuffer(size, usage) {
       const u = usage === 1
         ? GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
-        : GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST | GPUBufferUsage.INDIRECT;
+        : GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST;
       const b = device.createBuffer({ size, usage: u });
       const id = freeIds.length ? freeIds.pop() : bufs.length;
       bufs[id] = b;
@@ -241,8 +243,12 @@ function gpuImports(state) {
       if (backlog) defer(() => doDestroy(b)); else doDestroy(b);
     },
     writeBuffer(id, offset, ptr, len) {
+      if (state.deviceLoss) return;
       const b = bufs[id];
-      if (backlog) { const data = bytes(ptr, len).slice(); defer(() => device.queue.writeBuffer(b, offset, data)); }
+      if (backlog) {
+        const data = bytes(ptr, len).slice();
+        defer(() => { if (!state.deviceLoss) device.queue.writeBuffer(b, offset, data); });
+      }
       else device.queue.writeBuffer(b, offset, mem(), ptr, len);
     },
     // Starts compiling and returns at once; the first dispatch that needs it holds the queue
@@ -280,42 +286,38 @@ function gpuImports(state) {
       if (backlog || !p.ready) defer(() => doDispatch(p, x, y, z, entries));
       else doDispatch(p, x, y, z, entries);
     },
-    dispatchIndirect(pipe, buf, offset, bindsPtr, n) {
-      st.dispatches++;
-      const p = pipes[pipe];
-      const entries = bindEntries(bindsPtr, n);
-      const ind = [bufs[buf], offset];
-      if (!p.ready) blocking.add(p);
-      if (backlog || !p.ready) defer(() => doDispatch(p, 0, 0, 0, entries, ind));
-      else doDispatch(p, 0, 0, 0, entries, ind);
-    },
     clearBuffer(id, offset, size) {
       const b = bufs[id];
-      const op = () => { endPass(); encoder().clearBuffer(b, offset, size); };
+      const op = () => { if (!state.deviceLoss) { endPass(); encoder().clearBuffer(b, offset, size); } };
       if (backlog) defer(op); else op();
     },
     copyBuffer(src, soff, dst, doff, size) {
       const a = bufs[src];
       const b = bufs[dst];
-      const op = () => { endPass(); encoder().copyBufferToBuffer(a, soff, b, doff, size); };
+      const op = () => { if (!state.deviceLoss) { endPass(); encoder().copyBufferToBuffer(a, soff, b, doff, size); } };
       if (backlog) defer(op); else op();
     },
-    readBuffer(src, offset, size, dst) {
+    readBuffer(src, offset, size, dst, seq) {
+      if (state.deviceLoss) return;
       st.reads++;
       const a = bufs[src];
       const padded = Math.ceil(size / 4) * 4;
       const staging = device.createBuffer({ size: padded, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
-      const r = { staging, size, dst, promise: null, issued: false };
+      const r = { staging, size, dst, seq, promise: null, issued: false };
       state.reads.push(r);
-      const op = () => { endPass(); encoder().copyBufferToBuffer(a, offset, staging, 0, padded); r.issued = true; };
+      const op = () => {
+        if (state.deviceLoss) return;
+        endPass();
+        encoder().copyBufferToBuffer(a, offset, staging, 0, padded);
+        r.issued = true;
+      };
       if (backlog) defer(op); else op();
     },
     submit() {
       if (backlog) defer(doSubmit); else doSubmit();
     },
     takeError(ptr, cap) {
-      // Fatal GPU diagnostics are retained separately. Residual asynchronous adapter errors
-      // must not turn a successful CPU-only results/export call into another GPU failure.
+      // Late adapter errors belong to the failed GPU operation. CPU exports can still succeed.
       if (state.deviceLoss) { state.errors.length = 0; return 0; }
       if (!state.errors.length) return 0;
       const b = utf8enc.encode(state.errors.shift()).subarray(0, cap);
@@ -323,20 +325,25 @@ function gpuImports(state) {
       return b.length;
     },
     // Suspending import (JS Promise Integration): the module's stack waits here while pipelines
-    // still compiling and the submitted reads resolve, then resumes as if the call had blocked.
-    wait: new WebAssembly.Suspending(async () => {
+    // still compiling and the submitted reads numbered up to `upto` (all of them: −1) resolve,
+    // then resumes as if the call had blocked. Later reads stay pending (the next batch, in
+    // flight while this one is taken).
+    wait: new WebAssembly.Suspending(async (upto) => {
       const t0 = performance.now();
       st.waits++;
       try {
         if (drained) { await drained.promise; st.compileWaitMs += performance.now() - t0; }
-        const reads = state.reads;
-        state.reads = [];
-        // Never unwind the native stack (and free its destinations) while another mapping
-        // can still copy into wasm memory, even when an earlier mapping has failed.
-        const settled = await Promise.allSettled(reads.map((r) => r.promise));
+        const k = upto < 0 ? state.reads.length : state.reads.findLastIndex((r) => r.seq <= upto) + 1;
+        const reads = state.reads.slice(0, k);
+        state.reads = state.reads.slice(k);
+        // Keep wasm's destinations alive until every mapping settles, even if one fails.
+        const settled = await Promise.allSettled(reads.map((r) => {
+          if (!r.promise) r.staging.destroy();
+          return r.promise;
+        }));
         const failed = settled.find((r) => r.status === "rejected");
         if (failed) throw failed.reason;
-        return 0;
+        return state.deviceLoss ? 1 : 0;
       } catch (e) { state.errors.push(String(e)); return 1; } finally { st.waitMs += performance.now() - t0; }
     }),
   };
@@ -407,16 +414,16 @@ function ioImports(state) {
 const SYNC_EXPORTS = new Set(["ze_alloc", "ze_free", "ze_version", "ze_create", "ze_destroy", "ze_adapter", "ze_error",
   "ze_has_acquisition_calibration", "ze_configure", "ze_settings", "ze_events", "ze_cancel", "ze_close_scan", "ze_scan_info", "ze_scan_format", "ze_scan_overview_kind",
   "ze_get_geometry", "ze_set_geometry", "ze_clear_phases", "ze_phase_count", "ze_phase_info", "ze_pattern_shape", "ze_nlpar_view",
-  "ze_pc_scores", "ze_fit_patterns", "ze_results", "ze_map", "ze_ipf_key", "ze_export", "ze_export_snapshot", "ze_export_oxford_snapshot", "ze_result_checkpoint", "ze_restore_result_checkpoint", "ze_result_chance", "ze_bunge", "ze_reduce", "ze_disorientation", "ze_shader",
-  "ze_index_status", "ze_tune_begin", "ze_tune_report", "ze_pixel_angle", "ze_lattice", "ze_sweep", "ze_pc_level_count", "ze_pc_level", "ze_pc_level_ballots",
+  "ze_pc_scores", "ze_fit_patterns", "ze_results", "ze_map", "ze_ipf_key", "ze_export", "ze_frame", "ze_set_frame", "ze_export_snapshot", "ze_export_oxford_snapshot", "ze_result_checkpoint", "ze_restore_result_checkpoint", "ze_result_chance", "ze_bunge", "ze_reduce", "ze_disorientation", "ze_shader",
+  "ze_index_status", "ze_tune_begin", "ze_tune_report", "ze_pixel_angle", "ze_lattice", "ze_sweep", "ze_pc_level_count", "ze_pc_level", "ze_pc_level_scores", "ze_pc_level_ballots",
   "ze_gpu_counts", "ze_profile", "ze_profile_report", "ze_compile_wgsl", "ze_plane_points",
   "ze_sim_read_cif", "ze_sim_set_crystal", "ze_sim_edit_crystal", "ze_sim_crystal", "ze_sim_sheets", "ze_sim_add_phase", "ze_sim_npz",
   "ze_cell_info", "ze_sim_energy"]);
 
 // Struct layouts (src/engine.zig, geometry.zig, pcfit.zig, planefit.zig): [name, type, byte offset].
 const SCAN = [["rows", "u32", 0], ["cols", "u32", 4], ["patH", "u32", 8], ["patW", "u32", 12], ["pixel", "u32", 16],
-  ["hasBackground", "bool", 20], ["hasPc", "bool", 24], ["formatId", "u32", 28], ["voltageKv", "f64", 32], ["bytes", "f64", 40], ["hasPx", "bool", 48], ["geometryFrame", "u32", 52]];
-const SCAN_SIZE = 56;
+  ["hasBackground", "bool", 20], ["hasPc", "bool", 24], ["formatId", "u32", 28], ["voltageKv", "f64", 32], ["bytes", "f64", 40], ["hasPx", "bool", 48], ["patternKinds", "u32", 52], ["geometryFrame", "u32", 56]];
+const SCAN_SIZE = 64;
 const PHASE = [["side", "u32", 0], ["pointGroup", "u32", 4], ["spaceGroup", "u32", 8], ["laueId", "u32", 12],
   ["nFold", "u32", 16], ["mirror", "bool", 20], ["inversion", "bool", 24], ["voltageKv", "f64", 32]];
 const PHASE_SIZE = 104;
@@ -764,6 +771,9 @@ export class Zebsdsolve {
     });
     s.format = this._text((p, cap) => this.x.ze_scan_format(this.e, p, cap), 64);
     s.dtype = ["uint8", "uint16", "float32"][s.pixel];
+    // (the kinds of patterns the file stores side by side, and whether those read are the unprocessed)
+    s.storedKinds = ["processed", "unprocessed"].filter((_, i) => s.patternKinds & (1 << i));
+    s.unprocessed = !!(s.patternKinds & 4);
     return s;
   }
 
@@ -1129,10 +1139,10 @@ export class Zebsdsolve {
     return this._frame((f) => {
       const out = [];
       const count = this.x.ze_pc_level_count(this.e);
-      const nPat = Math.max(1, this.x.ze_fit_patterns(this.e, 0, 0, 0, 0, 0));
       const sp = f.alloc(12), ip = f.alloc(8);
       for (let i = 0; i < count; i++) {
         const n = this.x.ze_pc_level(this.e, i, sp, ip, 0, 0, 0, 0, 0, 0, 0);
+        const nPat = this.x.ze_pc_level_scores(this.e, i, 0, 0) / n;
         const [nz, ny, nx] = new Uint32Array(this.mem, sp, 3);
         const ap = f.alloc((nx + ny + nz) * 8), cp = f.alloc(n * 4), bp = f.alloc(nPat * 4), np = f.alloc(nPat * 4);
         this.x.ze_pc_level(this.e, i, sp, ip, ap, nx + ny + nz, cp, n, bp, np, nPat);
@@ -1159,7 +1169,7 @@ export class Zebsdsolve {
    * takes the plane (its `planeKind`, `plane`: 4 × 3 row-major, plane · (column, row, 1) = w · (PCx, PCy, PCz, 1)), and
    * the scan's steps and the pixel size then say nothing of where the beam stood. Resolves to { plane, kind
    * (PLANE_KINDS), frame (0 nominal, 1 following the plane), pc, pcSe, rot, saidRot and saidRotSe (the sample's frame
-   * by the plane against the nominal one: swing, tilt, the scan's turn in its plane; radians), step and stepSe (the
+   * by the plane against the nominal one: azimuthal, tilt, the scan rotation; radians), step and stepSe (the
    * beam's travel for a row and a column against what the steps and pixel size say), skew, skewSe, rmsd (PCx, PCy,
    * PCz), ncc, startNcc, nPatterns, nUsed, iterations, blocks }.
    */
@@ -1259,7 +1269,7 @@ export class Zebsdsolve {
     });
   }
 
-  /** Index the next batch of the sweep in progress: the status, with `left` cells still to visit (0: done). */
+  /** Index the next few batches of the sweep in progress: the status, with `left` cells still to visit (0: done). */
   indexStep() {
     return this._serial(async () => {
       const left = this._check(await this.x.ze_index_step(this.e), "index");
@@ -1267,7 +1277,7 @@ export class Zebsdsolve {
     });
   }
 
-  /** Index the region, calling progress(status) after each batch (return false to stop). */
+  /** Index the region, calling progress(status) after each step (a few batches; return false to stop). */
   async index(progress = null) {
     await this.indexBegin();
     for (;;) {
@@ -1363,8 +1373,8 @@ export class Zebsdsolve {
     });
   }
 
-  /** The key to a phase's inverse pole figure colours, as the settings have them (ipf_colors,
-   *  ipf_lightness, ipf_gray): { rgba (size × size × 4, for an ImageData), size, box, wedge }.
+  /** The key to a phase's inverse pole figure colours, as the settings have them (ipf_colors):
+   *  { rgba (size × size × 4, for an ImageData), size, box, wedge }.
    *  The crystal directions that stand for all the others, in stereographic projection with the
    *  crystal's x to the right ([001] at the origin), transparent outside them; `box` is their
    *  bounding box in the projection [x0, y0, x1, y1], drawn from the image's lower left corner at
@@ -1435,6 +1445,60 @@ export class Zebsdsolve {
       const p = f.alloc(n);
       this._check(this.x.ze_export_snapshot(this.e, frame, p, n), "export snapshot");
       return JSON.parse(utf8.decode(new Uint8Array(this.mem, p, n)));
+    });
+  }
+
+  /** The results as an Oxford .h5oina made from the acquisition the scan was opened from
+   *  (python: Solver.export): its header and maps copied, not its patterns; its indexing
+   *  replaced by these results, in the convention found from its own orientations. Resolves to
+   *  a Uint8Array. */
+  exportH5oina() {
+    return this._serial(() => this._frame(async (f) => {
+      const n = this._check(await this.x.ze_export_h5oina(this.e, 0, 0), "export");
+      const p = f.alloc(n);
+      this._check(await this.x.ze_export_h5oina(this.e, p, n), "export");
+      return new Uint8Array(this.mem, p, n).slice();
+    }));
+  }
+
+  /** The reference frame convention a maker's orientations are in, found against the results:
+   *  from `euler` (Bunge, radians, 3 per map cell) and `phase` (a label per cell, negative: not
+   *  indexed), or with neither the scan file's own. Resolves to { frame, cells, within,
+   *  median_deg, runner_up_deg, matched, installed, misorientation, misorientation_rows,
+   *  misorientation_cols, misorientation_cells } (python: Solver.identify_frame); the exports
+   *  take the convention when it was told clearly. The misorientation left (a rotation vector,
+   *  radians, about the engine's sample axes, and how it changes over the rows and the columns)
+   *  is reported, never applied. */
+  identifyFrame(euler = null, phase = null) {
+    return this._serial(() => this._frame(async (f) => {
+      const cap = 8192, out = f.alloc(cap);
+      let ep = 0, pp = 0, n = 0;
+      if (euler) {
+        n = phase.length;
+        ep = f.alloc(n * 24);
+        new Float64Array(this.mem, ep, 3 * n).set(euler);
+        pp = f.alloc(n * 4);
+        new Int32Array(this.mem, pp, n).set(phase);
+      }
+      const len = this._check(await this.x.ze_identify_frame(this.e, ep, pp, BigInt(n), out, cap), "identify frame");
+      return JSON.parse(utf8.decode(new Uint8Array(this.mem, out, len)));
+    }));
+  }
+
+  /** The convention the exports write orientations in: { axes, active, crystal, text }
+   *  (python: Solver.frame); the engine's own (kikuchipy's) until identified or set. */
+  get frame() {
+    return this._frame((f) => {
+      const p = f.alloc(1024), n = this.x.ze_frame(this.e, p, 1024);
+      return JSON.parse(utf8.decode(new Uint8Array(this.mem, p, n)));
+    });
+  }
+
+  /** Set it: { axes, active, crystal }, or null for the engine's own. */
+  set frame(value) {
+    this._frame((f) => {
+      const [p, n] = value ? f.str(JSON.stringify({ axes: value.axes, active: value.active, crystal: value.crystal })) : [0, 0];
+      this._check(this.x.ze_set_frame(this.e, p, n), "set frame");
     });
   }
 

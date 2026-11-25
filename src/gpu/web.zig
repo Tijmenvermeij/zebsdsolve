@@ -16,14 +16,14 @@ const js = struct {
     extern "zegpu" fn writeBuffer(id: u32, offset: f64, ptr: [*]const u8, len: usize) void;
     extern "zegpu" fn createPipeline(code: [*]const u8, code_len: usize, entry: [*]const u8, entry_len: usize) u32;
     extern "zegpu" fn dispatch(pipe: u32, x: u32, y: u32, z: u32, binds: [*]const api.Bind, n: usize) void;
-    extern "zegpu" fn dispatchIndirect(pipe: u32, buf: u32, offset: f64, binds: [*]const api.Bind, n: usize) void;
     extern "zegpu" fn clearBuffer(id: u32, offset: f64, size: f64) void;
     extern "zegpu" fn copyBuffer(src: u32, soff: f64, dst: u32, doff: f64, size: f64) void;
-    extern "zegpu" fn readBuffer(src: u32, offset: f64, size: f64, dst: [*]u8) void;
+    extern "zegpu" fn readBuffer(src: u32, offset: f64, size: f64, dst: [*]u8, seq: f64) void;
     extern "zegpu" fn submit() void;
     extern "zegpu" fn takeError(buf: [*]u8, cap: usize) usize;
-    /// suspends until every read requested so far has landed; 0 ok, else a failure code
-    extern "zegpu" fn wait() i32;
+    /// suspends until the reads requested so far numbered up to `upto` (every one: −1) have
+    /// landed; 0 ok, else a failure code
+    extern "zegpu" fn wait(upto: f64) i32;
 };
 
 pub const Device = struct {
@@ -80,12 +80,6 @@ pub const Device = struct {
         js.dispatch(pipe, x, y, z, binds.ptr, binds.len);
     }
 
-    /// A dispatch whose workgroup counts (3 × u32) the GPU reads from `buf` at byte `offset`.
-    pub fn dispatchIndirect(self: *Device, pipe: u32, buf: u32, offset: u64, binds: []const api.Bind) void {
-        _ = self;
-        js.dispatchIndirect(pipe, buf, @floatFromInt(offset), binds.ptr, binds.len);
-    }
-
     pub fn clearBuffer(self: *Device, id: u32, offset: u64, size: u64) void {
         _ = self;
         js.clearBuffer(id, @floatFromInt(offset), @floatFromInt(size));
@@ -96,9 +90,9 @@ pub const Device = struct {
         js.copyBuffer(src, @floatFromInt(soff), dst, @floatFromInt(doff), @floatFromInt(size));
     }
 
-    pub fn readBuffer(self: *Device, src: u32, off: u64, size: u64, dst: [*]u8) void {
+    pub fn readBuffer(self: *Device, src: u32, off: u64, size: u64, dst: [*]u8, seq: u64) void {
         _ = self;
-        js.readBuffer(src, @floatFromInt(off), @floatFromInt(size), dst);
+        js.readBuffer(src, @floatFromInt(off), @floatFromInt(size), dst, @floatFromInt(seq));
     }
 
     pub fn submit(self: *Device) void {
@@ -124,6 +118,14 @@ pub const Device = struct {
     pub fn wait(self: *Device) !void {
         _ = self;
         js.submit();
-        if (js.wait() != 0) return error.ReadFailed;
+        if (js.wait(-1) != 0) return error.ReadFailed;
+    }
+
+    /// Submit and block (suspend) until the reads numbered up to `seq` have been copied into
+    /// memory; later ones may still be in flight.
+    pub fn waitUpTo(self: *Device, seq: u64) !void {
+        _ = self;
+        js.submit();
+        if (js.wait(@floatFromInt(seq)) != 0) return error.ReadFailed;
     }
 };

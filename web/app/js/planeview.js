@@ -47,6 +47,14 @@ const ball = (x, y, z) => {
     enc(-0.0041960863 * l - 0.7034186147 * m + 1.707614701 * s)];
 };
 
+
+/** The first of `texts` (longest first) that fits in `room` pixels, drawn at (x, y) as the
+ *  context's alignment has it; none when none fits. */
+function fitText(ctx, texts, x, y, room) {
+  const t = texts.find((s) => ctx.measureText(s).width <= room);
+  if (t) ctx.fillText(t, x, y);
+}
+
 export function createPlaneView() {
   const view = { r: null, pts: null, scan: null, mode: "trends" };
 
@@ -128,7 +136,8 @@ export function createPlaneView() {
       ctx.drawImage(tmp, x0, y0, pw, ph);
       ctx.textBaseline = "alphabetic";
       ctx.fillStyle = "#e6e6e8"; ctx.textAlign = "left"; ctx.fillText(titles[p], x0, y0 - 7);
-      ctx.fillStyle = "#9d9da4"; ctx.textAlign = "right"; ctx.fillText(`gray: ${grays[p]} · rim ${sc.toFixed(4)}`, x0 + pw, y0 - 7);
+      ctx.fillStyle = "#9d9da4"; ctx.textAlign = "right";
+      fitText(ctx, [`gray: ${grays[p]} · rim ${sc.toFixed(4)}`, `rim ${sc.toFixed(4)}`], x0 + pw, y0 - 7, pw - ctx.measureText(titles[p]).width - 10);
     }
     if (below) key(ctx, padX, padT + ph + 16, W - 2 * padX, keyH - 16, true);
     else key(ctx, padX + 3 * pw + 3 * gap, padT, keyW - gap, ph, false);
@@ -256,9 +265,12 @@ export function createPlaneView() {
     const change = line(span - 1) - line(0);
     ctx.textBaseline = "alphabetic";
     ctx.fillStyle = "#e6e6e8"; ctx.textAlign = "left";
-    ctx.fillText(`${NAME[k]} along the ${dir === 0 ? "rows" : "columns"}`, x0, y0 - 6);
+    const title = `${NAME[k]} along the ${dir === 0 ? "rows" : "columns"}`;
+    ctx.fillText(title, x0, y0 - 6);
     ctx.fillStyle = "#9d9da4"; ctx.textAlign = "right";
-    ctx.fillText(`${change >= 0 ? "+" : "−"}${Math.abs(change).toFixed(4)} over the map · ±${sd.toFixed(4)}`, x0 + w, y0 - 6);
+    // the change over the map and the scatter, shortened to the room beside the title
+    const ch = `${change >= 0 ? "+" : "−"}${Math.abs(change).toFixed(4)}`;
+    fitText(ctx, [`${ch} over the map · ±${sd.toFixed(4)}`, `${ch} · ±${sd.toFixed(4)}`, ch], x0 + w, y0 - 6, w - ctx.measureText(title).width - 10);
     ctx.textBaseline = "middle";
     ctx.fillText(hi.toFixed(4), x0 - 4, y0 + 6); ctx.fillText(lo.toFixed(4), x0 - 4, y0 + h - 6);
     ctx.textAlign = "center";
@@ -288,12 +300,16 @@ export function createPlaneView() {
     // (a fit pattern stands for the cells about it: a square as wide as the lattice's stride)
     const stride = Math.max(1, Math.round(Math.sqrt((rows * cols) / Math.max(n, 1))));
     const wd = Math.max(1, cell * stride);
+    // (the squares at the edges kept to the map)
+    ctx.save();
+    ctx.beginPath(); ctx.rect(ox, oy, cell * cols, cell * rows); ctx.clip();
     for (let b = 0; b < n; b++) {
       const r = Math.floor(pts.cells[b] / cols), c = pts.cells[b] % cols;
       const rgb = pts.used[b] ? viridis(Math.min(1, far[b] / top)) : [212, 97, 95];
       ctx.fillStyle = `rgb(${rgb[0]},${rgb[1]},${rgb[2]})`;
       ctx.fillRect(ox + c * cell - (wd - cell) / 2, oy + r * cell - (wd - cell) / 2, wd, wd);
     }
+    ctx.restore();
     ctx.strokeStyle = "#2b2b30"; ctx.lineWidth = 1; ctx.strokeRect(x0 + 0.5, y0 + 0.5, w - 1, h - 1);
     // the scale, under the map: viridis from 0 to the 95th percentile of the patterns' distances
     const by = Math.min(y0 + h - 22, oy + cell * rows + 14), bw = Math.min(w - 24, 180), bx = x0 + (w - bw) / 2;

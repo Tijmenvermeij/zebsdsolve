@@ -6,14 +6,202 @@ notes.
 
 ## Unreleased
 
+## 0.2.6 — 2026-11-25
+
+0.2.5 once more: 0.2.5 reached PyPI, but GitHub failed its release (an upload answered HTTP 500)
+and its site's deployment, so it has neither. Nothing else changed.
+
 ### Fixed
 
+- In the app: indexing's rate read as little as a sixteenth of what it was. Since 0.2.4 a step
+  indexes several batches, and the readout counted one; it now counts what each step indexed.
+- In the app: the map redrawn during indexing held the device up a quarter of the time on a
+  large scan (750 × 750 patterns of 80 × 80: 16.2 s, now 12.1 s, 46 000 patterns a second in
+  Chrome on an RTX 5070, where the native library takes 9.4 s). It still follows indexing,
+  every 250 ms, or less often where drawing it would take more than a twentieth of the time.
+
+## 0.2.4 — 2026-11-24
+
+### Changed
+
+- **Indexing is 2.5 to 2.8 times as fast.** Sustained, after a warm-up, with CLAHE on, on an
+  RTX 5070: 65 200 patterns a second of 60 × 60 (from 23 000) and 18 300 of 240 × 320 (from
+  7 400). The orientations are those of 0.2.3 to within 0.024°, their medians from the answers
+  on `scripts/bench.py` within its noise, and the geometry fits are faster too. Nothing
+  is tuned to one GPU; every kernel stays within WebGPU's default limits and binds at most six
+  storage buffers. Where the time went:
+  - The correlation's spectrum transforms two orders m′ at once (one even in k, one odd: the
+    halves of one complex FFT), each workgroup sums for two patterns and four orders m that
+    share the tables' rows, and its accumulators are named variables rather than an array
+    (which the compiler had kept in memory): 62 ms to 23 ms on 4096 patterns of 60 × 60.
+  - The transforms along c and a and the search for the peak run on an (item, b) slab in a
+    workgroup's memory (`a_peak_m`), where the spectrum went to memory three times more: 67 ms
+    to 16 ms. The FFT runs its radix-2 stages in pairs and keeps its points apart in the memory's
+    banks.
+  - Patterns go onto the sphere without the grid being stored: the window's sums, then each
+    ring with its mirror in the equator as one complex FFT, of which only the orders below the
+    bandwidth are kept (`sphere.wgsl` rings): 12.5 ms to 5.8 ms.
+  - The dynamic background's blur takes four pixels an invocation, from a table of its weights:
+    3.9 ms to 1.7 ms, the same result.
+  - Orientation refinement's sums are a kernel of their own; an invocation takes every n-th
+    pixel, so that neighbouring invocations read neighbouring pixels and texels, and a
+    workgroup adds up its own before one fused step: 72 ms to 30 ms on 2048 patterns of
+    240 × 320.
+  - Two batches are in flight: each is recorded and submitted while the device works on the
+    one before, and an `index_step` call indexes a few batches (about 4096 patterns), so
+    `progress` comes after each step rather than each batch. Uploads made meanwhile go through
+    staging buffers the device keeps: a queue write of a whole batch takes an allocation of
+    its own, which held the queue up.
+- **`tests/check_shaders.py`** holds kernels to six storage buffers, as macOS runners have been.
+
+## 0.2.3 — 2026-11-24
+
+### Added
+
+- **`scripts/bench.py`**: a fixed set of synthetic scans with their answers (the engine's toy
+  scans from fixed seeds, over pattern sizes from 60 × 60 to 240 × 320, noise, faint bands,
+  a rotated detector, a wide map, a hexagonal phase, two phases with blank cells, a start far
+  off), on which the vote, the plane fit, Auto and indexing are measured against the answer.
+  `--root` runs another checkout and `--compare` sets runs side by side: changes to the fits
+  and to indexing are decided on it.
+
+- **Reference frames found from the data.** A convention (the sample's axes as signed axes of
+  the frame the engine computes in, kikuchipy's; passive or active angles; the crystal's axes
+  on the lattice, X ∥ a or X ∥ a\* and the like) is described as data, never by a maker's name,
+  and `identify_frame()` finds the one a scan file's own stored orientations are in. What is
+  left is a misorientation (`misorientation`, and how it changes over the rows and the
+  columns), reported and never applied: it is where the two geometries or indexings differ.
+  On an Oxford, a Bruker and an EDAX acquisition the makers' orientations lie a median 0.20°,
+  1.16° and 0.76° from the engine's. Oxford's sample and crystal axes come out as #13 (by
+  [Tijmenvermeij](https://github.com/Tijmenvermeij)) had them from Oxford's documentation and
+  MTEX. `.ang` and `.ctf` write in the convention found (or set: `Solver.frame`, the selector
+  under Export, a project file) and name it in their headers; `stored_orientations()` gives a
+  file's own as stored. The readers keep them for Oxford, Bruker and EDAX h5ebsd and the `.ang`
+  beside a UP file. See [docs/conventions.md](docs/conventions.md).
+- **The detector orientation an Oxford file stores** (`Detector Orientation Euler`) is read
+  into the geometry, as #13 read it. Left out, the engine's orientations on an AZtec map lay
+  3.4° from AZtec's; with it, 0.10°.
+- **An Oxford acquisition's scan turn** (`Scanning Rotation Angle`): unturned, the beam went
+  the other way from what the scan signs say, along both directions, as #13 (by
+  [Tijmenvermeij](https://github.com/Tijmenvermeij)) found on Oxford's files; at a half turn,
+  as they say (on an AZtec map so, the cells' pattern centres agree with AZtec's to 2 × 10⁻⁶).
+  Where a file's own per-pattern pattern centres move measurably, they decide.
+- **Processed or unprocessed patterns** from a file that stores both side by side, as an
+  Oxford acquisition can: the setting `stored_patterns` (in the app, "patterns" under the
+  scan's facts, which opens the scan again with the other kind) reads the processed ones, as
+  the acquisition prepared them, or the detector's own, signed 16-bit values widened to f32
+  exactly, each with its own static background. A file with one kind is read as it is;
+  `scan["pattern_kinds"]` names the kinds a file stores (#15, by
+  [Tijmenvermeij](https://github.com/Tijmenvermeij), whose reader this is).
+- **A menu** in the app (the three bars left of the name): opening and saving, the theme
+  (dark, light, or as the system is set), and **View conventions**, which draws each reference
+  frame and pattern-centre convention (the lab with the sample's axes over the engine's, and
+  the pattern as stored with where its pattern centre is measured from), the scan's own once
+  identified among them.
+- **`.h5oina` export** of a scan opened from an Oxford acquisition (`solver.export("x.h5oina")`,
+  and among the other formats under Export): the acquisition's groups, datasets and attributes copied (not its
+  patterns, nor spectra), its indexing replaced by these results in the convention found from
+  its own orientations, each cell's pattern centre in Oxford's convention, and the engine's
+  scores under `/zebsdsolve`. On an Oxford zirconium map its orientations lie a median 0.20°
+  from AZtec's, and its header's detector orientation is the geometry's. The file is written by the engine's own HDF5 writer, in both the browser and
+  Python, so neither needs an HDF5 library; the HDF5 reader now reads attributes. After #13 (by
+  [Tijmenvermeij](https://github.com/Tijmenvermeij)), which wrote it from the front ends, and
+  as it found Oxford's files to need: an earlier processing's solutions left out; the
+  acquisition's other measures of its indexing (mean angular deviation, bands and the like)
+  kept, cleared; its own detector orientation and tilt kept under
+  `/zebsdsolve/OriginalCalibration`, the geometry's written in their place; an acquisition
+  that already holds this writer's results, or whose cells' positions do not follow its raster,
+  refused; strings variable-length UTF-8, as AZtec and #13 write them.
+
+### Changed
+
+- **Auto's one centre** keeps the scan's steps as before, but its pattern centre is now where
+  the fit patterns stand on average, less where the steps put them, not the vote's. On the
+  benchmark's faint map, the only one that takes one centre, the pattern centre comes within
+  0.0008 of the answer, not 0.008, and indexing within 1° goes from 69 % to 97 % (median
+  0.91° → 0.34°). The app shows the plane after it, as after any other model.
+- **Full size for: everything** is gone (`full_resolution` `"all"`): it ran the search, the
+  refinement and the scores on the patterns as stored while the reduced size was only looked
+  at, which is what `binning` 1 does without reading every pattern twice. A project or a
+  script that sets it is refused; set `binning` 1 instead (#19, by
+  [Tijmenvermeij](https://github.com/Tijmenvermeij)).
+- The inverse pole figure keys' gradients are no longer settings: `ipf_lightness` and
+  `ipf_gray` are gone, and the Nolze–Hielscher keys use the λ_L and λ_S of a quarter each that
+  the paper recommends, so a map's key is always one others draw. The key itself is still a
+  choice (`ipf_colors`).
+- The Index step shows the method's own parameters under it, and changes them as the method
+  changes (the bandwidth for spherical indexing, the grid for a dictionary, and the grid,
+  components and Oja passes for its components); the sweeps are under Advanced, with the early
+  sweeps' parameters likewise.
+- Rotations are named as rotations: the detector's angles away from its nominal attitude are
+  azimuthal, tilt and twist (kikuchipy's names), and the plane fit reports the scan rotation.
+
+### Fixed
+
+- In the app: the log's times no longer wrap onto a second line; a lattice parameter tied to
+  another reads as the one it follows (3.524, not 3.5240 beside it); the crystal's facts wrap
+  instead of being cut off, as do wide readouts (a sweep plan, the plane fit's misfits); the
+  pattern centre in use reads to the four places the file's does; the z histogram says how many
+  of the cells above the threshold were accepted (acceptance also asks the refinement to have
+  settled, so the two counts can differ); the pattern-centre search's legend shows its marks in
+  the light theme; the plane fit's panel titles no longer run into their numbers in a narrower
+  window; the beam's step directions are under Geometry, Advanced (every scan's geometry uses
+  them), not under Raw stream; the conventions drawing's labels keep off each other and its
+  lines; every choice draws the same caret, and a setting's value reads as text beside its
+  muted label; the map's region and key tools and the fit-pattern toggle wait for a scan; the
+  plane fit's distance map keeps its edge squares inside the map; the readout of the cell under
+  the pointer keeps its room, so the map's bar no longer shifts when the pointer moves onto an
+  indexed cell in a narrower window (after #20, by [Tijmenvermeij](https://github.com/Tijmenvermeij));
+  the page has an icon.
+- `.ctf` and `.ang` wrote a hexagonal phase with the masters' crystal axes (X ∥ a), 30° about c
+  from Oxford's (X ∥ a\*), and in a sample frame rotated 90° from Oxford's and Bruker's: on an
+  Oxford map of zirconium the `.ctf` lay a median 84° from AZtec's own orientations. A scan
+  that stores its maker's orientations now exports in the convention found from them (0.20°
+  there, with the file's detector orientation read); the header says which.
+- A Bruker h5ebsd whose patterns were clipped (`UnClippedPatternHeight` above `PatternHeight`)
+  has its PCY read as a fraction of the height before clipping, from the top: Esprit's own
+  per-pattern pattern centres agree with its tilts and step only so, and the patterns put
+  their pattern centre 2 px from it (9 px from the reading before). On a ferrite map the
+  misorientation to Esprit's orientations fell from 1.75° to 1.02°.
+
+- A pattern-centre search whose every candidate lay nearer than `pc_z_min` installed a centre
+  anyway (below zero on the nickel scan, from a fitted plane and `pc_z_min` 1), and a search
+  that failed had already dropped the fitted plane and the last search's record. The search now
+  refuses a grid with nothing it may score (`NoPcCandidates`) or no pattern's ballot
+  (`NoPcSupport`), and keeps the geometry, the plane, the record and the fit patterns until it
+  has a centre to put in their place; the slices nearer than `pc_z_min` are no longer scored at
+  all. Identical results on every case of `scripts/bench.py` (#16, by
+  [Tijmenvermeij](https://github.com/Tijmenvermeij)).
+- What NMI chance gives (the scale z is read on, and so acceptance) was measured once and kept
+  while the settings, the geometry and the phases stayed as they were, even when another scan
+  was opened or a toy scan made: a scan could be read on the last one's scale. It is measured
+  again for each scan.
+- A plane fit for which fewer than three fit patterns had a match that would be accepted fitted
+  all of them, so on a map mostly of cells with no crystal (pores, a phase with no master, the
+  sample's edge) their chance matches set the plane. It now fits the matches that stand above
+  chance (z ≥ 3), and refuses (`TooFewFitPatterns`) when fewer than three, or than a tenth of
+  the fit patterns, do: on a faint map 60 % blank in `scripts/bench.py` the pattern centre came
+  out 0.0072 off before and 0.0009 now; on noise alone nothing is fitted. #17 (by
+  [Tijmenvermeij](https://github.com/Tijmenvermeij)) refused the fit outright, which on faint
+  maps that the fallback rescues left Auto failing. A background left uncorrected can lift
+  noise above chance, and the fallback then fits it, as before.
+- The plane fit's patterns, each taken to its own best, stopped as soon as a round gained
+  nothing, so a round in which every pattern's step overshot ended the fit before any had
+  tried the smaller step its damping now asked for. Such a round now goes again; otherwise the
+  fit stops as before, so it takes no more rounds and gives the same results on every case of
+  `scripts/bench.py`. `zig build test` now runs the plane fit's host-side test too. After #18,
+  by [Tijmenvermeij](https://github.com/Tijmenvermeij), whose own retry let each pattern run
+  until it alone had settled: the same results in two to three times the rounds.
 - **Auto fit geometry**, asked for a projective plane, said projective when it took a tilt line
   and installed it as the affine plane it is (#10, by [Tijmenvermeij](https://github.com/Tijmenvermeij)).
 - The joint fit of a projective plane stopped with `TooFewFitPatterns` when it started from one
   pattern centre for every cell (no steps, no plane) (#11, by [Tijmenvermeij](https://github.com/Tijmenvermeij)).
 - `cell_under(c, pc=…)` after a plane fit kept the plane and so ignored the centre given; it now
   takes the centre as `set_geometry` would (#12, by [Tijmenvermeij](https://github.com/Tijmenvermeij)).
+- In the browser, a GPU device lost during indexing failed a pending readback with a `mapAsync`
+  error and left the page working on a dead device. The app now says the device is lost, stops
+  GPU work and keeps the orientations already indexed for `.ang` and `.ctf` export; the log
+  records the adapter, bandwidth, batch and tile size (#14, by [Tijmenvermeij](https://github.com/Tijmenvermeij)).
 - A projective plane through source points that hardly move (a small region of interest) took
   its two slopes from their noise, the plane's other numbers making up for them where the points
   were and nowhere else: on a 3 × 3 region of the nickel example the source at the map's middle
@@ -21,8 +209,13 @@ notes.
   them (a prior of a tenth on how far they move the denominator from the map's middle to its
   edge, against the points' own scatter), and a plane whose denominator falls below a tenth of
   its middle's anywhere on the map is refused. Small regions now give the affine plane; the
-  nickel example's whole map barely moves, and what its plane says of the detector's turn
+  nickel example's whole map barely moves, and what its plane says of the detector's rotation
   varies across blocks of the map by 15° at most instead of 199°.
+- The joint fit (`plane_method="joint"`) of a projective plane had no such hold: on a 12 × 12
+  region of the nickel example (CLAHE on) its denominator went through zero inside the map. It
+  now holds the slopes the same way, the prior weighed against its pseudo-points' scatter, and
+  takes no step past the same bound; the denominator moves under 2 % there, and 15 % rather
+  than 17 % over the whole map.
 
 ## 0.2.2 — 2026-11-18
 
@@ -149,7 +342,7 @@ notes.
 - Master view: globe, Lambert, stereographic and joint (single-square) Lambert projections, with
   zoom and pan; one hemisphere for centrosymmetric crystals and an N − S′ difference for the
   others; a stereogram mode (distance and eye separation, default 0.5 m and 60 mm); several masters
-  can be switched between and toggled on or off; Ctrl + scroll turns about the north pole.
+  can be switched between and toggled on or off; Ctrl + scroll rotates about the north pole.
 - Crystal pane: the unit cell drawn by the engine, with an optional 3 × 3 × 3 supercell, a, b and c
   views over the picture, and a lock to the master's rotation.
 - Energy and depth charts run from the beam's energy down to 0, with arrow-key navigation and an

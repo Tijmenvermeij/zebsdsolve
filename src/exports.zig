@@ -15,6 +15,7 @@ const rot = @import("rot.zig");
 const pcfit = @import("pcfit.zig");
 const planefit = @import("planefit.zig");
 const output = @import("output.zig");
+const convention = @import("convention.zig");
 
 const Engine = engine.Engine;
 
@@ -323,12 +324,12 @@ export fn ze_cell_info(e: *Engine, cells: u32, out: ?[*]u8, cap: usize) i64 {
     return @intCast(bytes.len);
 }
 
-/// The crystal's cell in a picture for the app (cellview.zig): `turn` the view's rotation into
+/// The crystal's cell in a picture for the app (cellview.zig): `view_rot` the view's rotation into
 /// the crystal's Cartesian frame (row-major 3 × 3), `zoom` 1 fitting the cell to the shorter
 /// side, `highlight` what to pick out (1–3 the edge a, b, c; 4–6 the angle α, β, γ; 16 + k the
 /// atoms of site k; 0 nothing); `width` × `height` RGBA8 pixels into `out` (`len` u32).
-export fn ze_cell_view(e: *Engine, turn: [*]const f32, zoom: f32, highlight: u32, cells: u32, width: u32, height: u32, out: [*]u32, len: usize) i32 {
-    @import("cellview.zig").render(e, turn[0..9].*, zoom, highlight, cells, width, height, out[0..len]) catch |err| return failed(e, "cell_view", err);
+export fn ze_cell_view(e: *Engine, view_rot: [*]const f32, zoom: f32, highlight: u32, cells: u32, width: u32, height: u32, out: [*]u32, len: usize) i32 {
+    @import("cellview.zig").render(e, view_rot[0..9].*, zoom, highlight, cells, width, height, out[0..len]) catch |err| return failed(e, "cell_view", err);
     return 0;
 }
 
@@ -402,14 +403,14 @@ export fn ze_phase_info(e: *Engine, index: u32, out: *engine.PhaseInfo) i32 {
 /// A master in a picture for the app (sphereview.zig): `source` a phase (≥ 0) or the last
 /// simulation (−1); `stored` 1 a phase's master as loaded, 0 as patterns are compared with it;
 /// `bin` and `site`, for the simulation, one energy bin's and one site's alone (−1: all);
-/// `projection` 0 globe, 1 Lambert, 2 stereographic, 3 joint Lambert; `turn` the view's
+/// `projection` 0 globe, 1 Lambert, 2 stereographic, 3 joint Lambert; `view_rot` the view's
 /// rotation into the crystal's frame (row-major 3 × 3, then four more numbers: the picture's pan
 /// across and down in shorter sides, the hemispheres shown (0 both, 1 upper, 2 lower), 1 for the
 /// upper less the lower's inversion); `width` × `height` RGBA8 pixels into
 /// `out` (`len` u32).
-export fn ze_sphere_view(e: *Engine, source: i32, stored: u32, bin: i32, site: i32, projection: u32, turn: [*]const f32, zoom: f32, width: u32, height: u32, out: [*]u32, len: usize) i32 {
+export fn ze_sphere_view(e: *Engine, source: i32, stored: u32, bin: i32, site: i32, projection: u32, view_rot: [*]const f32, zoom: f32, width: u32, height: u32, out: [*]u32, len: usize) i32 {
     if (projection > 3) return failed(e, "sphere_view", error.UnknownKind);
-    @import("sphereview.zig").render(e, source, stored != 0, bin, site, @enumFromInt(projection), turn[0..9].*, turn[9..13].*, zoom, width, height, out[0..len]) catch |err| return failed(e, "sphere_view", err);
+    @import("sphereview.zig").render(e, source, stored != 0, bin, site, @enumFromInt(projection), view_rot[0..9].*, view_rot[9..13].*, zoom, width, height, out[0..len]) catch |err| return failed(e, "sphere_view", err);
     return 0;
 }
 
@@ -620,9 +621,10 @@ export fn ze_index_begin(e: *Engine) i32 {
     return 0;
 }
 
-/// Index the next batch of the sweep in progress. Returns the number of cells left to visit
-/// (0: done; a sweep that ends hands the cells it did not accept to the next), or a negative
-/// code. ze_index_status says where it stands.
+/// Index the next few batches of the sweep in progress (two at a time on the device, none left
+/// in flight when it returns). Returns the number of cells left to visit (0: done; a sweep that
+/// ends hands the cells it did not accept to the next), or a negative code. ze_index_status
+/// says where it stands.
 export fn ze_index_step(e: *Engine) i64 {
     const left = e.indexStep() catch |err| return failed(e, "index_step", err);
     return @intCast(left);
@@ -751,8 +753,8 @@ export fn ze_map(e: *Engine, kind: u32, out: [*]u8, len: usize) i32 {
     return 0;
 }
 
-/// The key to a phase's inverse pole figure colours, as the settings have them (ipf_colors,
-/// ipf_lightness, ipf_gray), as RGBA8, size × size: the directions that stand for all the
+/// The key to a phase's inverse pole figure colours, as the settings have them (ipf_colors), as
+/// RGBA8, size × size: the directions that stand for all the
 /// others, in stereographic projection with the crystal's x to the right, transparent outside
 /// them. `lower` = 0 gives their part in the upper hemisphere ([001] at the origin), 1 their
 /// part in the lower one, which only some keys have (output.ipfKey). `box` receives the part's
@@ -825,7 +827,113 @@ export fn ze_bunge(q: *const [4]f32, euler: *[3]f64) void {
     euler.* = rot.toBunge(.{ q[0], q[1], q[2], q[3] });
 }
 
-/// Explicit symmetry reduction: `q` is replaced by its representative in the
+/// The results as an Oxford .h5oina made from the acquisition the scan was opened from
+/// (h5oina.zig). With a null buf it makes the file and returns its size, holding it for the
+/// next call, which copies it into buf (when cap suffices) and lets it go.
+export fn ze_export_h5oina(e: *Engine, buf: ?[*]u8, cap: usize) i64 {
+    if (buf == null or e.export_held.len == 0) {
+        e.gpa.free(e.export_held);
+        e.export_held = &.{};
+        e.export_held = @import("h5oina.zig").write(e) catch |err| return failed(e, "export_h5oina", err);
+    }
+    const n = e.export_held.len;
+    if (buf) |b| {
+        if (cap < n) return failed(e, "export_h5oina", error.BufferTooSmall);
+        @memcpy(b[0..n], e.export_held);
+        e.gpa.free(e.export_held);
+        e.export_held = &.{};
+    }
+    return @intCast(n);
+}
+
+fn frameJson(w: *std.Io.Writer, f: convention.Frame) !void {
+    try w.writeAll("{\"axes\":");
+    try std.json.Stringify.value(f.axes, .{}, w);
+    try w.print(",\"active\":{},\"crystal\":\"{s}\",\"text\":", .{ f.active, @tagName(f.crystal) });
+    var line: [256]u8 = undefined;
+    var lw = std.Io.Writer.fixed(&line);
+    try f.describe(&lw);
+    try std.json.Stringify.value(lw.buffered(), .{}, w);
+    try w.writeByte('}');
+}
+
+/// The frame a maker's orientations are in, found against the results (convention.zig): from
+/// `euler` (Bunge, radians, 3 per map cell) and `phase` (a label per cell, negative: not
+/// indexed), or with null the scan file's own. Writes JSON (under 1 KB) into buf and returns its
+/// length: the frame, how well it holds, and whether the exports took it.
+export fn ze_identify_frame(e: *Engine, euler: ?[*]const f64, phase: ?[*]const i32, n: u64, buf: [*]u8, cap: usize) i64 {
+    const ref: ?convention.Reference = if (euler) |eu| blk: {
+        const ph = phase orelse return failed(e, "identify_frame", error.MissingPhases);
+        const m: usize = @intCast(n);
+        break :blk .{ .euler = eu[0 .. 3 * m], .phase = ph[0..m] };
+    } else null;
+    const got = e.identifyFrame(ref) catch |err| return failed(e, "identify_frame", err);
+    const f = got.found;
+    var out: std.Io.Writer.Allocating = .init(e.gpa);
+    defer out.deinit();
+    const w = &out.writer;
+    (blk: {
+        w.writeAll("{\"frame\":") catch |err| break :blk err;
+        frameJson(w, f.frame) catch |err| break :blk err;
+        w.print(",\"cells\":{d},\"within\":{d},\"median_deg\":{d},\"runner_up_deg\":{d},\"installed\":{},\"misorientation_cells\":{d},\"misorientation\":", .{ f.cells, f.within, f.median_deg, f.runner_up_deg, got.installed, f.misorientation_cells }) catch |err| break :blk err;
+        std.json.Stringify.value(f.misorientation, .{}, w) catch |err| break :blk err;
+        w.writeAll(",\"misorientation_rows\":") catch |err| break :blk err;
+        std.json.Stringify.value(f.misorientation_rows, .{}, w) catch |err| break :blk err;
+        w.writeAll(",\"misorientation_cols\":") catch |err| break :blk err;
+        std.json.Stringify.value(f.misorientation_cols, .{}, w) catch |err| break :blk err;
+        w.writeAll(",\"matched\":") catch |err| break :blk err;
+        std.json.Stringify.value(f.matched[0..@min(e.phases.items.len, convention.max_phases)], .{}, w) catch |err| break :blk err;
+        w.writeByte('}') catch |err| break :blk err;
+    }) catch |err| return failed(e, "identify_frame", err);
+    const text = out.written();
+    if (cap < text.len) return failed(e, "identify_frame", error.BufferTooSmall);
+    @memcpy(buf[0..text.len], text);
+    return @intCast(text.len);
+}
+
+/// The orientations the scan file stores from its maker's indexing, as it stores them (scan.zig
+/// storedOrientations): Bunge angles (radians, 3 per map cell) into `euler` and a phase label
+/// per cell (−1: not indexed) into `phase`, n cells each. Returns 1, or 0 when the file stores
+/// none.
+export fn ze_stored_orientations(e: *Engine, euler: [*]f64, phase: [*]i32, n: u64) i32 {
+    const s = switch (e.source) {
+        .file => |s| s,
+        else => return 0,
+    };
+    var got = (s.storedOrientations(e.gpa) catch |err| return failed(e, "stored_orientations", err)) orelse return 0;
+    defer got.deinit(e.gpa);
+    if (got.phase.len != n) return failed(e, "stored_orientations", error.BadLength);
+    @memcpy(euler[0 .. 3 * got.phase.len], got.euler);
+    @memcpy(phase[0..got.phase.len], got.phase);
+    return 1;
+}
+
+/// The convention the exports write orientations in, as JSON (axes, active, crystal and a
+/// line describing it); returns its length (copied when cap suffices).
+export fn ze_frame(e: *Engine, buf: [*]u8, cap: usize) usize {
+    var line: [1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&line);
+    frameJson(&w, e.convention) catch return 0;
+    const text = w.buffered();
+    @memcpy(buf[0..@min(cap, text.len)], text[0..@min(cap, text.len)]);
+    return text.len;
+}
+
+/// Set the convention the exports write in: JSON as `ze_frame` gives it (axes, active,
+/// crystal; others ignored), or empty for the engine's own.
+export fn ze_set_frame(e: *Engine, json: [*]const u8, len: usize) i32 {
+    if (len == 0) {
+        e.convention = .{};
+        return 0;
+    }
+    const parsed = std.json.parseFromSlice(convention.Frame, e.gpa, json[0..len], .{ .ignore_unknown_fields = true }) catch |err| return failed(e, "set_frame", err);
+    defer parsed.deinit();
+    if (!parsed.value.valid()) return failed(e, "set_frame", error.InvalidFrame);
+    e.convention = parsed.value;
+    return 0;
+}
+
+/// An orientation as the results store one: `q` is replaced by its representative in the
 /// phase's fundamental zone (the equivalent of the smallest rotation, among those the proper
 /// rotations its master obeys give, about the master's own axes), and `euler` receives that
 /// quaternion's Bunge angles, radians.

@@ -12,7 +12,7 @@
 //! match indexing itself would not accept (settings.accept_nmi or accept_z, and
 //! accept_step_deg) are left out: a pattern matched to the wrong orientation puts its source
 //! wherever suits its mistake. Each of the others is refined by itself over six unknowns, a
-//! shift of its rays' origin and a turn of its crystal, by Levenberg–Marquardt on its own
+//! shift of its rays' origin and a rotation of its crystal, by Levenberg–Marquardt on its own
 //! normalized cross-correlation with its simulation. The device supplies, per pattern, that
 //! correlation's gradient and Gauss–Newton matrix over those six directions (detector.wgsl
 //! `sums`); all the patterns take a step together, one readback a step.
@@ -52,11 +52,11 @@ pub const PlaneResult = extern struct {
     /// the pattern centre the fit began from (the vote's, in the automatic fit)
     pc: [3]f64 = .{ 0, 0, 0 },
     start_pc: [3]f64 = .{ 0, 0, 0 },
-    /// the geometry's turn now (the plane's when the frame follows it, else as it was)
+    /// the geometry's detector rotation now (the plane's when the frame follows it, else as it was)
     rot: [3]f64 = .{ 0, 0, 0 },
     /// What the plane says (plane.Said) and each one's standard error, by leaving out the
     /// points of one block of the map at a time (a jackknife over `blocks` blocks): the
-    /// sample's frame against the nominal one (swing, tilt, twist, radians), how far the beam
+    /// sample's frame against the nominal one (azimuthal, tilt, twist, radians), how far the beam
     /// goes for a row and for a column against the scan's steps and the pixel size, the angle
     /// between the scan's directions off a right angle, and the source at the map's middle.
     said_rot: [3]f64 = .{ 0, 0, 0 },
@@ -164,7 +164,7 @@ fn choose(a: std.mem.Allocator, models: []const plane_mod.Model, pts: []plane_mo
 /// A pattern's normalized cross-correlation with its simulation, with its gradient and
 /// Gauss–Newton matrix (the score falls by ½ δᵀ H δ about its top) over the device's six
 /// directions: a shift of the pattern's rays' origin (pixels, in the sample's axes), then a
-/// turn of its crystal (radians).
+/// rotation of its crystal (radians).
 const Local = struct {
     ok: bool = false,
     ncc: f64 = 0,
@@ -231,7 +231,7 @@ fn solve(comptime N: usize, A0: [N * N]f64, b0: [N]f64) ?[N]f64 {
     return x;
 }
 
-/// A pattern's system over `k` of its unknowns from the last (3: the turn alone; 6: the
+/// A pattern's system over `k` of its unknowns from the last (3: the rotation alone; 6: the
 /// source's shift too), damped by Marquardt's `lambda` (0: as it is).
 fn damped(comptime k: usize, l: *const Local, lambda: f64) struct { A: [k * k]f64, g: [k]f64 } {
     const o = 6 - k;
@@ -246,6 +246,14 @@ fn damped(comptime k: usize, l: *const Local, lambda: f64) struct { A: [k * k]f6
     for (0..k) |i| A[i * k + i] = A[i * k + i] * (1 + lambda) + 1e-9 * tr + 1e-30;
     return .{ .A = A, .g = g };
 }
+
+/// How far above chance (in chance's spreads) a match must stand to take part when too few are
+/// accepted, and the share of the fit patterns that must: on the synthetic maps of
+/// scripts/bench.py, cells with no crystal match at a median of about 1, and 1.5–3.4 % of them
+/// at 3 or more; the faintest crystals' patterns there at about 4, 82 % of them at 3 or more.
+/// (Higher, fewer of a faint map's patterns take part, and its plane is the worse for it.)
+const CHANCE_Z: f32 = 3;
+const CHANCE_SHARE = 10;
 
 /// The fit patterns, indexed at the geometry as it stands and on the device, each with its
 /// orientation and its source's shift away from where the geometry puts it.
@@ -375,10 +383,19 @@ const Fit = struct {
             self.base[b] = try e.placeOf(&e.geo, cells[b], lv);
         }
         if (self.n_used < 3) {
-            // nothing to choose among: a start this far off, or a threshold this high, leaves the fit all of them
-            e.events.log("plane fit: {d} of the {d} fit patterns have a match that would be accepted here; fitting to all of them", .{ self.n_used, n });
-            @memset(self.use, true);
-            self.n_used = n;
+            // too few to fit to (a start this far off, or a threshold this high): the matches
+            // that stand above chance instead, three of its spreads above it, so that cells with
+            // no crystal to find (pores, a phase with no master, the sample's edge) do not take
+            // part; fewer than three of those, or than a tenth of the fit patterns (what chance
+            // alone might leave), and nothing is fitted
+            const accepted = self.n_used;
+            self.n_used = 0;
+            for (0..n) |b| {
+                self.use[b] = recs[@as(usize, @intCast(phase[b])) * n + b].z >= CHANCE_Z;
+                if (self.use[b]) self.n_used += 1;
+            }
+            e.events.log("plane fit: {d} of the {d} fit patterns have a match that would be accepted here; fitting to the {d} above chance (z ≥ {d})", .{ accepted, n, self.n_used, CHANCE_Z });
+            if (self.n_used < 3 or self.n_used * CHANCE_SHARE < n) return error.TooFewFitPatterns;
         } else if (self.n_used < n) {
             e.events.log("plane fit: {d} of the {d} fit patterns left out, their matches not accepted", .{ n - self.n_used, n });
         }
@@ -524,7 +541,7 @@ const Fit = struct {
         };
         defer e.det.interp = 0;
         for (e.phases.items, 0..) |*p, pi| {
-            e.det.sumsOf(self.masterOf(p, pi), fr, e.pats[@intFromEnum(self.lv)], @intCast(n), false);
+            e.det.sumsOf(self.masterOf(p, pi), fr, e.pats[@intFromEnum(self.lv)], @intCast(n));
             g.read(e.det.sums, 0, std.mem.sliceAsBytes(self.sums[pi * n * NS ..][0 .. n * NS]));
         }
         try g.wait();
@@ -544,10 +561,12 @@ const Fit = struct {
     /// score: over its orientation alone (`k` 3), or with the place of its own source (`k` 6:
     /// what Winkelmann et al. and kikuchipy's refine_orientation_projection_center do a
     /// pattern at a time). All the patterns take a step together, a pattern's step kept where
-    /// its own score rose, until a round gains the mean less than 1e-7 (about what single
-    /// precision on the device leaves of it) or after `most` rounds. A source may move
-    /// `trust` pixels each way from where it started. Returns the rounds taken; leaves the
-    /// mean score in `ncc` and the patterns' systems in `keep`.
+    /// its own score rose and its damping eased (where it fell, the damping grows), until a
+    /// round gains the mean less than 1e-7 (about what single precision on the device leaves of
+    /// it) or after `most` rounds. A round in which every step overshot is not the end: the
+    /// steps go again, damped more, until one is kept or none can be damped further. A source
+    /// may move `trust` pixels each way from where it started. Returns the rounds taken; leaves
+    /// the mean score in `ncc` and the patterns' systems in `keep`.
     fn settle(self: *Fit, comptime k: usize, trust: f64, most: u32) !u32 {
         const n = self.n;
         const count: f64 = @floatFromInt(self.n_used);
@@ -572,18 +591,26 @@ const Fit = struct {
             }
             _ = try self.eval(self.q_t, self.shift_t);
             var gain: f64 = 0;
+            var kept: usize = 0;
+            var damp: usize = 0;
             for (0..n) |b| {
                 if (!self.use[b]) continue;
                 const now = self.locals[b].ncc;
                 if (now > self.keep[b].ncc) {
                     gain += now - self.keep[b].ncc;
+                    kept += 1;
                     self.q[b] = self.q_t[b];
                     self.shift[b] = self.shift_t[b];
                     self.keep[b] = self.locals[b];
                     self.lam[b] = @max(self.lam[b] / 3, 1e-4);
-                } else self.lam[b] = @min(self.lam[b] * 5, 1e8);
+                } else {
+                    if (self.lam[b] < 1e8) damp += 1;
+                    self.lam[b] = @min(self.lam[b] * 5, 1e8);
+                }
             }
             if (k == 6) self.e.events.emit(.{ .kind = "progress", .stage = "plane", .done = it + 1, .total = most });
+            // (a round whose every step overshot has not converged: they go again, damped more)
+            if (kept == 0 and damp > 0) continue;
             if (gain / count < 1e-7) break;
         }
         var mean: f64 = 0;
@@ -670,9 +697,9 @@ const Joint = struct {
     }
 };
 
-/// A pattern's information about its source with its turn profiled out (pixels, the sample's
+/// A pattern's information about its source with its rotation profiled out (pixels, the sample's
 /// axes): the curvature S = H_tt − H_tq H_qq⁻¹ H_qt and the pull g̃ = g_t − H_tq H_qq⁻¹ g_q, what
-/// its score says of its source once its orientation follows. Null where its turn is not told.
+/// its score says of its source once its orientation follows. Null where its rotation is not told.
 fn profiled(l: *const Local) ?struct { S: [9]f64, g: [3]f64 } {
     const B = damped(3, l, 0).A;
     var S: [9]f64 = undefined;
@@ -905,7 +932,7 @@ pub fn plane(e: *Engine) !PlaneResult {
 }
 
 /// `plane`, or (`compare`) with the simpler models checked as well: the geometry takes the
-/// simplest the map supports (choose). One centre leaves the vote's geometry as it is.
+/// simplest the map supports (choose). One centre keeps the scan's steps (stepsKept).
 fn fitPlane(e: *Engine, compare: bool) !PlaneResult {
     const s = &e.set;
     const before = e.geo;
@@ -955,9 +982,24 @@ fn fitPlane(e: *Engine, compare: bool) !PlaneResult {
             P = plane_mod.toPlane(model, theta, fr) orelse return error.TooFewFitPatterns;
         } else P = plane_mod.fitModel(model, pts, fr) orelse return error.TooFewFitPatterns;
     }
-    const signs = e.calibration.scanSigns(s.scan_x_sign, s.scan_y_sign);
-    const said = plane_mod.saidWithNominal(P, &before, e.calibration.nominal(&before), info.rows, info.cols, aspect, h_px, signs[0], signs[1]);
+    const signs = e.scanSigns();
+    var said = plane_mod.saidWithNominal(P, &before, e.calibration.nominal(&before), info.rows, info.cols, aspect, h_px, signs[0], signs[1]);
+    if (model == .centre) said.pc = try stepsKept(fit, pts, fr, aspect, &before, said.pc, a);
     return finishPlane(e, fit, &res, &before, P, model, full, kind, pts, fr, aspect, said, info);
+}
+
+/// One centre: the map does not tell the source's path, so the scan's steps keep it, and the
+/// pattern centre at the map's middle is the model's (`pc`: where the fit patterns stand on
+/// average) less where the steps put them on average, each weighed as in the fit.
+fn stepsKept(fit: *const Fit, pts: []const plane_mod.Point, fr: plane_mod.Frame, aspect: f64, before: *const Geometry, pc: [3]f64, a: std.mem.Allocator) ![3]f64 {
+    const R = fit.e.calibration.rotation(before);
+    const by_steps = try a.dupe(plane_mod.Point, pts);
+    for (by_steps, 0..) |*pt, b| {
+        const at = Geometry.pcOf(R, fit.base[b], fit.sz[0], fit.sz[1]);
+        pt.y = .{ (at[0] - before.pc[0]) * aspect, at[1] - before.pc[1], at[2] - before.pc[2] };
+    }
+    const off = plane_mod.fitTheta(.centre, by_steps, fr) orelse return error.TooFewFitPatterns;
+    return .{ pc[0] - off[2] / aspect, pc[1] - off[5], pc[2] - off[8] };
 }
 
 /// The way of Winkelmann et al. and kikuchipy: each pattern's own source point (after `settle`
@@ -1069,7 +1111,7 @@ fn finishPlane(e: *Engine, fit: *Fit, res_out: *PlaneResult, before_in: *const G
     var res = res_out.*;
     const compare = res.compared != 0;
     const h_px: f64 = @floatFromInt(info.pat_h);
-    const signs = e.calibration.scanSigns(s.scan_x_sign, s.scan_y_sign);
+    const signs = e.scanSigns();
 
     // each one's standard error: the plane fitted again without the points of one block of the map, block by block
     {
@@ -1110,8 +1152,8 @@ fn finishPlane(e: *Engine, fit: *Fit, res_out: *PlaneResult, before_in: *const G
         }
     }
 
-    // the geometry takes the plane (a tilt line is an affine plane; one centre leaves the
-    // vote's geometry, its pattern centre and the scan's steps, as it is)
+    // the geometry takes the plane (a tilt line is an affine plane; one centre, its pattern
+    // centre with the scan's steps)
     res.kind = switch (model) {
         .centre => 0,
         .line, .affine => @intFromEnum(plane_mod.Kind.affine),
@@ -1119,15 +1161,15 @@ fn finishPlane(e: *Engine, fit: *Fit, res_out: *PlaneResult, before_in: *const G
     };
     res.frame = @intFromBool(s.plane_frame == .follow and model != .centre);
     res.plane = P;
-    res.pc = if (model == .centre) before.pc else said.pc;
+    res.pc = said.pc;
     res.said_rot = said.rot;
     res.step = said.step;
     res.skew = said.skew;
     e.geo = before;
+    e.geo.pc = said.pc;
     if (model != .centre) {
         e.geo.plane_kind = res.kind;
         e.geo.plane = P;
-        e.geo.pc = said.pc;
         if (s.plane_frame == .follow) e.geo.rot = said.rot;
     }
     res.rot = e.geo.rot;
@@ -1135,8 +1177,10 @@ fn finishPlane(e: *Engine, fit: *Fit, res_out: *PlaneResult, before_in: *const G
     e.plane_points.clearRetainingCapacity();
     var sq: [3]f64 = .{ 0, 0, 0 };
     var used: f64 = 0;
+    const R_before = e.calibration.rotation(&before);
     for (pts, 0..) |pt, b| {
-        const pc = plane_mod.at(P, pt.row, pt.col);
+        // (one centre: where the geometry now puts the source, by the scan's steps)
+        const pc = if (model == .centre) rot.add(rot.sub(Geometry.pcOf(R_before, fit.base[b], fit.sz[0], fit.sz[1]), before.pc), said.pc) else plane_mod.at(P, pt.row, pt.col);
         const own: [3]f64 = .{ pt.y[0] / aspect, pt.y[1], pt.y[2] };
         try e.plane_points.append(gpa, .{ .cell = fit.cells[b], .pc = own, .fit = pc, .ncc = if (fit.use[b]) fit.keep[b].ncc else fit.seed_ncc[b], .used = @intFromBool(pt.used) });
         if (!pt.used) continue;
@@ -1147,16 +1191,16 @@ fn finishPlane(e: *Engine, fit: *Fit, res_out: *PlaneResult, before_in: *const G
     for (0..3) |i| res.rmsd[i] = @sqrt(sq[i] / @max(used, 1));
 
     // The fit patterns, with their orientations in the sample's frame as the geometry now has
-    // it. A turn of the geometry from E to E' turns that frame: q' = q h(E) h(E')⁻¹, with h
-    // the detector's turn in the sample's axes, Exp(R0 log E).
+    // it. A rotation of the detector from E to E' rotates that frame: q' = q h(E) h(E')⁻¹, with h
+    // the detector's rotation in the sample's axes, Exp(R0 log E).
     const quats = try gpa.alloc(f32, 4 * n);
     errdefer gpa.free(quats);
     const nccs = try gpa.alloc(f32, n);
     const R0 = e.calibration.nominal(&before);
-    const turn = rot.qmul(rot.so3Exp(rot.matVec(R0, before.rot)), rot.qconj(rot.so3Exp(rot.matVec(R0, e.geo.rot))));
+    const frame_rot = rot.qmul(rot.so3Exp(rot.matVec(R0, before.rot)), rot.qconj(rot.so3Exp(rot.matVec(R0, e.geo.rot))));
     for (0..n) |k| {
         const p: usize = @intCast(fit.phase[k]);
-        const q = sym.toFz(rot.qmul(fit.q[k], turn), e.phases.items[p].master.rotations());
+        const q = sym.toFz(rot.qmul(fit.q[k], frame_rot), e.phases.items[p].master.rotations());
         for (0..4) |c| quats[4 * k + c] = @floatCast(q[c]);
         nccs[k] = if (fit.use[k]) @floatCast(fit.keep[k].ncc) else fit.seed_ncc[k];
     }
@@ -1172,12 +1216,12 @@ fn finishPlane(e: *Engine, fit: *Fit, res_out: *PlaneResult, before_in: *const G
 
     const deg = 180.0 / std.math.pi;
     if (compare) e.events.log("the source over the scan, each model asked where a block of the map stands from the others (mean misfit a point): one centre {d:.3}, a tilt line {d:.3}, the {s} plane {d:.3}; the map supports {s}", .{ res.cv[0], res.cv[1], @tagName(kind), res.cv[@intFromEnum(full)], switch (model) {
-        .centre => "one centre: the vote's geometry stays",
+        .centre => "one centre, with the scan's steps",
         .line => "a tilt line: PCx the same everywhere, PCy and PCz along the rows",
         else => "the plane",
     } });
     e.events.log("plane of source points ({s}): {d} of {d} fit patterns used; about it they scatter by {d:.5} {d:.5} {d:.5} (PCx, PCy, PCz); mean NCC {d:.4} with each pattern at its own best (was {d:.4})", .{ @tagName(model), res.n_used, res.n_patterns, res.rmsd[0], res.rmsd[1], res.rmsd[2], res.ncc, res.start_ncc });
-    e.events.log("plane: source at the map's middle {d:.5} {d:.5} {d:.5}; the sample's frame against the nominal one: swing {d:.2}° ± {d:.2}°, tilt {d:.2}° ± {d:.2}°, the scan turned in its plane {d:.2}° ± {d:.2}°; the beam's travel for a row {d:.3} ± {d:.3} and for a column {d:.3} ± {d:.3} of what the steps and the pixel size say; the scan's directions {d:.2}° ± {d:.2}° off square", .{ res.pc[0], res.pc[1], res.pc[2], said.rot[0] * deg, res.said_rot_se[0] * deg, said.rot[1] * deg, res.said_rot_se[1] * deg, said.rot[2] * deg, res.said_rot_se[2] * deg, said.step[0], res.step_se[0], said.step[1], res.step_se[1], said.skew * deg, res.skew_se * deg });
+    e.events.log("plane: source at the map's middle {d:.5} {d:.5} {d:.5}; the sample's frame against the nominal one: azimuthal {d:.2}° ± {d:.2}°, tilt {d:.2}° ± {d:.2}°, scan rotation {d:.2}° ± {d:.2}°; the beam's travel for a row {d:.3} ± {d:.3} and for a column {d:.3} ± {d:.3} of what the steps and the pixel size say; the scan's directions {d:.2}° ± {d:.2}° off square", .{ res.pc[0], res.pc[1], res.pc[2], said.rot[0] * deg, res.said_rot_se[0] * deg, said.rot[1] * deg, res.said_rot_se[1] * deg, said.rot[2] * deg, res.said_rot_se[2] * deg, said.step[0], res.step_se[0], said.step[1], res.step_se[1], said.skew * deg, res.skew_se * deg });
     return res;
 }
 
