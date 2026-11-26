@@ -14,8 +14,8 @@ pub const Frame = spherical.Frame;
 /// Sums per item (detector.wgsl NS).
 pub const NS = 43;
 /// Floats of a refinement record: orientation (4), NCC, NMI, the size of the last refinement
-/// step that improved the match (radians), and one the host fills (how far the NMI stands
-/// above chance).
+/// step that improved the match (radians), and the batch stamp. The host replaces the stamp
+/// with how far the NMI stands above chance for ordinary indexing.
 pub const RECORD = 8;
 const REFINE_CONDITIONAL = 2;
 
@@ -68,6 +68,9 @@ pub const RefineOptions = struct {
     scale_min: f32 = 0.02,
     scale_max: f32 = 1e4,
     nmi_bins: u32 = 16,
+    /// the number `collect` writes into each record's last slot: the batch's, which the host
+    /// checks (records without it are an earlier batch's; 0 where nobody checks)
+    stamp: u32 = 0,
 };
 
 pub const Detector = struct {
@@ -235,7 +238,9 @@ pub const Detector = struct {
             self.run("refine_rot_step", ps, n, &.{ self.part.at(6), self.state.at(9), self.poses.at(10) });
         }
         self.run("nmi", p, n, &.{ m.buf.at(1), self.poses.at(2), pats.at(3), self.score.at(11) });
-        self.run("collect", p, (n + 63) / 64, &.{ self.state.at(14), self.score.at(15), records.at(16) });
+        var pc = p;
+        pc.flags = o.stamp;
+        self.run("collect", pc, (n + 63) / 64, &.{ self.state.at(14), self.score.at(15), records.at(16) });
     }
 
     /// Record: make the n items from `items` ((t, pattern index) each) and the orientations

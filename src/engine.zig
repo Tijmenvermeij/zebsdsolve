@@ -49,7 +49,7 @@ const Allocator = std.mem.Allocator;
 pub const Settings = settings_mod.Settings;
 pub const Geometry = geometry_mod.Geometry;
 
-pub const version = "0.2.6";
+pub const version = "0.2.8";
 
 /// A pattern resolution: reduced by settings.binning, or as stored.
 pub const Level = enum(u1) { reduced = 0, full = 1 };
@@ -576,7 +576,8 @@ pub const Record = extern struct {
     step: f32,
     /// (NMI − chance) / chance's spread: the NMI on a scale measured once for the scan (a
     /// sample of the region's patterns against the phase at random orientations), the same
-    /// for every pattern
+    /// for every pattern. As the device writes it, the number of the batch that wrote it
+    /// (`finishCells` checks it, then puts z there).
     z: f32,
 };
 
@@ -690,6 +691,8 @@ pub const Engine = struct {
     /// each phase's spherical peaks; the refinement records; chance's mutual information
     peaks: std.ArrayList(Buf) = .empty,
     records: Buf = .{},
+    /// the last recorded detector batch's number, which its records carry back
+    batch_stamp: u32 = 0,
     chance: Buf = .{},
     /// what mutual information chance gives on this scan, per phase: measured once on a sample
     /// of the region (`calibrate`), the same for every pattern, and what it was measured for
@@ -2149,24 +2152,33 @@ pub const Engine = struct {
     /// score it (NCC, NMI) at the scores', and measure there what NMI chance gives. `out` gets
     /// one record per phase per cell ([phase][cell]). One readback.
     pub fn indexCells(self: *Engine, cells: []const u64, prm: Search, out: []Record) !void {
-        const ticket = try self.recordCells(cells, prm, out);
+        const rec = try self.recordCells(cells, prm, out);
         // the device starts on this batch; the host reads the next one meanwhile
         if (self.ahead.len != 0) {
             self.g.submit();
             self.readAhead(self.ahead);
         }
-        try self.finishCells(ticket, cells.len, out);
+        try self.finishCells(rec, cells.len, out);
     }
 
-    /// indexCells up to its readback: the batch recorded, not yet submitted. Its records land in
-    /// `out`, which stays the caller's until `finishCells` has the ticket returned here.
-    fn recordCells(self: *Engine, cells: []const u64, prm: Search, out: []Record) !u64 {
+    /// A batch recorded: the ticket of its read, and the number its records carry back.
+    const Recorded = struct { ticket: u64, stamp: u32 };
+
+    fn nextBatchStamp(self: *Engine) u32 {
+        // The record carries the stamp as f32, which holds each value exactly.
+        self.batch_stamp = self.batch_stamp % (1 << 24) + 1;
+        return self.batch_stamp;
+    }
+
+    /// Record indexCells through its readback. The caller keeps `out` alive until
+    /// `finishCells` completes that read.
+    fn recordCells(self: *Engine, cells: []const u64, prm: Search, out: []Record) !Recorded {
         const s = &self.set;
         const n_ph = self.phases.items.len;
         const n: u32 = @intCast(cells.len);
         if (n_ph == 0) return error.NoPhases;
         if (out.len != n_ph * cells.len) return error.BadLength;
-        if (n == 0) return self.g.readTicket();
+        if (n == 0) return .{ .ticket = self.g.readTicket(), .stamp = 0 };
         const ls = self.levelOf(.search);
         const lr = self.levelOf(.refine);
         const lc = self.levelOf(.score);
@@ -2194,14 +2206,15 @@ pub const Engine = struct {
     }
 
     fn indexPrepared(self: *Engine, cells: []const u64, prm: Search, bd: ?*Band, out: []Record) !void {
-        const ticket = try self.recordPrepared(cells, prm, bd, out);
-        try self.g.waitFor(ticket);
+        const rec = try self.recordPrepared(cells, prm, bd, out);
+        try self.waitForRecords(rec, out);
+        for (out) |*r| r.z = 0;
     }
 
     /// Search/refine/score a batch already in pats at the three stage levels.
     /// Never uploads, preprocesses, calibrates chance, or assigns chance-z.
     /// Masters/band/PCA must already have been prepared by indexCells.
-    fn recordPrepared(self: *Engine, cells: []const u64, prm: Search, bd: ?*Band, out: []Record) !u64 {
+    fn recordPrepared(self: *Engine, cells: []const u64, prm: Search, bd: ?*Band, out: []Record) !Recorded {
         const g = &self.g;
         const gpa = self.gpa;
         const s = &self.set;
@@ -2239,6 +2252,7 @@ pub const Engine = struct {
             .iters = if (s.refine) s.refine_iters else 0,
             .max_step = @floatCast(std.math.degreesToRadians(s.refine_step)),
             .nmi_bins = s.nmi_bins,
+            .stamp = self.nextBatchStamp(),
         };
 
         if (spherical_method) {
@@ -2278,6 +2292,8 @@ pub const Engine = struct {
                 try self.det.dictBegin(n);
                 var d0: u32 = 0;
                 while (d0 < total) : (d0 += chunk) {
+                    // (a submission a chunk: no one submission keeps a slow device busy for long)
+                    if (d0 > 0) g.submit();
                     self.det.dictChunk(p.det[@intFromEnum(ls)], fr_s, t_avg, self.pats[@intFromEnum(ls)], p.dict_gpu, @min(chunk, total - d0), d0, n);
                 }
                 self.det.seedDict(fr_r, self.items_gpu[@intFromEnum(lr)], p.dict_gpu, n);
@@ -2292,13 +2308,21 @@ pub const Engine = struct {
             }
         }
         g.read(self.records, 0, std.mem.sliceAsBytes(out));
-        return g.readTicket();
+        return .{ .ticket = g.readTicket(), .stamp = refine.stamp };
     }
 
-    /// The batch recordCells gave `ticket` for, landed in `out` (its n cells): each match's NMI
-    /// on the scan's own scale.
-    fn finishCells(self: *Engine, ticket: u64, n: usize, out: []Record) !void {
-        try self.g.waitFor(ticket);
+    /// Wait for the read and reject any records the device left from another batch.
+    fn waitForRecords(self: *Engine, rec: Recorded, out: []const Record) !void {
+        try self.g.waitFor(rec.ticket);
+        const stamp: f32 = @floatFromInt(rec.stamp);
+        for (out) |r| {
+            if (r.z != stamp) return error.DeviceSkippedBatch;
+        }
+    }
+
+    /// Finish the batch and put each match's NMI on the scan's own scale.
+    fn finishCells(self: *Engine, rec: Recorded, n: usize, out: []Record) !void {
+        try self.waitForRecords(rec, out);
         self.reportNlpar();
         for (0..self.phases.items.len) |pi| {
             for (out[pi * n ..][0..n]) |*r| r.z = (r.nmi - self.chance_med[pi]) / self.chance_spread[pi];
@@ -2374,6 +2398,7 @@ pub const Engine = struct {
                 var d0: u32 = 0;
                 while (d0 < total) : (d0 += chunk) {
                     if (self.cancel.get()) return error.Cancelled;
+                    if (d0 > 0) g.submit();
                     self.det.dictChunkCandidates(phase.det[@intFromEnum(lv)], fr, t_avg, self.pats[@intFromEnum(lv)], phase.dict_gpu, @min(chunk, total - d0), d0, n, keep_n);
                 }
                 g.read(self.det.dict_best, 0, std.mem.sliceAsBytes(scores));
@@ -2404,11 +2429,16 @@ pub const Engine = struct {
                     count += 1;
                 }
                 if (count == 0) continue;
+                var refine = options;
+                refine.stamp = self.nextBatchStamp();
                 self.det.setPoses(poses[0..count]);
-                self.det.refine(phase.det[@intFromEnum(lv)], fr, self.pats[@intFromEnum(lv)], @intCast(count), options, records, 0);
+                self.det.refine(phase.det[@intFromEnum(lv)], fr, self.pats[@intFromEnum(lv)], @intCast(count), refine, records, 0);
                 g.read(records, 0, std.mem.sliceAsBytes(refined[0..count]));
-                try g.wait();
-                for (source_slots[0..count], refined[0..count]) |slot, record| phase_out[slot] = record;
+                try self.waitForRecords(.{ .ticket = g.readTicket(), .stamp = refine.stamp }, refined[0..count]);
+                for (source_slots[0..count], refined[0..count]) |slot, record| {
+                    phase_out[slot] = record;
+                    phase_out[slot].z = 0;
+                }
             }
         }
     }
@@ -3012,8 +3042,8 @@ pub const Engine = struct {
         };
     }
 
-    /// A batch in flight (indexBatches): its cells, the records it lands in, its read's ticket.
-    const Flight = struct { cells: []const u64, recs: []Record, ticket: u64 };
+    /// A batch in flight (indexBatches): its cells, the records it lands in, what was recorded.
+    const Flight = struct { cells: []const u64, recs: []Record, rec: Recorded };
 
     /// Index `cells` a batch at a time, two batches in flight: each batch is recorded and
     /// submitted while the device still works on the one before, which is waited on only then,
@@ -3039,24 +3069,24 @@ pub const Engine = struct {
             // the report reads what its averaging left)
             if (cur) |c| if (!more or self.nl_report == .queued) {
                 cur = null;
-                try self.finishCells(c.ticket, c.cells.len, c.recs);
+                try self.finishCells(c.rec, c.cells.len, c.recs);
                 try land(ctx, c.cells, c.recs);
             };
             if (!more) break;
             const n = @min(batch, cells.len - at);
             const mine = cells[at..][0..n];
             const out = recs[slot][0 .. self.phases.items.len * n];
-            const ticket = try self.recordCells(mine, prm, out);
+            const rec = try self.recordCells(mine, prm, out);
             self.g.submit();
             at += n;
             slot = 1 - slot;
             const next = if (at < cells.len) cells[at..][0..@min(batch, cells.len - at)] else after;
             if (next.len != 0 and !self.cancel.get()) self.readAhead(next);
             if (cur) |c| {
-                try self.finishCells(c.ticket, c.cells.len, c.recs);
+                try self.finishCells(c.rec, c.cells.len, c.recs);
                 try land(ctx, c.cells, c.recs);
             }
-            cur = .{ .cells = mine, .recs = out, .ticket = ticket };
+            cur = .{ .cells = mine, .recs = out, .rec = rec };
         }
     }
 
