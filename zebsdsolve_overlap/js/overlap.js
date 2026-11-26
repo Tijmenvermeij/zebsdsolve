@@ -318,7 +318,9 @@ export function createOverlap({ st, busy, runPrimary, selectTab, redraw, status,
   }
 
   async function computeTiles(engine, candidate, options, check, onTile, colors) {
-    const batch = Math.max(1, Math.min(64, engine.settings.batch));
+    const profile = options.polish || options.minResidualNcc != null;
+    const batch = (profile && engine.overlapProfileBatchWidth) ||
+      Math.max(1, Math.min(64, engine.settings.batch));
     const {primaryMinimum, residualMapMinimum, ...fitOptions} = options;
     for (let first = 0; first < candidate.requested.length; first += batch) {
       if (!check()) return false;

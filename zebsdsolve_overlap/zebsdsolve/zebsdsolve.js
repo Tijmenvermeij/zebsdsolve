@@ -531,7 +531,7 @@ export function decodeOverlapProfileEvents(bytes, cells, selectionVersion=1, sta
 
 // Exports that never wait (plain calls); every other function export may suspend (on the GPU
 // or on a file read) and is called through WebAssembly.promising.
-const SYNC_EXPORTS = new Set(["ze_alloc", "ze_free", "ze_version", "ze_overlap_optimizer_version", "ze_overlap_trajectory_version", "ze_overlap_profile_version", "ze_overlap_profile_selection_version", "ze_overlap_stage_gate_version", "ze_overlap_set_next_bandwidth", "ze_oxford_detector_attitude_version", "ze_overlap_profile_trace_capacity", "ze_create", "ze_destroy", "ze_adapter", "ze_error",
+const SYNC_EXPORTS = new Set(["ze_alloc", "ze_free", "ze_version", "ze_overlap_optimizer_version", "ze_overlap_trajectory_version", "ze_overlap_profile_version", "ze_overlap_profile_selection_version", "ze_overlap_stage_gate_version", "ze_overlap_set_next_bandwidth", "ze_oxford_detector_attitude_version", "ze_overlap_profile_trace_capacity", "ze_overlap_profile_batch_width", "ze_create", "ze_destroy", "ze_adapter", "ze_error",
   "ze_has_acquisition_calibration", "ze_configure", "ze_settings", "ze_events", "ze_cancel", "ze_close_scan", "ze_scan_info", "ze_scan_format", "ze_scan_overview_kind",
   "ze_get_geometry", "ze_set_geometry", "ze_clear_phases", "ze_phase_count", "ze_phase_info", "ze_pattern_shape", "ze_nlpar_view",
   "ze_seed_source_roi", "ze_stored_primary_validity", "ze_phase_generation", "ze_orientation_colors", "ze_pc_scores", "ze_fit_patterns", "ze_results", "ze_map", "ze_ipf_key", "ze_export", "ze_frame", "ze_set_frame", "ze_export_snapshot", "ze_export_oxford_snapshot", "ze_result_checkpoint", "ze_restore_result_checkpoint", "ze_result_chance", "ze_bunge", "ze_reduce", "ze_disorientation", "ze_shader",
@@ -649,6 +649,7 @@ export class Zebsdsolve {
 
   /** Cheap native asset epoch, independent of warm-up/index scheduling. */
   get phaseGeneration() { return this._frame(()=>Number(this.x.ze_phase_generation(this.e))); }
+  get overlapProfileBatchWidth() { return this.x.ze_overlap_profile_batch_width?.(this.e) ?? 0; }
   get detectorAttitudeVersion() { return this.x.ze_oxford_detector_attitude_version?.(this.e) ?? null; }
 
   get hasAcquisitionCalibration() { return !!this._frame(() => this.x.ze_has_acquisition_calibration(this.e)); }
