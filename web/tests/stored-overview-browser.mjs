@@ -157,8 +157,8 @@ try {
   console.error("preview: P6 stored quality loaded",JSON.stringify(first));
   assert.equal(first.calls.contrast,0);assert.equal(first.idleBytes,0);
   assert.ok(first.initialBytes<16*1024*1024,`Opening exceeded bounded metadata traffic: ${first.initialBytes}`);
-  assert.ok(first.calls.patterns.length<=2 && first.calls.patterns.every(p=>p.stage===0), "Opening may display the selected stored pattern only");
-  assert.equal(first.live,true);assert.equal(first.stage,'stored');
+  assert.ok(first.calls.patterns.length<=2 && first.calls.patterns.every(p=>p.stage===1), "Opening may display the selected filtered pattern only");
+  assert.equal(first.live,true);assert.equal(first.stage,'filtered');
   assert.ok(first.calls.patternStarts.every(p=>p.legend==='Band contrast'),'The stored overview must be drawn before the first pattern request');
   const controls = await evaluate(`
     const select=document.getElementById('overview-source'), button=document.getElementById('btn-overview');

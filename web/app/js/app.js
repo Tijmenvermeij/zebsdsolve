@@ -641,7 +641,7 @@ function afterOpen(files = [], hints = null) {
   st.storedOverview = st.calculatedOverview = null;
   st.overviewSource = null;
   st.overviewLoading = true;
-  st.stage = "stored";
+  st.stage = "filtered";
   updateOverviewControls();
   st.view = { k: 1, cx: s.cols / 2, cy: s.rows / 2, s: 1 };
   app.dataset.scan = "1";
