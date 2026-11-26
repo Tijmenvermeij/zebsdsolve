@@ -160,7 +160,7 @@ export const FIELDS = {
     { key: "refine_pixels", label: "px / thread", type: "int", min: 8, max: 65536, hint: "Pixels of a pattern one GPU invocation adds up in refinement. Speed only. The fastest value grows with the batch, so Tune speed moves the two together." },
     { key: "wg_refine", label: "WG refine", type: "enum", options: [[16, "16"], [32, "32"], [64, "64"], [128, "128"], [256, "256"]], hint: "GPU invocations per workgroup of refinement's sums. Speed only; each value is compiled once." },
     { key: "wg_fft", label: "WG FFT", type: "enum", options: [[16, "16"], [32, "32"], [64, "64"], [128, "128"], [256, "256"]], hint: "GPU invocations per workgroup of the correlation's FFT kernels. Speed only; each value is compiled once." },
-    { key: "tile_mb", label: "FFT MiB", type: "int", min: 8, max: 8192, hint: "Memory the correlation's spectra may take per dispatch: how many patterns of a batch are correlated at once. Speed only, and it made no difference where it was measured, so Tune speed leaves it." },
+    { key: "tile_mb", label: "GPU tile MiB", type: "int", min: 8, max: 8192, hint: "Scratch budget for spherical correlation and overlap blur/gain batches. Tune speed leaves this value as set." },
   ],
   // the Simulate step
   simbeam: [

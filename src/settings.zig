@@ -360,7 +360,7 @@ pub const Settings = struct {
     // The defaults suit every GPU reasonably. `tune` measures this machine and this scan and
     // sets `batch` above, `refine_pixels` and the two workgroup sizes to what runs fastest.
     /// Memory the correlation's spectra may take per dispatch, MiB: how many patterns of a
-    /// batch are correlated at once.
+    /// batch are correlated at once. Also caps the overlap profile scratch batch.
     tile_mb: u32 = 256,
     /// Pixels of a pattern that one GPU invocation adds up in refinement (at most: orientation
     /// refinement rounds a pattern's share of invocations up to whole workgroups of

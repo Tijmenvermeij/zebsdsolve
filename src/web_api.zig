@@ -51,3 +51,7 @@ export fn ze_create() ?*Engine {
 export fn ze_destroy(e: *Engine) void {
     e.destroy();
 }
+
+export fn ze_overlap_profile_batch_width(e: *const Engine) u32 {
+    return engine.overlap_profile.batchWidth(e);
+}

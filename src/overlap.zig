@@ -59,13 +59,26 @@ pub const Fit = struct {
     state: gpu.Buf = .{},
     progress: gpu.Buf = .{},
     pub fn init(g: *gpu.Gpu, n: u32, px: u32, width: u32, mask: [3]f32, target: gpu.Buf) Fit {
-        var f: Fit = .{ .g = g, .n = n, .px = px, .width = width, .mask = mask };
-        f.original = g.storage(@as(u64, n) * px * 4);
-        f.bank = g.storage(@as(u64, capacity) * n * px * 4);
-        f.state = g.storage(@as(u64, n) * @sizeOf(State));
-        f.progress = g.storage(@as(u64, n) * @sizeOf(Progress));
-        g.clear(f.bank);
+        var f = allocate(g, n, px, width, mask);
         f.resetTarget(target);
+        return f;
+    }
+
+    /// Reserve space for n lanes. Set the active length and reset the target
+    /// before recording work if fewer lanes are populated.
+    pub fn allocate(g: *gpu.Gpu, n: u32, px: u32, width: u32, mask: [3]f32) Fit {
+        const f: Fit = .{
+            .g = g,
+            .n = n,
+            .px = px,
+            .width = width,
+            .mask = mask,
+            .original = g.storage(@as(u64, n) * px * 4),
+            .bank = g.storage(@as(u64, capacity) * n * px * 4),
+            .state = g.storage(@as(u64, n) * @sizeOf(State)),
+            .progress = g.storage(@as(u64, n) * @sizeOf(Progress)),
+        };
+        g.clear(f.bank);
         return f;
     }
     /// Reuse this allocation for another batch of n prepared target rows.

@@ -9,6 +9,7 @@ const gpu = @import("gpu/gpu.zig");
 const shaders = @import("shaders");
 const overlap = @import("overlap.zig");
 const nuisance = @import("overlap_nuisance.zig");
+const batched = @import("overlap_profile_batch.zig");
 const Theta = nuisance.Theta;
 const Quat = [4]f32;
 const nan = std.math.nan(f32);
@@ -121,14 +122,6 @@ pub const Request = struct {
     source_q: []Quat,
     events: []Event,
     used: usize = 0,
-
-    fn log(self: *Request, event: Event) !usize {
-        if (self.used == self.events.len) return error.ProfileTraceCapacityExceeded;
-        const index = self.used;
-        self.events[index] = event;
-        self.used += 1;
-        return index;
-    }
 };
 
 fn finiteScore(x: f32) bool {
@@ -215,17 +208,6 @@ const Support = struct {
 
     fn positive(self: Support) bool {
         return self.k > 0 and assessed(self.state) and @popCount(self.activeMask()) == self.k;
-    }
-};
-
-const SingletonSeed = struct {
-    state: overlap.State,
-    theta: Theta = nuisance.identity,
-
-    fn needsResidual(seed: ?SingletonSeed) bool {
-        const fit = (seed orelse return false).state;
-        return fit.amplitude[0] > 0 and improves(fit.sse, fit.initial_sse, fit.initial_sse) and
-            fit.sse > 1e-8 * fit.initial_sse;
     }
 };
 
@@ -427,15 +409,7 @@ const Work = struct {
     lv: core.Level,
     frame: spherical.Frame,
     t: [3]f32,
-    cell: u64,
-    row: u32,
-    band: ?*core.Band,
-    search: core.Search,
-    pool: []core.Record,
     refinement: ?*Refinement,
-    seed_target: gpu.Buf,
-    residual_seeds: []?SingletonSeed,
-    first_residual: ?FirstResidual = null,
     cache: [4]Member = @splat(.{}),
 
     fn check(self: *Work) !void {
@@ -481,47 +455,6 @@ const Work = struct {
         try self.check();
         self.queueFixedRead(s);
         try self.wait();
-    }
-
-    fn queueTheta(self: *Work, s: Support, trial: *overlap.State, theta: *Theta) void {
-        self.stage(s);
-        var seeds: [4]Theta = undefined;
-        for (&seeds, 0..) |*t, j| t.* = s.members[@min(j, s.k - 1)].single_theta;
-        self.model.profileNuisance(s.theta, seeds);
-        self.model.readProfile(trial, theta);
-    }
-
-    fn retainTheta(s: *Support, trial: overlap.State, theta: Theta) void {
-        if (assessed(trial) and (!assessed(s.state) or improves(trial.sse, s.state.sse, trial.initial_sse))) {
-            s.state = trial;
-            s.theta = theta;
-        }
-    }
-
-    fn optimizeTheta(self: *Work, s: *Support) !void {
-        if (!self.model.optimize_enabled) return;
-        try self.check();
-        var trial: overlap.State = undefined;
-        var theta: Theta = undefined;
-        self.queueTheta(s.*, &trial, &theta);
-        try self.wait();
-        retainTheta(s, trial, theta);
-    }
-
-    fn fitSupport(self: *Work, input: Support, prefit: bool) !Support {
-        var seed = input;
-        try self.check();
-        if (!prefit) self.queueFixedRead(&seed);
-        // The nuisance search does not consume the fixed-fit result. Queue both
-        // reads before waiting, then compare once both host destinations are ready.
-        if (self.model.optimize_enabled) {
-            var trial: overlap.State = undefined;
-            var theta: Theta = undefined;
-            self.queueTheta(seed, &trial, &theta);
-            try self.wait();
-            retainTheta(&seed, trial, theta);
-        } else if (!prefit) try self.wait();
-        return seed;
     }
 
     fn refineSelected(self: *Work, seed: Support) !Support {
@@ -634,277 +567,6 @@ const Work = struct {
         if (trial.positive()) support.* = trial;
     }
 
-    fn residual(self: *Work, s: Support) !void {
-        try self.check();
-        self.stage(s);
-        self.model.prepareFixedTheta(s.theta);
-        const g = &self.engine.g;
-        const f = self.model.fit;
-        g.copy(self.model.trial.bank, 0, f.bank, 0, @as(u64, s.k) * f.px * 4);
-        // The unchanged accepted amplitude vector is the explicit nested
-        // zero-new-amplitude witness. Rebuild its own residual, never a rejected
-        // candidate's bank, coefficients or theta.
-        g.writeSlice(f.state, 0, overlap.State, &.{s.state});
-        f.residual(s.k, self.engine.pats[@intFromEnum(self.lv)], true);
-    }
-
-    fn singleton(self: *Work, native: Member, precomputed: ?SingletonSeed) !Support {
-        var seed = (Support{}).append(native);
-        var result = if (precomputed) |pre| result: {
-            seed.state = pre.state;
-            seed.theta = pre.theta;
-            break :result seed;
-        } else try self.fitSupport(seed, false);
-        if (assessed(result.state)) {
-            result.members[0].single_theta = result.theta;
-            result.members[0].single_sse = result.state.sse;
-        }
-        return result;
-    }
-
-    fn compactFace(self: *Work, input: Support) !Support {
-        var s = input;
-        while (assessed(s.state) and !s.positive()) {
-            const mask = s.activeMask();
-            if (mask == 0) return .{};
-            s = try self.fitSupport(s.subset(mask), false);
-        }
-        return s;
-    }
-
-    fn saveLower(battle: *Competition, s: Support, event_idx: usize) void {
-        if (!s.positive()) return;
-        const b = battle.lower;
-        if (improves(s.state.sse, b.state.sse, s.state.initial_sse) or
-            (battle.lower_event != null and !improves(b.state.sse, s.state.sse, b.state.initial_sse) and s.k < b.k))
-        {
-            battle.lower = s;
-            battle.lower_event = event_idx;
-        }
-    }
-
-    fn evaluate(self: *Work, baseline: Support, native: Member, battle: *Competition, req: *Request, index: usize, primary_fit: ?*?Support, precomputed: ?SingletonSeed) !void {
-        var event = &req.events[index];
-        if (!native.valid()) return;
-        event.flags |= flag.native;
-        battle.valid += 1;
-        if (baseline.k > 0 and self.options.flags & 2 != 0 and native.source.proposal_ncc < self.options.min_residual_ncc) {
-            event.flags |= flag.screened;
-            battle.screened += 1;
-            return;
-        }
-        const cached = if (primary_fit) |fit| fit.* else null;
-        const single = cached orelse try self.singleton(native, precomputed);
-        if (primary_fit) |fit| fit.* = single;
-        if (baseline.k == 0) {
-            battle.archive.remember(single, index, false);
-        } else {
-            battle.offerLower(single, index);
-        }
-        if (baseline.k == 0) {
-            event.joint_sse = if (assessed(single.state)) single.state.sse else nan;
-            if (single.positive() and improves(single.state.sse, baseline.state.sse, baseline.state.initial_sse)) {
-                event.flags |= flag.joint;
-                if (!battle.joint.positive() or improves(single.state.sse, battle.joint.state.sse, single.state.initial_sse)) {
-                    battle.joint = single;
-                    battle.joint_event = index;
-                }
-            } else {
-                event.flags |= flag.boundary;
-                battle.unresolved = battle.unresolved or !assessed(single.state);
-            }
-            return;
-        }
-        // The prior support, embedded with zero amplitude for the new pose, is
-        // feasible even when a reprofiled joint design is rank deficient.
-        var lower = baseline;
-        if (single.positive() and improves(single.state.sse, lower.state.sse, lower.state.initial_sse)) lower = single;
-
-        var seed = baseline.append(single.members[0]);
-        seed.theta = baseline.theta;
-        try self.fixed(&seed);
-        const joint = try self.fitSupport(seed, true);
-        if (assessed(joint.state)) {
-            // The prior embedded model is an achieved feasible nested trial.
-            event.joint_sse = @min(baseline.state.sse, joint.state.sse);
-            event.flags |= if (battle.offerJoint(baseline.state.sse, joint, index)) flag.joint else flag.boundary;
-        } else {
-            battle.unresolved = true;
-            event.flags |= flag.boundary;
-        }
-
-        // At K3/K4 each possible drop-one support is independently reprofiled.
-        // Include any smaller exact active face the joint happened to reach.
-        const all = (@as(u32, 1) << @intCast(joint.k)) - 1;
-        const active = if (assessed(joint.state)) joint.activeMask() else 0;
-        for (1..all) |m| {
-            const mask: u32 = @intCast(m);
-            const count: u32 = @popCount(mask);
-            if (count != joint.k - 1 and !(active != 0 and active == mask)) continue;
-            const subset = joint.subset(mask);
-            // K2's independently strengthened singletons are already achieved.
-            // An identical pose can still benefit from the joint theta.
-            var reduced = subset;
-            if (joint.k == 2 and
-                (subset.members[0].sameProjection(baseline.members[0]) or subset.members[0].sameProjection(single.members[0])))
-            {
-                try self.fixed(&reduced);
-                if (assessed(reduced.state) and improves(reduced.state.sse, lower.state.sse, reduced.state.initial_sse))
-                    try self.optimizeTheta(&reduced);
-            } else reduced = try self.fitSupport(subset, false);
-            reduced = try self.compactFace(reduced);
-            if (reduced.positive() and reduced.k == 1) {
-                reduced.members[0].single_sse = reduced.state.sse;
-                reduced.members[0].single_theta = reduced.theta;
-            }
-            battle.offerLower(reduced, index);
-            if (reduced.positive() and (improves(reduced.state.sse, lower.state.sse, reduced.state.initial_sse) or
-                (lower.k != baseline.k and !improves(lower.state.sse, reduced.state.sse, reduced.state.initial_sse) and reduced.k < lower.k))) lower = reduced;
-        }
-        if (lower.k == 1) {
-            lower.members[0].single_sse = lower.state.sse;
-            lower.members[0].single_theta = lower.theta;
-        }
-        event.flags |= flag.lower;
-        event.lower_sse = lower.state.sse;
-        if (battle.stage_reference_sse == null) saveLower(battle, lower, index);
-    }
-
-    fn prepareResidualSeeds(self: *Work, ranks: usize) !void {
-        @memset(self.residual_seeds, null);
-        if (ranks < 2 or self.residual_seeds.len == 0) return;
-        const g = &self.engine.g;
-        const bytes = @as(u64, self.model.fit.px) * 4;
-        const capacity: usize = @intCast(@min(ranks, self.seed_target.size / bytes));
-        if (capacity < 2) return;
-        var poses: [8]detector.Pose = undefined;
-        var rows: [8]usize = undefined;
-        var seeds: [8]?SingletonSeed = undefined;
-        for (0..self.engine.phases.items.len) |phase| {
-            var first: usize = 0;
-            while (first < ranks) : (first += capacity) {
-                const end = @min(first + capacity, ranks);
-                var n: usize = 0;
-                for (first..end) |rank| {
-                    const i = phase * ranks + rank;
-                    const member = Member.indexed(self.pool[i], phase, @intCast(rank + 1));
-                    if (!member.valid()) continue;
-                    if (self.options.flags & 2 != 0 and member.source.proposal_ncc < self.options.min_residual_ncc) continue;
-                    poses[n] = .{ .q = member.source.q, .t = self.t, .pat = 0 };
-                    rows[n] = i;
-                    n += 1;
-                }
-                if (n < 2) continue;
-                for (0..n) |i| g.copy(self.model.fit.original, 0, self.seed_target, i * bytes, bytes);
-                try fitSingletonSeeds(self.engine, self.lv, self.frame, phase, poses[0..n], self.seed_target, self.model.optimize_enabled, seeds[0..n], null);
-                for (rows[0..n], seeds[0..n]) |row, seed| self.residual_seeds[row] = seed;
-            }
-        }
-    }
-
-    fn branch(self: *Work, primary: []const core.Record, stride: usize, k: u32, keep_n: u32, branch_id: u32, initial: Outcome, req: *Request, primary_fits: []?Support, primary_seeds: []const ?SingletonSeed) !Outcome {
-        var out = initial;
-        var replacements = [_]u32{0} ** 5;
-        while (out.progress.stop_reason == 0) {
-            try self.check();
-            const baseline = out.support;
-            const order = baseline.k + 1;
-            const ranks = if (order == 1) 1 else keep_n;
-            var first_prefit: ?SingletonSeed = null;
-            if (order != 1) {
-                if (self.first_residual) |cached| {
-                    // This cache is only installed for rank-one,
-                    // single-phase K2 with the same prefit used for this primary.
-                    self.pool[0] = cached.record;
-                    first_prefit = cached.seed;
-                    self.first_residual = null;
-                } else {
-                    try self.residual(baseline);
-                    const nrec = self.engine.phases.items.len * ranks;
-                    try self.engine.indexPreparedCandidates(&.{self.cell}, self.search, self.band, ranks, self.pool[0..nrec]);
-                }
-                try self.check();
-                try self.prepareResidualSeeds(ranks);
-            }
-            var reference: ?f32 = null;
-            if (order > 1 and self.options.min_stage_improvement != null) {
-                reference = baseline.state.sse;
-                for (1..order) |k_lower| {
-                    const score = out.archive.score(k_lower);
-                    if (finiteScore(score)) reference = @min(reference.?, score);
-                }
-            }
-            var battle: Competition = .{ .lower = baseline, .archive = &out.archive, .stage_reference_sse = reference };
-            for (0..self.engine.phases.items.len) |pi| for (0..ranks) |rank| {
-                const record = if (order == 1) primary[pi * stride + self.row] else self.pool[pi * ranks + rank];
-                const member = Member.indexed(record, pi, if (order == 1) 0 else @intCast(rank + 1));
-                const idx = try req.log(.{
-                    .cell_index = self.row,
-                    .branch = branch_id,
-                    .order = order,
-                    .attempt = replacements[order],
-                    .phase = @intCast(pi),
-                    .rank = member.rank,
-                    .source_q = record.q,
-                    .residual_ncc = if (order == 1 or !member.valid()) nan else record.ncc,
-                    .baseline_sse = baseline.state.sse,
-                    .result_order = baseline.k,
-                });
-                // Both trajectories start from exactly the same primary fits.
-                // Each still records its own candidates, ties and selection.
-                const primary_fit = if (order == 1 and primary_fits.len != 0) &primary_fits[pi] else null;
-                const precomputed = if (order == 1)
-                    if (primary_seeds.len != 0) primary_seeds[pi * stride + self.row] else null
-                else if (first_prefit != null)
-                    first_prefit
-                else if (self.residual_seeds.len != 0)
-                    self.residual_seeds[pi * ranks + rank]
-                else
-                    null;
-                try self.evaluate(baseline, member, &battle, req, idx, primary_fit, precomputed);
-            };
-            try self.check();
-            if (battle.valid > 0 and battle.screened == battle.valid) {
-                // Every byte of the accepted prefix remains intact. The stop
-                // reason and the separate proposal log describe the screen.
-                out.progress.stop_reason = 11;
-                break;
-            }
-            const stage_rejected = if (reference != null)
-                battle.gateJoint(self.options.min_stage_improvement.?[order - 2], req.events)
-            else
-                false;
-            out.progress.proposed_count += 1;
-            if (stage_rejected) {
-                out.progress.stop_reason = 13;
-                break;
-            }
-            const selected = battle.selection() orelse {
-                out.progress.stop_reason = if (battle.unresolved) 4 else if (battle.valid == 0) 3 else 5;
-                out.progress.boundary_seen = if (battle.unresolved) 2 else if (battle.valid != 0) 1 else 0;
-                out.updateEvidence();
-                break;
-            };
-            out.support = selected.support;
-            if (selected.replacement) {
-                req.events[selected.event].flags |= flag.replace;
-                replacements[order] += 1;
-                if (replacements[order] >= max_replacements) out.progress.stop_reason = 12;
-            } else req.events[selected.event].flags |= flag.add;
-            req.events[selected.event].result_order = out.support.k;
-            out.progress.retained_order = out.support.k;
-            out.progress.active_count = out.support.k;
-            out.updateEvidence();
-            out.progress.boundary_seen = 0;
-            if (out.progress.stop_reason == 0) {
-                if (out.support.state.sse <= 1e-8 * out.support.state.initial_sse) {
-                    out.progress.stop_reason = 2;
-                } else if (out.support.k == k) out.progress.stop_reason = 1;
-            }
-        }
-        return out;
-    }
-
     fn publish(self: *Work, out: Outcome, slots: []overlap.Component, source_q: []Quat, ranks: []i32, norms: []f32, state: *overlap.State) !void {
         const s = out.support;
         state.* = s.state;
@@ -931,252 +593,586 @@ const Work = struct {
     }
 };
 
-/// Shared fixed-identity and blur/gain prefit. All lanes in a dispatch
-/// project the same master, each with its own pose and measured target.
-fn fitSingletonSeeds(e: *core.Engine, lv: core.Level, frame: spherical.Frame, phase: usize, poses: []const detector.Pose, target: gpu.Buf, optimize: bool, seeds: []?SingletonSeed, residuals: ?gpu.Buf) !void {
-    if (e.cancel.get()) return error.Cancelled;
-    const g = &e.g;
-    const px = frame.pat_h * frame.pat_w;
-    const count: u32 = @intCast(poses.len);
-    var fixed_states: [64]overlap.State = undefined;
-    var optimized_states: [64]overlap.State = undefined;
-    var theta: [64]Theta = undefined;
-    var fit = overlap.Fit.init(g, count, px, frame.pat_w, frame.mask, target);
-    var model = nuisance.Model.init(g, &e.prep, &fit);
-    defer if (residuals != null) {
-        model.deinit();
-        fit.deinit();
-        // Submit the completed residual before the next large workspace is
-        // allocated. No host readback is needed here.
-        g.submit();
-    };
-    model.contrast = true;
-    model.optimize_enabled = optimize;
-    e.det.setPoses(poses);
-    e.det.project(e.phases.items[phase].det[@intFromEnum(lv)], frame, count);
-    g.copy(e.det.sims, 0, model.raw, 0, @as(u64, count) * px * 4);
-    model.singletonSeeds(fixed_states[0..count], optimized_states[0..count], theta[0..count]);
-    if (residuals == null) {
-        model.deinit();
-        fit.deinit();
+const History = struct {
+    outcome: Outcome,
+    events: []Event,
+    used: usize = 0,
+    replacements: [5]u32 = @splat(0),
+
+    fn log(self: *History, event: Event) !usize {
+        if (self.used == self.events.len) return error.ProfileTraceCapacityExceeded;
+        const index = self.used;
+        self.events[index] = event;
+        self.used += 1;
+        return index;
     }
-    try g.wait();
-    if (e.cancel.get()) return error.Cancelled;
-    for (seeds, 0..) |*out, i| {
-        var seed: Support = .{ .state = fixed_states[i] };
-        if (optimize) Work.retainTheta(&seed, optimized_states[i], theta[i]);
-        // Let the scalar path retain its exact unavailable-state diagnostics.
-        out.* = if (assessed(seed.state)) .{ .state = seed.state, .theta = seed.theta } else null;
+
+    fn nextOrder(self: *const History) ?u32 {
+        return if (self.outcome.progress.stop_reason == 0) self.outcome.support.k + 1 else null;
     }
-    if (residuals) |destination| {
-        for (seeds) |seed| {
-            if (SingletonSeed.needsResidual(seed)) break;
-        } else return;
-        for (seeds, 0..) |seed, i| {
-            fixed_states[i] = if (seed) |valid| valid.state else .{};
-            theta[i] = if (seed) |valid| valid.theta else nuisance.identity;
+
+    fn begin(self: *History, order: u32, options: Options) Competition {
+        const baseline = self.outcome.support;
+        var reference: ?f32 = null;
+        if (order > 1 and options.min_stage_improvement != null) {
+            reference = baseline.state.sse;
+            for (1..order) |k_lower| {
+                const score = self.outcome.archive.score(k_lower);
+                if (finiteScore(score)) reference = @min(reference.?, score);
+            }
         }
-        // The same original image, fixed theta, and saved amplitudes as
-        // Work.residual, with one independent target per lane.
-        model.preparePolishColumns(model.raw, theta[0..count]);
-        g.copy(model.trial.bank, 0, fit.bank, 0, @as(u64, count) * px * 4);
-        g.writeSlice(fit.state, 0, overlap.State, fixed_states[0..count]);
-        fit.residual(1, destination, true);
+        return .{ .lower = baseline, .archive = &self.outcome.archive, .stage_reference_sse = reference };
     }
+
+    fn finish(self: *History, battle: *Competition, order: u32, k: u32, options: Options) void {
+        const out = &self.outcome;
+        if (battle.valid > 0 and battle.screened == battle.valid) {
+            // The accepted prefix stays intact when every candidate is screened.
+            out.progress.stop_reason = 11;
+            return;
+        }
+        const stage_rejected = if (battle.stage_reference_sse != null)
+            battle.gateJoint(options.min_stage_improvement.?[order - 2], self.events)
+        else
+            false;
+        out.progress.proposed_count += 1;
+        if (stage_rejected) {
+            out.progress.stop_reason = 13;
+            return;
+        }
+        const selected = battle.selection() orelse {
+            out.progress.stop_reason = if (battle.unresolved) 4 else if (battle.valid == 0) 3 else 5;
+            out.progress.boundary_seen = if (battle.unresolved) 2 else if (battle.valid != 0) 1 else 0;
+            out.updateEvidence();
+            return;
+        };
+        out.support = selected.support;
+        const event = &self.events[selected.event];
+        if (selected.replacement) {
+            event.flags |= flag.replace;
+            self.replacements[order] += 1;
+            if (self.replacements[order] >= max_replacements) out.progress.stop_reason = 12;
+        } else event.flags |= flag.add;
+        event.result_order = out.support.k;
+        out.progress.retained_order = out.support.k;
+        out.progress.active_count = out.support.k;
+        out.updateEvidence();
+        out.progress.boundary_seen = 0;
+        if (out.progress.stop_reason == 0) {
+            if (out.support.state.sse <= 1e-8 * out.support.state.initial_sse) {
+                out.progress.stop_reason = 2;
+            } else if (out.support.k == k) out.progress.stop_reason = 1;
+        }
+    }
+};
+
+const Row = struct {
+    t: [3]f32,
+    trace: []Event,
+    histories: [2]History,
+
+    fn sharePrimary(self: *Row) void {
+        const exact = &self.histories[0];
+        const pooled = &self.histories[1];
+        pooled.outcome = exact.outcome;
+        pooled.used = exact.used;
+        const events = pooled.events[0..pooled.used];
+        @memcpy(events, exact.events[0..exact.used]);
+        for (events) |*event| event.branch = 1;
+    }
+
+    fn select(self: *Row, compare_pooled: bool, options: Options) struct { outcome: Outcome, events: []Event } {
+        const exact = &self.histories[0];
+        const pooled = &self.histories[1];
+        const exact_used = exact.used;
+        const pooled_used = pooled.used;
+        if (compare_pooled) {
+            std.mem.copyForwards(Event, self.trace[exact_used..][0..pooled_used], pooled.events[0..pooled_used]);
+            for (&pooled.outcome.archive.by_order) |*entry| {
+                if (entry.*) |*candidate| candidate.event += exact_used;
+            }
+        }
+        const events = self.trace[0 .. exact_used + pooled_used];
+        const archive = if (compare_pooled) pooled.outcome.archive else null;
+        var selected = exact.outcome;
+        var source: i32 = -1;
+        if (exact.outcome.archive.best(archive)) |achieved| {
+            const event = &events[achieved.event];
+            source = @intCast(event.branch);
+            if (source == 1) selected = pooled.outcome;
+            if (archive) |other| {
+                selected.archive = exact.outcome.archive;
+                selected.archive.include(other);
+            }
+            selected.useAchieved(achieved);
+            if (options.flags & 4 != 0) {
+                event.flags |= flag.published;
+                if (achieved.from_lower) event.flags |= flag.published_lower;
+            }
+        }
+        for (events) |*event| if (source >= 0 and event.branch == @as(u32, @intCast(source))) {
+            event.flags |= flag.chosen_branch;
+        };
+        selected.progress._pad = if (source < 0) unselected else @intCast(source);
+        return .{ .outcome = selected, .events = events };
+    }
+};
+
+fn fitJob(row: usize, t: [3]f32, support: Support, mode: batched.Mode) batched.Job {
+    var job: batched.Job = .{
+        .row = row,
+        .k = support.k,
+        .poses = undefined,
+        .phases = undefined,
+        .seeds = .{ .warm = support.theta },
+        .state = support.state,
+        .mode = mode,
+    };
+    for (support.members[0..support.k], 0..) |member, j| {
+        job.poses[j] = .{ .q = member.pose(), .t = t, .pat = 0 };
+        job.phases[j] = @intCast(member.source.phase);
+    }
+    for (&job.seeds.singles, 0..) |*seed, j| seed.* = support.members[@min(j, support.k - 1)].single_theta;
+    return job;
 }
 
-const FirstResidual = struct {
-    record: core.Record,
-    seed: ?SingletonSeed = null,
+const Wave = struct {
+    jobs: []batched.Job,
+    destinations: []*Support,
+    used: usize = 0,
+
+    fn add(self: *Wave, row: usize, t: [3]f32, support: *Support, mode: batched.Mode) void {
+        self.jobs[self.used] = fitJob(row, t, support.*, mode);
+        self.destinations[self.used] = support;
+        self.used += 1;
+    }
+
+    fn fit(self: *Wave, batch: *batched.Batch) !void {
+        if (self.used == 0) return;
+        const jobs = self.jobs[0..self.used];
+        try batch.run(jobs);
+        for (jobs, self.destinations[0..self.used]) |job, support| {
+            if (job.mode != .optimize) support.state = job.state;
+            if (job.optimized) |trial| {
+                if (assessed(trial.state) and (!assessed(support.state) or improves(trial.state.sse, support.state.sse, trial.state.initial_sse))) {
+                    support.state = trial.state;
+                    support.theta = trial.theta;
+                }
+            }
+        }
+        self.used = 0;
+    }
 };
 
-const Prefetch = struct {
-    records: []?FirstResidual,
-    search: core.Search,
+fn saveSingleton(s: *Support) void {
+    s.members[0].single_sse = s.state.sse;
+    s.members[0].single_theta = s.theta;
+}
+
+const Proposal = struct {
+    lane: usize,
+    event: usize,
+    single: Support,
+    joint: Support = .{},
+    lower: Support = .{},
+    // At most four drop-one models and one smaller active face.
+    faces: [5]Support = undefined,
+    face_count: usize = 0,
+
+    fn faceForMask(self: *Proposal, mask: u32) ?*Support {
+        const active = if (assessed(self.joint.state)) self.joint.activeMask() else 0;
+        if (@popCount(mask) != self.joint.k - 1 and active != mask) return null;
+        return &self.faces[self.face_count];
+    }
+
+    fn offer(self: *const Proposal, baseline: Support, battle: *Competition, event: *Event) void {
+        const single = self.single;
+        if (baseline.k == 0) {
+            battle.archive.remember(single, self.event, false);
+            event.joint_sse = if (assessed(single.state)) single.state.sse else nan;
+            if (single.positive() and improves(single.state.sse, baseline.state.sse, baseline.state.initial_sse)) {
+                event.flags |= flag.joint;
+                if (!battle.joint.positive() or improves(single.state.sse, battle.joint.state.sse, single.state.initial_sse)) {
+                    battle.joint = single;
+                    battle.joint_event = self.event;
+                }
+            } else {
+                event.flags |= flag.boundary;
+                battle.unresolved = battle.unresolved or !assessed(single.state);
+            }
+            return;
+        }
+
+        battle.offerLower(single, self.event);
+        const joint = self.joint;
+        if (assessed(joint.state)) {
+            // The accepted support is a feasible nested fit with zero added amplitude.
+            event.joint_sse = @min(baseline.state.sse, joint.state.sse);
+            event.flags |= if (battle.offerJoint(baseline.state.sse, joint, self.event)) flag.joint else flag.boundary;
+        } else {
+            battle.unresolved = true;
+            event.flags |= flag.boundary;
+        }
+        for (self.faces[0..self.face_count]) |reduced| battle.offerLower(reduced, self.event);
+        const lower = self.lower;
+        event.flags |= flag.lower;
+        event.lower_sse = lower.state.sse;
+        if (battle.stage_reference_sse == null and lower.positive()) {
+            const prior = battle.lower;
+            if (improves(lower.state.sse, prior.state.sse, lower.state.initial_sse) or
+                (battle.lower_event != null and !improves(prior.state.sse, lower.state.sse, prior.state.initial_sse) and lower.k < prior.k))
+            {
+                battle.lower = lower;
+                battle.lower_event = self.event;
+            }
+        }
+    }
+};
+
+const Round = struct {
+    row: usize,
+    battle: Competition,
+};
+
+const Controller = struct {
+    batch: *batched.Batch,
+    cells: []const u64,
+    rows: []Row,
+    primary: []const core.Record,
+    k: u32,
+    keep_n: u32,
+    options: Options,
     band: ?*core.Band,
-};
+    search: core.Search,
+    rounds: []Round,
+    ids: []u64,
+    records: []core.Record,
+    proposals: []Proposal,
+    wave: Wave,
 
-fn preparePrimarySeeds(e: *core.Engine, cells: []const u64, primary: []const core.Record, missing: []const u32, lv: core.Level, frame: spherical.Frame, frozen: gpu.Buf, target: gpu.Buf, optimize: bool, options: Options, seeds: []?SingletonSeed, prefetch: ?Prefetch) !void {
-    if (seeds.len == 0) return;
-    const g = &e.g;
-    const bytes = @as(u64, frame.pat_h) * frame.pat_w * 4;
-    const capacity: usize = @intCast(target.size / bytes);
-    var poses: [64]detector.Pose = undefined;
-    var rows: [64]usize = undefined;
-    var fit_seeds: [64]?SingletonSeed = undefined;
-    for (0..e.phases.items.len) |phase| {
-        const phase_records = primary[phase * cells.len ..][0..cells.len];
+    fn readInitial(self: *Controller, states: []overlap.State, progress: []overlap.Progress) !void {
+        const batch = self.batch;
+        const e = batch.engine;
+        const fit = batch.fit;
+        const bytes = @as(u64, fit.px) * @sizeOf(f32);
         var first: usize = 0;
-        while (first < cells.len) : (first += capacity) {
-            const end = @min(first + capacity, cells.len);
+        while (first < states.len) {
+            if (e.cancel.get()) return error.Cancelled;
+            const n = @min(batch.lanes, states.len - first);
+            fit.n = @intCast(n);
+            e.g.copy(batch.frozen, first * bytes, fit.original, 0, n * bytes);
+            fit.resetTarget(fit.original);
+            fit.read(states[first..][0..n]);
+            fit.readProgress(progress[first..][0..n]);
+            try e.g.wait();
+            first += n;
+        }
+    }
+
+    fn runStages(self: *Controller) !void {
+        try self.runStage(1, 0, 1);
+        const branches: usize = if (self.k > 1 and self.keep_n > 1) 2 else 1;
+        if (branches == 2) for (self.rows) |*row| row.sharePrimary();
+
+        while (true) {
+            var order = self.k + 1;
+            var branch: usize = 0;
+            for (0..branches) |b| {
+                for (self.rows) |*row| {
+                    if (row.histories[b].nextOrder()) |next| {
+                        if (next >= order) continue;
+                        order = next;
+                        branch = b;
+                    }
+                }
+            }
+            if (order > self.k) return;
+            try self.runStage(order, branch, if (branch == 0) 1 else self.keep_n);
+        }
+    }
+
+    fn runStage(self: *Controller, order: u32, branch: usize, ranks: u32) !void {
+        const batch = self.batch;
+        const e = batch.engine;
+        var at: usize = 0;
+        while (at < self.rows.len) {
+            if (e.cancel.get()) return error.Cancelled;
             var n: usize = 0;
-            for (first..end) |row| {
-                const record = phase_records[row];
-                if (missing[row] != 0 or !Member.indexed(record, phase, 0).valid()) continue;
-                poses[n] = .{ .q = record.q, .t = try e.positionOf(&e.geo, cells[row], lv), .pat = 0 };
-                rows[n] = row;
+            while (at < self.rows.len and n < self.rounds.len) : (at += 1) {
+                const row = &self.rows[at];
+                const history = &row.histories[branch];
+                if (history.nextOrder() != order) continue;
+                self.rounds[n] = .{ .row = at, .battle = history.begin(order, self.options) };
+                if (order > 1) {
+                    self.wave.jobs[n] = fitJob(at, row.t, history.outcome.support, .fixed);
+                    self.ids[n] = self.cells[at];
+                }
                 n += 1;
             }
-            if (n < 2) continue;
-            for (rows[0..n], 0..) |row, i| g.copy(frozen, row * bytes, target, i * bytes, bytes);
-            // The prefit has already copied the measured rows into fit.original,
-            // so its input staging buffer can hold the generated residuals.
-            const residuals = if (prefetch != null) target else null;
-            try fitSingletonSeeds(e, lv, frame, phase, poses[0..n], target, optimize, fit_seeds[0..n], residuals);
-            if (prefetch) |cache| {
-                try prefetchResiduals(e, cells, lv, frame, phase, frozen, target, optimize, options, cache, poses[0..n], rows[0..n], fit_seeds[0..n]);
+            if (n == 0) break;
+            const records = self.records[0 .. n * e.phases.items.len * ranks];
+            if (order > 1) {
+                batch.residual(self.wave.jobs[0..n], e.pats[@intFromEnum(batch.lv)]);
+                try e.indexPreparedCandidates(self.ids[0..n], self.search, self.band, ranks, records);
             }
-            for (rows[0..n], fit_seeds[0..n]) |row, seed| seeds[phase * cells.len + row] = seed;
+            try self.scoreRound(self.rounds[0..n], order, branch, ranks, records);
         }
     }
-}
 
-fn prefetchResiduals(e: *core.Engine, cells: []const u64, lv: core.Level, frame: spherical.Frame, phase: usize, frozen: gpu.Buf, target: gpu.Buf, optimize: bool, options: Options, cache: Prefetch, poses: []detector.Pose, rows: []const usize, primary_seeds: []const ?SingletonSeed) !void {
-    const g = &e.g;
-    const bytes = @as(u64, frame.pat_h) * frame.pat_w * 4;
-    var ids: [64]u64 = undefined;
-    var lanes: [64]usize = undefined;
-    var live: usize = 0;
-    for (rows, primary_seeds, 0..) |row, seed, i| {
-        if (!SingletonSeed.needsResidual(seed)) continue;
-        g.copy(target, i * bytes, e.pats[@intFromEnum(lv)], live * bytes, bytes);
-        ids[live] = cells[row];
-        lanes[live] = i;
-        live += 1;
+    fn scoreRound(self: *Controller, rounds: []Round, order: u32, branch: usize, ranks: u32, records: []const core.Record) !void {
+        const phase_count = self.batch.engine.phases.items.len;
+        var used: usize = 0;
+        for (rounds, 0..) |*round, lane| {
+            const row = &self.rows[round.row];
+            const history = &row.histories[branch];
+            const baseline = history.outcome.support;
+            for (0..phase_count) |pi| for (0..ranks) |rank| {
+                const record = if (order == 1)
+                    self.primary[pi * self.rows.len + round.row]
+                else
+                    records[(pi * ranks + rank) * rounds.len + lane];
+                const member = Member.indexed(record, pi, if (order == 1) 0 else @intCast(rank + 1));
+                const valid = member.valid();
+                const event = try history.log(.{
+                    .cell_index = @intCast(round.row),
+                    .branch = @intCast(branch),
+                    .order = order,
+                    .attempt = history.replacements[order],
+                    .phase = @intCast(pi),
+                    .rank = member.rank,
+                    .source_q = record.q,
+                    .residual_ncc = if (order == 1 or !valid) nan else record.ncc,
+                    .baseline_sse = baseline.state.sse,
+                    .result_order = baseline.k,
+                });
+                if (!valid) continue;
+                history.events[event].flags |= flag.native;
+                round.battle.valid += 1;
+                if (order > 1 and self.options.flags & 2 != 0 and record.ncc < self.options.min_residual_ncc) {
+                    history.events[event].flags |= flag.screened;
+                    round.battle.screened += 1;
+                    continue;
+                }
+                const proposal = &self.proposals[used];
+                proposal.* = .{ .lane = lane, .event = event, .single = (Support{}).append(member) };
+                self.wave.add(round.row, row.t, &proposal.single, .both);
+                used += 1;
+            };
+        }
+        try self.wave.fit(self.batch);
+        const proposals = self.proposals[0..used];
+        for (proposals) |*proposal| {
+            if (assessed(proposal.single.state)) saveSingleton(&proposal.single);
+        }
+        if (order > 1 and used > 0) try self.scoreJointAndFaces(rounds, proposals, branch, order);
+        // GPU work is grouped by fit shape; offer achieved results in exactly
+        // the original phase, rank and face-mask order within each history.
+        for (proposals) |*proposal| {
+            const round = &rounds[proposal.lane];
+            const history = &self.rows[round.row].histories[branch];
+            proposal.offer(history.outcome.support, &round.battle, &history.events[proposal.event]);
+        }
+        if (self.batch.engine.cancel.get()) return error.Cancelled;
+        for (rounds) |*round| {
+            self.rows[round.row].histories[branch].finish(&round.battle, order, self.k, self.options);
+        }
     }
-    if (live == 0) return;
 
-    var proposals: [64]core.Record = undefined;
-    try e.indexPreparedCandidates(ids[0..live], cache.search, cache.band, 1, proposals[0..live]);
-    var accepted: usize = 0;
-    var proposal_rows: [64]usize = undefined;
-    for (lanes[0..live], proposals[0..live]) |i, proposal| {
-        const row = rows[i];
-        cache.records[row] = .{ .record = proposal };
-        const member = Member.indexed(proposal, phase, 1);
-        if (!member.valid() or proposal.ncc < options.min_residual_ncc) continue;
-        poses[accepted] = .{ .q = proposal.q, .t = poses[i].t, .pat = 0 };
-        proposal_rows[accepted] = row;
-        accepted += 1;
-    }
-    if (accepted < 2) return;
+    fn scoreJointAndFaces(self: *Controller, rounds: []const Round, proposals: []Proposal, branch: usize, order: u32) !void {
+        for (proposals) |*proposal| {
+            const i = rounds[proposal.lane].row;
+            const row = &self.rows[i];
+            const baseline = row.histories[branch].outcome.support;
+            const single = proposal.single;
+            proposal.lower = if (single.positive() and improves(single.state.sse, baseline.state.sse, single.state.initial_sse)) single else baseline;
+            proposal.joint = baseline.append(single.members[0]);
+            self.wave.add(i, row.t, &proposal.joint, .both);
+        }
+        try self.wave.fit(self.batch);
 
-    var proposal_seeds: [64]?SingletonSeed = undefined;
-    for (proposal_rows[0..accepted], 0..) |row, i| g.copy(frozen, row * bytes, target, i * bytes, bytes);
-    try fitSingletonSeeds(e, lv, frame, phase, poses[0..accepted], target, optimize, proposal_seeds[0..accepted], null);
-    for (proposal_rows[0..accepted], proposal_seeds[0..accepted]) |row, seed| {
-        cache.records[row].?.seed = seed;
+        const all = (@as(u32, 1) << @intCast(order)) - 1;
+        for (1..all) |m| {
+            const mask: u32 = @intCast(m);
+            for (proposals) |*proposal| {
+                const face = proposal.faceForMask(mask) orelse continue;
+                face.* = proposal.joint.subset(mask);
+                const i = rounds[proposal.lane].row;
+                // For K2 both singleton poses have already had a nuisance fit.
+                // Re-optimize from joint theta only when its fixed fit improves.
+                self.wave.add(i, self.rows[i].t, face, if (order == 2) .fixed else .both);
+            }
+            try self.wave.fit(self.batch);
+            if (order == 2 and self.batch.optimize) {
+                for (proposals) |*proposal| {
+                    const face = proposal.faceForMask(mask) orelse continue;
+                    if (!assessed(face.state) or !improves(face.state.sse, proposal.lower.state.sse, face.state.initial_sse)) continue;
+                    const i = rounds[proposal.lane].row;
+                    self.wave.add(i, self.rows[i].t, face, .optimize);
+                }
+                try self.wave.fit(self.batch);
+            }
+
+            while (true) {
+                for (proposals) |*proposal| {
+                    const face = proposal.faceForMask(mask) orelse continue;
+                    if (!assessed(face.state) or face.positive()) continue;
+                    const active = face.activeMask();
+                    if (active == 0) {
+                        face.* = .{};
+                        continue;
+                    }
+                    face.* = face.subset(active);
+                    const i = rounds[proposal.lane].row;
+                    self.wave.add(i, self.rows[i].t, face, .both);
+                }
+                if (self.wave.used == 0) break;
+                try self.wave.fit(self.batch);
+            }
+
+            for (proposals) |*proposal| {
+                const face = proposal.faceForMask(mask) orelse continue;
+                proposal.face_count += 1;
+                if (!face.positive()) continue;
+                if (face.k == 1) saveSingleton(face);
+                const lower = proposal.lower;
+                if (improves(face.state.sse, lower.state.sse, face.state.initial_sse) or
+                    (lower.k != order - 1 and !improves(lower.state.sse, face.state.sse, lower.state.initial_sse) and face.k < lower.k))
+                    proposal.lower = face.*;
+            }
+        }
+        for (proposals) |*proposal| {
+            if (proposal.lower.k == 1) saveSingleton(&proposal.lower);
+        }
     }
+};
+
+pub fn batchWidth(e: *const core.Engine) u32 {
+    const shape = e.patternShape(e.levelOf(.search)) catch return 0;
+    const px = std.math.mul(u32, shape[0], shape[1]) catch return 0;
+    return batched.maxLanes(e, px);
 }
 
 pub fn run(e: *core.Engine, cells: []const u64, k: u32, primary: []const core.Record, missing: []const u32, hw: [2]u32, outputs: core.Engine.OverlapTrajectoryPayload, optimize: bool, keep_n: u32, prm: core.Search, req: *Request) !void {
     const g = &e.g;
+    // Retire per-call scratch before the next tile allocates its workspace.
+    defer g.submit();
     const lv = e.levelOf(.search);
     const frame = try e.frame(lv);
     const px = hw[0] * hw[1];
-    const bytes = @as(u64, px) * 4;
+    const bytes = @as(u64, px) * @sizeOf(f32);
     const n = cells.len;
+    const phase_count = e.phases.items.len;
+    const compare_pooled = k > 1 and keep_n > 1;
     const saved_ahead = e.ahead;
     e.ahead = &.{};
     defer e.ahead = saved_ahead;
     var frozen = g.storage(n * bytes);
     defer g.release(&frozen);
     g.copy(e.pats[@intFromEnum(lv)], 0, frozen, 0, n * bytes);
-    const compare_pooled = k > 1 and keep_n > 1;
-    // The model, two fits and shared scratch hold about forty full
-    // patterns per lane. Check the largest individual binding too.
-    const lim = @min(g.lim.max_storage_binding, g.lim.max_buffer);
-    const budget = @as(u64, e.set.tile_mb) << 20;
-    const capacity = @min(64, lim / (4 * bytes), budget / (40 * bytes), @max(n, if (compare_pooled) keep_n else 1));
-    var seed_target: gpu.Buf = if (capacity >= 2) g.storage(capacity * bytes) else .{};
-    defer g.release(&seed_target);
-    const primary_seeds = try e.gpa.alloc(?SingletonSeed, if (capacity >= 2 and n > 1) primary.len else 0);
-    defer e.gpa.free(primary_seeds);
-    @memset(primary_seeds, null);
-    const band = if (k > 1 and prm.method == .spherical) try e.band(prm.bandwidth, lv) else null;
-    // In this case the sole candidate always supplies the first achieved
-    // primary; no phase comparison or pooled branch can
-    // change the prefit used to generate its first residual.
-    const prefetch_enabled = primary_seeds.len > 0 and k == 2 and keep_n == 1 and
-        e.phases.items.len == 1 and req.options.flags & 2 != 0;
-    const prefetched = try e.gpa.alloc(?FirstResidual, if (prefetch_enabled) n else 0);
-    defer e.gpa.free(prefetched);
-    @memset(prefetched, null);
-    const prefetch: ?Prefetch = if (prefetch_enabled) .{ .records = prefetched, .search = prm, .band = band } else null;
-    try preparePrimarySeeds(e, cells, primary, missing, lv, frame, frozen, seed_target, optimize, req.options, primary_seeds, prefetch);
+
+    var arena = std.heap.ArenaAllocator.init(e.gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const rows = try a.alloc(Row, n);
+    {
+        var scratch = std.heap.ArenaAllocator.init(e.gpa);
+        defer scratch.deinit();
+        const temp = scratch.allocator();
+        const candidates_per_row = phase_count * keep_n;
+        // A small request can still fill GPU lanes with independent proposals.
+        var batch = try batched.Batch.init(e, lv, frame, frozen, @max(n, candidates_per_row), optimize);
+        defer batch.deinit();
+        // An indexing failure can leave reads targeting controller scratch.
+        errdefer g.wait() catch {};
+        const row_lanes = @min(n, batch.lanes);
+        const capacity = try std.math.mul(usize, row_lanes, candidates_per_row);
+        var controller: Controller = .{
+            .batch = &batch,
+            .cells = cells,
+            .rows = rows,
+            .primary = primary,
+            .k = k,
+            .keep_n = keep_n,
+            .options = req.options,
+            .band = if (k > 1 and prm.method == .spherical) try e.band(prm.bandwidth, lv) else null,
+            .search = prm,
+            .rounds = try temp.alloc(Round, row_lanes),
+            .ids = try temp.alloc(u64, row_lanes),
+            .records = try temp.alloc(core.Record, capacity),
+            .proposals = try temp.alloc(Proposal, capacity),
+            .wave = .{
+                .jobs = try temp.alloc(batched.Job, capacity),
+                .destinations = try temp.alloc(*Support, capacity),
+            },
+        };
+        try controller.readInitial(outputs.states, outputs.progress);
+        const exact_capacity = try traceCapacity(1, phase_count, k, 1);
+        const row_capacity = try traceCapacity(1, phase_count, k, keep_n);
+        for (rows, cells, missing, outputs.states, outputs.progress, 0..) |*row, cell, absent, *state, *progress, i| {
+            const events = req.events[req.used + i * row_capacity ..][0..row_capacity];
+            if (absent != 0) {
+                state.* = .{ .sse = nan, .initial_sse = nan, .single_sse = @splat(nan), .correlation = nan, .condition = nan, .best_single_sse = nan, .trial_sse = nan };
+                progress.* = .{ .stop_reason = absent, .previous_sse = nan, .incremental_improvement = nan, ._pad = unselected };
+            }
+            const initial: Outcome = .{ .support = .{ .state = state.* }, .progress = progress.* };
+            row.* = .{
+                .t = if (absent == 0) try e.positionOf(&e.geo, cell, lv) else @splat(0),
+                .trace = events,
+                .histories = .{
+                    .{ .outcome = initial, .events = events[0..exact_capacity] },
+                    .{ .outcome = initial, .events = events[exact_capacity..] },
+                },
+            };
+        }
+        try controller.runStages();
+    }
+    // Retire GPU buffers before reserving scalar polishing scratch.
+    g.submit();
+
+    errdefer g.wait() catch {};
     var fit = overlap.Fit.init(g, 1, px, hw[1], frame.mask, frozen);
     defer fit.deinit();
     var model = nuisance.Model.init(g, &e.prep, &fit);
     defer model.deinit();
     model.contrast = true;
     model.optimize_enabled = optimize;
-    const pool = try e.gpa.alloc(core.Record, e.phases.items.len * keep_n);
-    defer e.gpa.free(pool);
-    const residual_seeds = try e.gpa.alloc(?SingletonSeed, if (capacity >= 2 and compare_pooled) pool.len else 0);
-    defer e.gpa.free(residual_seeds);
-    const primary_fits = try e.gpa.alloc(?Support, if (compare_pooled) e.phases.items.len else 0);
-    defer e.gpa.free(primary_fits);
     var refinement: ?Refinement = if (req.options.flags & 1 != 0)
         Refinement.init(g, px, k, req.options.flags & refit_after_polish != 0)
     else
         null;
     defer if (refinement) |*workspace| workspace.deinit(g);
-    for (cells, 0..) |cell, i| {
+    for (rows, missing, 0..) |*row, absent, i| {
         if (e.cancel.get()) return error.Cancelled;
-        const first = i * k;
-        if (missing[i] != 0) {
-            outputs.states[i] = .{ .sse = nan, .initial_sse = nan, .single_sse = @splat(nan), .correlation = nan, .condition = nan, .best_single_sse = nan, .trial_sse = nan };
-            outputs.progress[i] = .{ .stop_reason = missing[i], .previous_sse = nan, .incremental_improvement = nan, ._pad = unselected };
-            continue;
-        }
-        if (i != 0) {
-            g.copy(frozen, i * bytes, fit.original, 0, bytes);
-            fit.resetTarget(fit.original);
-            model.resetProfileTarget();
-        }
-        var work: Work = .{ .engine = e, .model = &model, .options = req.options, .lv = lv, .frame = frame, .t = try e.positionOf(&e.geo, cell, lv), .row = @intCast(i), .cell = cell, .band = band, .search = prm, .pool = pool, .refinement = if (refinement) |*workspace| workspace else null, .seed_target = seed_target, .residual_seeds = residual_seeds, .first_residual = if (prefetch_enabled) prefetched[i] else null };
-        var states: [1]overlap.State = undefined;
-        var progress: [1]overlap.Progress = undefined;
-        fit.read(&states);
-        fit.readProgress(&progress);
-        try work.wait();
-        const initial: Outcome = .{ .support = .{ .state = states[0] }, .progress = progress[0] };
-        const begin = req.used;
-        @memset(primary_fits, null);
-        const exact = try work.branch(primary, n, k, 1, 0, initial, req, primary_fits, primary_seeds);
-        var selected = exact;
-        var pooled: ?Outcome = null;
-        if (compare_pooled) {
-            pooled = try work.branch(primary, n, k, keep_n, 1, initial, req, primary_fits, primary_seeds);
-        }
-        var source: i32 = -1;
-        if (exact.archive.best(if (pooled) |branch| branch.archive else null)) |achieved| {
-            const event = &req.events[achieved.event];
-            source = @intCast(event.branch);
-            if (source == 1) selected = pooled.?;
-            if (pooled) |branch| {
-                selected.archive = exact.archive;
-                selected.archive.include(branch.archive);
+        if (absent != 0) continue;
+        const result = row.select(compare_pooled, req.options);
+        std.mem.copyForwards(Event, req.events[req.used..][0..result.events.len], result.events);
+        req.used += result.events.len;
+        var selected = result.outcome;
+        if (selected.support.k > 0) {
+            if (i != 0) {
+                g.copy(frozen, i * bytes, fit.original, 0, bytes);
+                fit.resetTarget(fit.original);
+                model.resetProfileTarget();
             }
-            selected.useAchieved(achieved);
-            if (req.options.flags & 4 != 0) {
-                event.flags |= flag.published;
-                if (achieved.from_lower) event.flags |= flag.published_lower;
-            }
-        }
-        for (req.events[begin..req.used]) |*event| if (source >= 0 and event.branch == @as(u32, @intCast(source))) {
-            event.flags |= flag.chosen_branch;
-        };
-        selected.progress._pad = if (source < 0) unselected else @intCast(source);
-        // In an overlap run, a singleton has no other signal to isolate.
-        // Keep that discovered orientation, including on clean interiors.
-        if (k == 1 or selected.support.k > 1) selected.support = try work.refineSelected(selected.support);
+            var work: Work = .{
+                .engine = e,
+                .model = &model,
+                .options = req.options,
+                .lv = lv,
+                .frame = frame,
+                .t = row.t,
+                .refinement = if (refinement) |*workspace| workspace else null,
+            };
+            // A singleton in an overlap run has no other signal to isolate.
+            if (k == 1 or selected.support.k > 1) selected.support = try work.refineSelected(selected.support);
+            const first = i * k;
+            try work.publish(selected, outputs.components[first..][0..k], req.source_q[first..][0..k], outputs.ranks[first..][0..k], outputs.norms[first..][0..k], &outputs.states[i]);
+        } else outputs.states[i] = selected.support.state;
         selected.progress.retained_order = selected.support.k;
         selected.progress.active_count = selected.support.k;
         selected.updateEvidence();
         outputs.progress[i] = selected.progress;
         outputs.theta[i] = selected.support.theta;
-        try work.publish(selected, outputs.components[first..][0..k], req.source_q[first..][0..k], outputs.ranks[first..][0..k], outputs.norms[first..][0..k], &outputs.states[i]);
     }
     if (e.cancel.get()) return error.Cancelled;
 }

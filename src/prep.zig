@@ -12,6 +12,11 @@ const Gpu = gpu_mod.Gpu;
 const Buf = gpu_mod.Buf;
 const Background = settings_mod.Background;
 
+/// One CLAHE table per image. Both the histogram and CDF use this layout.
+pub fn claheImageBytes(grid: u32, bins: u32) u64 {
+    return @as(u64, grid) * grid * bins * @sizeOf(u32);
+}
+
 const P = extern struct {
     n: u32 = 0,
     h: u32 = 0,
@@ -139,6 +144,11 @@ pub const Prep = struct {
         self.perPixel("spread_cols", p, &.{ co[1].at(8), dst.at(2) });
     }
 
+    /// Normalize an already prepared batch without reserving filter scratch.
+    pub fn normalize(self: *Prep, img: Buf, n: u32, h: u32, w: u32, mask: [3]f32) void {
+        self.perImage("normalize", .{ .n = n, .h = h, .w = w, .mask = .{ mask[0], mask[1], mask[2], 0 } }, &.{img.at(2)});
+    }
+
     /// Record the filter chain on the n images of h × w in `img` (in place).
     pub fn filter(self: *Prep, img: Buf, n: u32, h: u32, w: u32, o: Options) void {
         const g = self.g;
@@ -172,9 +182,9 @@ pub const Prep = struct {
             p.pad_w = (p.tiles - w % p.tiles) % p.tiles;
             p.tile_h = @max(1, (h + p.pad_h) / p.tiles);
             p.tile_w = @max(1, (w + p.pad_w) / p.tiles);
-            const cells: u64 = @as(u64, n) * p.tiles * p.tiles * p.bins * 4;
-            g.ensure(&self.hist, cells);
-            g.ensure(&self.cdf, cells);
+            const table_bytes = n * claheImageBytes(p.tiles, p.bins);
+            g.ensure(&self.hist, table_bytes);
+            g.ensure(&self.cdf, table_bytes);
             self.perImage("stretch", p, &.{cur.at(2)});
             g.clear(self.hist);
             self.perCount("clahe_hist", p, @as(u64, n) * (h + p.pad_h) * (w + p.pad_w), &.{ cur.at(3), self.hist.at(5) });

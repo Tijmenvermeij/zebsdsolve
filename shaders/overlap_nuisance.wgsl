@@ -28,8 +28,7 @@ struct Progress { retained_order:u32, proposed_count:u32, active_count:u32, stop
 // V4 discovery order baseline: singleton theta160..187, SSE188..191;
 // historical rejection bits192; separate winning candidate ID193 (−1 missing).
 fn ci(b:u32,j:u32)->u32 { return b*196u+j; }
-// Mode 3 transforms one independently posed column per lane.
-fn staged_columns()->u32 { return select(4u,1u,p.mode==3u); }
+const STAGED_COLUMNS=4u;
 fn bounded_theta(x:f32,j:u32)->f32 {
  let lower=array<f32,7>(0.0,-1.38629436,0.25,0.6,0.6,-0.15,-0.15);
  let upper=array<f32,7>(5.0,1.38629436,8.0,1.4,1.4,0.15,0.15);
@@ -52,10 +51,13 @@ fn invalidate_sigma(@builtin(workgroup_id) w:vec3<u32>) {
  let b=image_id(w);if(b<p.n){cells[ci(b,65u)]=-1.0;}
 }
 @compute @workgroup_size(1)
-fn stage_polish_theta(@builtin(workgroup_id) w:vec3<u32>) {
+fn stage_profile_seeds(@builtin(workgroup_id) w:vec3<u32>) {
  let b=image_id(w);if(b>=p.n){return;}
- for(var j=0u;j<7u;j++){cells[ci(b,j)]=bounded_theta(theta_out[b*7u+j],j);}
- cells[ci(b,65u)]=-1.0;
+ for(var j=0u;j<7u;j++){cells[ci(b,24u+j)]=theta_out[b*35u+j];}
+ for(var j=0u;j<28u;j++){
+  let seed=theta_out[b*35u+7u+j];
+  cells[ci(b,32u+j)]=seed;cells[ci(b,90u+j)]=seed;
+ }
 }
 @compute @workgroup_size(1)
 fn share_primary_theta(@builtin(workgroup_id) w:vec3<u32>) {
@@ -93,7 +95,7 @@ var<workgroup> lo:array<f32,64>;var<workgroup> hi:array<f32,64>;var<workgroup> v
 @compute @workgroup_size(64)
 fn validate(@builtin(workgroup_id) w:vec3<u32>,@builtin(local_invocation_index) lane:u32){
  let b=image_id(w);if(b>=p.n){return;}
- for(var j=0u;j<staged_columns();j++){
+ for(var j=0u;j<STAGED_COLUMNS;j++){
   var l=1e30;var h=-1e30;var ok=1u;
   for(var i=lane;i<p.px;i+=64u){
    let v=raw[(j*p.n+b)*p.px+i];
@@ -139,7 +141,7 @@ fn propose(@builtin(workgroup_id) w:vec3<u32>){
 // sigma is per cell here. Reuse blurred values throughout same-sigma gain trials.
 @compute @workgroup_size(256)
 fn blur_rows(@builtin(workgroup_id) w:vec3<u32>,@builtin(local_invocation_index) lane:u32){
- let tid=(w.y*p.grid_x+w.x)*256u+lane;if(tid>=staged_columns()*p.n*p.px){return;}
+ let tid=(w.y*p.grid_x+w.x)*256u+lane;if(tid>=STAGED_COLUMNS*p.n*p.px){return;}
  let j=tid/(p.n*p.px);let b=(tid/p.px)%p.n;let i=tid%p.px;
  let k=select(count(b),1u,p.mode==1u);if(j>=k){return;}
  let sigma=cells[ci(b,0u)];if(sigma==cells[ci(b,65u)]){return;}
@@ -150,7 +152,7 @@ fn blur_rows(@builtin(workgroup_id) w:vec3<u32>,@builtin(local_invocation_index)
 }
 @compute @workgroup_size(256)
 fn blur_cols(@builtin(workgroup_id) w:vec3<u32>,@builtin(local_invocation_index) lane:u32){
- let tid=(w.y*p.grid_x+w.x)*256u+lane;if(tid>=staged_columns()*p.n*p.px){return;}
+ let tid=(w.y*p.grid_x+w.x)*256u+lane;if(tid>=STAGED_COLUMNS*p.n*p.px){return;}
  let j=tid/(p.n*p.px);let b=(tid/p.px)%p.n;let i=tid%p.px;
  let k=select(count(b),1u,p.mode==1u);if(j>=k){return;}
  let sigma=cells[ci(b,0u)];if(sigma==cells[ci(b,65u)]){return;}
@@ -163,7 +165,7 @@ fn blur_cols(@builtin(workgroup_id) w:vec3<u32>,@builtin(local_invocation_index)
 fn cache_sigma(@builtin(workgroup_id) w:vec3<u32>){let b=image_id(w);if(b<p.n){cells[ci(b,65u)]=cells[ci(b,0u)];}}
 @compute @workgroup_size(256)
 fn gain(@builtin(workgroup_id) w:vec3<u32>,@builtin(local_invocation_index) lane:u32){
- let tid=(w.y*p.grid_x+w.x)*256u+lane;if(tid>=staged_columns()*p.n*p.px){return;}
+ let tid=(w.y*p.grid_x+w.x)*256u+lane;if(tid>=STAGED_COLUMNS*p.n*p.px){return;}
  let j=tid/(p.n*p.px);let b=(tid/p.px)%p.n;let i=tid%p.px;let k=select(count(b),1u,p.mode==1u);
  if(j>=k){transformed[tid]=0.0;return;}
  let col=column(b,j);if(cells[ci(b,84u+col)]<0.5){transformed[tid]=0.0;return;}
@@ -296,7 +298,7 @@ var<workgroup> sums:array<vec2<f32>,256>;
 fn mean_blurred(@builtin(workgroup_id) w:vec3<u32>,@builtin(local_invocation_index) lane:u32){
  let b=image_id(w);if(b>=p.n){return;}
  let k=select(count(b),1u,p.mode==1u);
- for(var j=0u;j<staged_columns();j++){
+ for(var j=0u;j<STAGED_COLUMNS;j++){
   var bins:array<f32,8>;var count=0.0;
   for(var c=0u;c<8u;c++){bins[c]=0.0;}
   for(var i=lane;i<p.px;i+=256u){if(j<k && inside(i)){
@@ -341,7 +343,7 @@ fn component_norms(@builtin(workgroup_id) w:vec3<u32>,@builtin(local_invocation_
 // Original raw/committed references remain unchanged in their declared units.
 @compute @workgroup_size(256)
 fn center_raw(@builtin(workgroup_id) w:vec3<u32>,@builtin(local_invocation_index) lane:u32){
- let tid=(w.y*p.grid_x+w.x)*256u+lane;if(tid>=staged_columns()*p.n*p.px){return;}
+ let tid=(w.y*p.grid_x+w.x)*256u+lane;if(tid>=STAGED_COLUMNS*p.n*p.px){return;}
  let image=tid/p.px;let j=image/p.n;let b=image%p.n;
  centered[tid]=raw[tid]-cells[ci(b,136u+j)];
 }
@@ -360,7 +362,7 @@ var<workgroup> radix_rank:u32;
 @compute @workgroup_size(256)
 fn raw_median(@builtin(workgroup_id) w:vec3<u32>,@builtin(local_invocation_index) lane:u32){
  let b=image_id(w);if(b>=p.n){return;}
- for(var j=0u;j<staged_columns();j++){
+ for(var j=0u;j<STAGED_COLUMNS;j++){
   if(lane==0u){atomicStore(&radix_count,0u);radix_prefix=0u;radix_mask=0u;}
   workgroupBarrier();
   var count=0u;

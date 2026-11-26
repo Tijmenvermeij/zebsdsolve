@@ -8,6 +8,15 @@ const Prep = @import("prep.zig").Prep;
 pub const Theta = [7]f32;
 pub const identity: Theta = .{ 0, 0, 1, 1, 1, 0, 0 };
 pub const max_evaluations: u32 = 104;
+pub const ProfileSeed = extern struct {
+    warm: Theta,
+    singles: [4]Theta = @splat(identity),
+};
+
+// Two Fit workspaces plus the raw, transformed, and selected profile banks.
+pub const profile_bytes_per_pixel = (2 * (1 + overlap.capacity) + 6 * overlap.capacity) * @sizeOf(f32);
+pub const profile_bytes_per_lane = 2 * (@sizeOf(overlap.State) + @sizeOf(overlap.Progress)) +
+    196 * @sizeOf(f32) + @sizeOf(overlap.State) + @sizeOf(ProfileSeed) + @sizeOf([4]f32);
 /// End-of-refinement searches share the shader's nuisance parameter bounds.
 pub fn clampParameter(value: f32, j: usize) f32 {
     const lower: Theta = .{ 0, -1.38629436, 0.25, 0.6, 0.6, -0.15, -0.15 };
@@ -50,15 +59,37 @@ pub const Model = struct {
     k: u32 = 0,
     single_column: u32 = 0,
     pub fn init(g: *gpu.Gpu, prep: *Prep, fit: *overlap.Fit) Model {
-        const bytes = @as(u64, 4) * fit.n * fit.px * 4;
-        var m: Model = .{ .g = g, .prep = prep, .fit = fit, .trial = overlap.Fit.init(g, fit.n, fit.px, fit.width, fit.mask, fit.original), .raw = g.storage(bytes), .committed = g.storage(bytes), .centered = g.storage(bytes), .mid = g.storage(bytes), .blurred = g.storage(bytes), .cells = g.storage(@as(u64, fit.n) * 196 * 4), .best = g.storage(@as(u64, fit.n) * @sizeOf(overlap.State)), .best_bank = g.storage(bytes), .theta = g.storage(@as(u64, fit.n) * 7 * 4), .norms = g.storage(@as(u64, fit.n) * 4 * 4) };
-        g.clear(m.committed);
-        m.initializeState();
-        return m;
+        var model = allocate(g, prep, fit);
+        model.trial.resetTarget(fit.original);
+        g.clear(model.committed);
+        model.initializeState();
+        return model;
     }
+
+    /// Reserve the workspace; the profile controller stages live targets later.
+    pub fn allocate(g: *gpu.Gpu, prep: *Prep, fit: *overlap.Fit) Model {
+        const bytes = @as(u64, overlap.capacity) * fit.n * fit.px * @sizeOf(f32);
+        return .{
+            .g = g,
+            .prep = prep,
+            .fit = fit,
+            .trial = overlap.Fit.allocate(g, fit.n, fit.px, fit.width, fit.mask),
+            .raw = g.storage(bytes),
+            .committed = g.storage(bytes),
+            .centered = g.storage(bytes),
+            .mid = g.storage(bytes),
+            .blurred = g.storage(bytes),
+            .cells = g.storage(@as(u64, fit.n) * 196 * @sizeOf(f32)),
+            .best = g.storage(@as(u64, fit.n) * @sizeOf(overlap.State)),
+            .best_bank = g.storage(bytes),
+            .theta = g.storage(@as(u64, fit.n) * @sizeOf(ProfileSeed)),
+            .norms = g.storage(@as(u64, fit.n) * @sizeOf([4]f32)),
+        };
+    }
+
     fn initializeState(self: *Model) void {
-        self.g.clear(self.cells);
-        self.g.clear(self.raw);
+        self.g.clearRange(self.cells, 0, @as(u64, self.fit.n) * 196 * @sizeOf(f32));
+        self.g.clearRange(self.raw, 0, @as(u64, overlap.capacity) * self.fit.n * self.fit.px * @sizeOf(f32));
         self.run("initialize", .{}, &.{ self.cells.at(5), self.fit.state.at(8) }, false);
     }
     /// Reuse the fixed-support workspace after the outer fit receives a new target.
@@ -76,7 +107,7 @@ pub const Model = struct {
     const Args = struct { mode: u32 = 0, coord: u32 = 0, phase: u32 = 0, seed: u32 = 0, step: f32 = 0, dc: f32 = 0, reuse_blur: bool = false };
     fn run(self: *Model, comptime entry: []const u8, a: Args, binds: []const gpu.Bind, pixels: bool) void {
         const f = self.fit;
-        const columns: u64 = if (a.mode == 3) 1 else 4;
+        const columns: u64 = overlap.capacity;
         const count = if (pixels) (columns * f.n * f.px + 255) / 256 else f.n;
         const grid = gpu.Gpu.flat(@intCast(count));
         const p: P = .{ .n = f.n, .px = f.px, .width = f.width, .grid_x = grid[0], .mode = a.mode, .coord = a.coord, .phase = a.phase, .seed = a.seed, .step = a.step, .dc = a.dc, .k = self.k, .contrast = @intFromBool(self.contrast), .mask = .{ f.mask[0], f.mask[1], f.mask[2], 0 } };
@@ -114,7 +145,7 @@ pub const Model = struct {
             // Profiled trials have a known column count and use only this prefix.
             // Batched discovery may have a different count for each cell.
             const columns = if (self.k == 0) 4 else if (a.mode == 1) 1 else self.k;
-            self.prep.filter(self.trial.bank, columns * self.fit.n, self.fit.px / self.fit.width, self.fit.width, .{ .mask = self.fit.mask });
+            self.prep.normalize(self.trial.bank, columns * self.fit.n, self.fit.px / self.fit.width, self.fit.width, self.fit.mask);
         }
     }
     fn evaluate(self: *Model, a: Args, singleton: bool) void {
@@ -206,8 +237,8 @@ pub const Model = struct {
         self.run("read_theta", .{}, &.{ self.cells.at(5), self.theta.at(12) }, false);
         self.g.read(self.theta, 0, std.mem.sliceAsBytes(out));
     }
-    // These V6 entry points operate on one cell, with a fixed positive k. The
-    // controller projects into raw with Detector.project. Raw and blur-cache
+    // The profiled controller projects into raw at a fixed positive k.
+    // Raw and blur-cache
     // invalidation form one operation even if the next theta has the same sigma.
     pub fn profileRawChanged(self: *Model, k: u32) void {
         std.debug.assert(self.contrast and k > 0 and k <= 4);
@@ -235,7 +266,7 @@ pub const Model = struct {
         self.prepareWarmTheta();
     }
 
-    fn prepareWarmTheta(self: *Model) void {
+    pub fn prepareWarmTheta(self: *Model) void {
         self.transformWarmTheta(true);
     }
 
@@ -262,20 +293,6 @@ pub const Model = struct {
         self.trial.nuisanceTrial(false, self.k);
     }
 
-    /// Transform one projected column per lane at its own theta. The lane-major
-    /// prefix of trial.bank is ready for a fixed-theta contrast fit.
-    pub fn preparePolishColumns(self: *Model, raw: gpu.Buf, theta: []const Theta) void {
-        std.debug.assert(self.contrast and theta.len == self.fit.n);
-        self.k = 1;
-        if (raw.id != self.raw.id) self.g.copy(raw, 0, self.raw, 0, @as(u64, self.fit.n) * self.fit.px * 4);
-        self.g.writeSlice(self.theta, 0, Theta, theta);
-        const a: Args = .{ .mode = 3 };
-        self.run("stage_polish_theta", a, &.{ self.cells.at(5), self.theta.at(12) }, false);
-        self.run("validate", a, &.{ self.raw.at(1), self.cells.at(5) }, false);
-        self.centerRaw(a);
-        self.transformWithArgs(a, true);
-    }
-
     fn optimizePrimaryTheta(self: *Model) void {
         self.single_column = 0;
         self.optimize(true);
@@ -285,33 +302,24 @@ pub const Model = struct {
         self.optimize(false);
     }
 
-    /// Independent singleton seeds start with identity theta. Launch each
-    /// trial across the batch with one independent reduction per detector pattern.
-    pub fn singletonSeeds(self: *Model, fixed_states: []overlap.State, optimized_states: []overlap.State, theta: []Theta) void {
-        std.debug.assert(self.fit.n > 1);
-        self.profileRawChanged(1);
+    /// A lane is an independent support, with component-major raw columns
+    /// and its own target, warm start and singleton seeds.
+    pub fn stageProfileSeeds(self: *Model, seeds: []const ProfileSeed) void {
+        std.debug.assert(self.fit.n == seeds.len);
+        self.g.writeSlice(self.theta, 0, ProfileSeed, seeds);
+        self.run("stage_profile_seeds", .{}, &.{ self.cells.at(5), self.theta.at(12) }, false);
+    }
+
+    pub fn fixedProfileBatch(self: *Model, states: []overlap.State) void {
         self.fixedWarmTheta();
-        self.trial.read(fixed_states);
-        if (self.optimize_enabled) {
-            self.optimizePrimaryTheta();
-            self.run("read_theta", .{ .mode = 1 }, &.{ self.cells.at(5), self.theta.at(12) }, false);
-            self.g.read(self.best, 0, std.mem.sliceAsBytes(optimized_states));
-            self.g.read(self.theta, 0, std.mem.sliceAsBytes(theta));
-        }
+        self.trial.read(states);
     }
 
-    /// Fit shared blur/gain for a support at fixed orientations.
-    pub fn profileNuisance(self: *Model, warm: Theta, singles: [4]Theta) void {
-        self.g.writeSlice(self.cells, 24 * 4, f32, &warm);
-        self.g.writeSlice(self.cells, 32 * 4, Theta, &singles);
-        self.g.writeSlice(self.cells, 90 * 4, Theta, &singles);
+    pub fn optimizeProfileBatch(self: *Model, states: []overlap.State, theta: []Theta) void {
         if (self.k == 1) self.optimizePrimaryTheta() else self.optimize(false);
-    }
-
-    /// Read a single achieved state and theta together, after profileNuisance.
-    pub fn readProfile(self: *Model, state: *overlap.State, theta: *Theta) void {
-        self.g.read(self.best, 0, std.mem.asBytes(state));
-        self.g.read(self.cells, 8 * 4, std.mem.asBytes(theta));
+        self.run("read_theta", .{ .mode = 1 }, &.{ self.cells.at(5), self.theta.at(12) }, false);
+        self.g.read(self.best, 0, std.mem.sliceAsBytes(states));
+        self.g.read(self.theta, 0, std.mem.sliceAsBytes(theta));
     }
 
     pub fn readProfileNorms(self: *Model, theta: Theta, out: *[4]f32) void {

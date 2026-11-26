@@ -130,6 +130,46 @@ class ProfileProduction(unittest.TestCase):
                     with self.subTest(method=method, row=row, field=field):
                         np.testing.assert_array_equal(batch[field][row], independent[field][0])
 
+    def test_batched_mixed_phase_profiles_match_single_lane_with_partial_batches(self):
+        # Exercise shuffled and repeated cells, a missing primary, and both
+        # rank-one and pooled histories on independently positioned patterns.
+        q0, q1, q2 = self.fixture.q
+        q3 = np.array([.5, -.5, .5, -.5], np.float32)
+        ids = np.arange(6)
+        patterns = [
+            fixtures.unit(self.s.simulate(np.tile(q, (6, 1)), cells=ids, phase=phase))
+            for q, phase in [(q0, 0), (q1, 0), (q2, 1), (q3, 1)]
+        ]
+        mixture = np.einsum('k,khij->hij', [.8, .6, .5, .4], patterns).astype(np.float32)
+        mixture[3] = 0
+        self.s.set_patterns(mixture[None])
+        self.s.index()
+        cells = [4, 2, 3, 1, 4]
+        options = dict(primary='stored', max_components=4, keep_n=2, blur_gain=True,
+                       min_residual_ncc=.1, min_stage_improvement=[.001, .001, .001])
+        self.s.configure(batch=1)
+        scalar = self.s.overlap_cells(cells, **options)
+        self.s.configure(batch=3)
+        batched = self.s.overlap_cells(cells, **options)
+        self.assertTrue(any(event['order'] == 4 for event in scalar['profile_events']))
+        self.assertTrue(any(event['branch'] == 1 for event in scalar['profile_events']))
+        self.assertTrue(np.any(scalar['phase'] == 1))
+        # One row can still fill multiple fit lanes with phase/rank candidates.
+        self.s.configure(batch=4)
+        one = self.s.overlap_cells(cells[:1], **options)
+        for field in ('phase', 'retained_order', 'blur_gain_theta', 'quaternions', 'sse'):
+            np.testing.assert_array_equal(one[field][0], scalar[field][0], err_msg=field)
+        for field in ('phase', 'retained_order', 'stop_reason', 'winner_rank', 'trajectory_source'):
+            np.testing.assert_array_equal(batched[field], scalar[field], err_msg=field)
+        for field in ('quaternions', 'amplitudes', 'proposal_ncc', 'blur_gain_theta', 'sse', 'component_norms'):
+            np.testing.assert_allclose(batched[field], scalar[field], atol=1e-6, rtol=0, err_msg=field)
+        self.assertEqual(len(batched['profile_events']), len(scalar['profile_events']))
+        for actual, expected in zip(batched['profile_events'], scalar['profile_events']):
+            for key in ('cell_index', 'branch', 'order', 'attempt', 'phase', 'rank', 'flags', 'result_order'):
+                self.assertEqual(actual[key], expected[key], key)
+            for key in ('source_q', 'residual_ncc', 'baseline_sse', 'lower_sse', 'joint_sse'):
+                np.testing.assert_allclose(actual[key], expected[key], atol=1e-6, rtol=0, err_msg=key)
+
     def test_batched_primary_seeds_match_independent_stored_cells(self):
         self.s.index()
         cells = [4, 2, 1, 0]

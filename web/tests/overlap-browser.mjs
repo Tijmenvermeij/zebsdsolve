@@ -91,6 +91,17 @@ try {
       await ze._queue;await pause(10);
     };
     await configureUI({method:'spherical',bandwidth:32,refine_iters:4,binning:1,full_resolution:'none',roi_x:0,roi_y:0,roi_w:4,roi_h:2});
+    const prepOptions={clahe:ze.settings.clahe,clahe_grid:ze.settings.clahe_grid,clahe_bins:ze.settings.clahe_bins};
+    await configureUI({batch:256,tile_mb:256,clahe:false});
+    const wideOverlapBatch=ze.overlapProfileBatchWidth;
+    require(wideOverlapBatch>64 && wideOverlapBatch<=256,'tuned overlap width still capped at 64');
+    await configureUI({tile_mb:8});
+    require(ze.overlapProfileBatchWidth>0 && ze.overlapProfileBatchWidth<wideOverlapBatch,'overlap width did not follow GPU scratch budget');
+    await configureUI({tile_mb:64});
+    const withoutClahe=ze.overlapProfileBatchWidth;
+    await configureUI({clahe:true,clahe_grid:16,clahe_bins:256});
+    require(ze.overlapProfileBatchWidth<withoutClahe,'overlap width ignored CLAHE workspace');
+    await configureUI({...prepOptions,tile_mb:256});
     document.getElementById('btn-index').click();
     await waitFor(()=>document.getElementById('app').dataset.busy==='0' && ze.results().phase.filter(x=>x>=0).length===8,'primary');console.log('primary ready');
     window.primary=ze.results();
